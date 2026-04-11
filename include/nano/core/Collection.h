@@ -26,8 +26,13 @@ public:
   T get(std::string_view attr) const;
 
   template <typename T>
-  T extra(std::string_view attr) const {
-    return std::any_cast<T>(event_->object_extras(object_name_, index_).at(std::string(attr)));
+  const T &extra(std::string_view attr) const {
+    return std::any_cast<const T &>(event_->object_extras(object_name_, index_).at(std::string(attr)));
+  }
+
+  template <typename T>
+  T &extra_ref(std::string_view attr) {
+    return std::any_cast<T &>(event_->object_extras(object_name_, index_).at(std::string(attr)));
   }
 
   template <typename T>
@@ -87,6 +92,12 @@ T ObjectView::get(std::string_view attr) const {
   } else if constexpr (std::is_same_v<T, std::int32_t>) {
     if (info->type == BranchType::kVecInt32) {
       return event_->vector<std::int32_t>(branch_name).at(index_);
+    }
+    if (info->type == BranchType::kVecUInt8) {
+      return static_cast<std::int32_t>(event_->vector<std::uint8_t>(branch_name).at(index_));
+    }
+    if (info->type == BranchType::kVecUInt16) {
+      return static_cast<std::int32_t>(event_->vector<std::uint16_t>(branch_name).at(index_));
     }
     return static_cast<std::int32_t>(event_->vector<std::int16_t>(branch_name).at(index_));
   } else if constexpr (std::is_same_v<T, bool>) {

@@ -5,8 +5,35 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 namespace nano {
+
+/*
+ * Channel summary: muon
+ *
+ * Purpose
+ * - Select a phase space dominated by semi-leptonic ttbar events.
+ * - Enrich boosted hadronic top and W jets.
+ * - Produce a flat ntuple suited for deriving top/W tagging scale factors and
+ *   for top/W-jet JMS and JMR studies.
+ *
+ * Event selection implemented in this producer
+ * - Require exactly one tight muon with:
+ *   pt > 55 GeV, |eta| < 2.4, |dxy| < 0.2, |dz| < 0.5,
+ *   `tightId`, and `miniPFRelIso_all < 0.10`.
+ * - Build loose-lepton collections for jet cleaning through
+ *   `HeavyFlavBaseProducer::select_leptons()`.
+ * - Run AK4/AK8/SubJet JME corrections and MET propagation through
+ *   `HeavyFlavBaseProducer::correct_jets_and_met()`.
+ * - Require corrected MET > 50 GeV.
+ * - Reconstruct the leptonic W from the selected muon and MET and require
+ *   `pT(W_lep) > 100 GeV`.
+ * - Require at least one AK4 jet passing the configured medium b-tag working
+ *   point and satisfying `|DeltaPhi(jet, muon)| < 2`.
+ * - Require at least one probe AK8 jet satisfying `|DeltaPhi(fatjet, muon)| > 2`.
+ * - Keep only the leading probe AK8 jet for output.
+ */
 
 HeavyFlavMuonSampleProducer::HeavyFlavMuonSampleProducer(ProducerConfig config)
     : HeavyFlavBaseProducer([&config] {
@@ -57,7 +84,8 @@ bool HeavyFlavMuonSampleProducer::analyze(Event &event) {
   const auto ak4jets = event.get<std::vector<ObjectView>>("ak4jets");
   std::vector<ObjectView> bjets;
   for (auto &jet : ak4jets) {
-    if (jet.get<float>("btagDeepFlavB") > deepjet_wp_m_ && std::abs(delta_phi(jet, mu)) < 2.0f) {
+    const auto btag_value = jet.get<float>(config_.btag_config.branch);
+    if (btag_value > config_.btag_config.medium && std::abs(delta_phi(jet, mu)) < 2.0f) {
       bjets.push_back(jet);
     }
   }
@@ -80,12 +108,10 @@ bool HeavyFlavMuonSampleProducer::analyze(Event &event) {
   probe_jets.erase(probe_jets.begin() + 1, probe_jets.end());
 
   load_gen_history(event, probe_jets);
-  eval_tagger(event, probe_jets);
-  eval_mass_regression(event, probe_jets);
   fill_base_event_info(event);
   fill_fatjet_info(event, probe_jets);
 
-  out_.fill("passMuTrig", event.scalar<bool>("HLT_Mu50"));
+  out_.fill("passMuTrig", pass_trigger(event, config_.required_triggers));
   out_.fill("muon_pt", mu.pt());
   out_.fill("muon_eta", mu.eta());
   out_.fill("muon_miniIso", mu.get<float>("miniPFRelIso_all"));

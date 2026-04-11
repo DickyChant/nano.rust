@@ -14,6 +14,8 @@ enum class BranchType {
   kUInt64,
   kFloat,
   kVecBool,
+  kVecUInt8,
+  kVecUInt16,
   kVecInt16,
   kVecInt32,
   kVecFloat
@@ -22,6 +24,7 @@ enum class BranchType {
 struct BranchSpec {
   std::string name;
   BranchType type;
+  bool optional = false;
 };
 
 struct BranchInfo {

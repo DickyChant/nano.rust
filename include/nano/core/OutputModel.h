@@ -14,6 +14,7 @@ public:
   bool has(std::string_view name) const;
   void reset();
 
+  const std::unordered_map<std::string, OutputValue> &defaults() const { return defaults_; }
   const std::unordered_map<std::string, OutputValue> &values() const { return values_; }
 
 private:

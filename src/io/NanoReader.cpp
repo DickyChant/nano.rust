@@ -73,6 +73,44 @@ NanoReader::NanoReader(std::string ntuple_name, std::string file_name, BranchSch
 void NanoReader::bind_branches() {
   for (const auto &spec : schema_.specs()) {
     if (!tree_->GetBranch(spec.name.c_str())) {
+      if (spec.optional) {
+        switch (spec.type) {
+          case BranchType::kBool:
+            fields_[spec.name] = make_scalar_field<bool>();
+            break;
+          case BranchType::kInt32:
+            fields_[spec.name] = make_scalar_field<std::int32_t>();
+            break;
+          case BranchType::kUInt32:
+            fields_[spec.name] = make_scalar_field<std::uint32_t>();
+            break;
+          case BranchType::kUInt64:
+            fields_[spec.name] = make_scalar_field<std::uint64_t>();
+            break;
+          case BranchType::kFloat:
+            fields_[spec.name] = make_scalar_field<float>();
+            break;
+          case BranchType::kVecBool:
+            fields_[spec.name] = make_vector_field<bool>();
+            break;
+          case BranchType::kVecUInt8:
+            fields_[spec.name] = make_vector_field<std::uint8_t>();
+            break;
+          case BranchType::kVecUInt16:
+            fields_[spec.name] = make_vector_field<std::uint16_t>();
+            break;
+          case BranchType::kVecInt16:
+            fields_[spec.name] = make_vector_field<std::int16_t>();
+            break;
+          case BranchType::kVecInt32:
+            fields_[spec.name] = make_vector_field<std::int32_t>();
+            break;
+          case BranchType::kVecFloat:
+            fields_[spec.name] = make_vector_field<float>();
+            break;
+        }
+        continue;
+      }
       throw std::runtime_error("Missing branch in TTree: " + spec.name);
     }
 
@@ -106,6 +144,16 @@ void NanoReader::bind_branches() {
         fields_[spec.name] = make_vector_field<bool>();
         loaders_.push_back(std::make_unique<ArrayLoader<Bool_t, bool>>(
             *reader_, spec.name, std::get<std::shared_ptr<std::vector<bool>>>(fields_[spec.name])));
+        break;
+      case BranchType::kVecUInt8:
+        fields_[spec.name] = make_vector_field<std::uint8_t>();
+        loaders_.push_back(std::make_unique<ArrayLoader<UChar_t, std::uint8_t>>(
+            *reader_, spec.name, std::get<std::shared_ptr<std::vector<std::uint8_t>>>(fields_[spec.name])));
+        break;
+      case BranchType::kVecUInt16:
+        fields_[spec.name] = make_vector_field<std::uint16_t>();
+        loaders_.push_back(std::make_unique<ArrayLoader<UShort_t, std::uint16_t>>(
+            *reader_, spec.name, std::get<std::shared_ptr<std::vector<std::uint16_t>>>(fields_[spec.name])));
         break;
       case BranchType::kVecInt16:
         fields_[spec.name] = make_vector_field<std::int16_t>();

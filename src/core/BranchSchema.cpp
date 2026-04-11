@@ -9,7 +9,7 @@ namespace nano {
 namespace {
 
 bool is_vector_type(BranchType type) {
-  return type == BranchType::kVecBool || type == BranchType::kVecInt16 || type == BranchType::kVecInt32 ||
+  return type == BranchType::kVecBool || type == BranchType::kVecUInt8 || type == BranchType::kVecUInt16 || type == BranchType::kVecInt16 || type == BranchType::kVecInt32 ||
          type == BranchType::kVecFloat;
 }
 

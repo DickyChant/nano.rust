@@ -86,6 +86,10 @@ const std::vector<T> &Event::vector(std::string_view branch_name) const {
   const auto &field = reader_.field(branch_name);
   if constexpr (std::is_same_v<T, bool>) {
     return *std::get<std::shared_ptr<std::vector<bool>>>(field);
+  } else if constexpr (std::is_same_v<T, std::uint8_t>) {
+    return *std::get<std::shared_ptr<std::vector<std::uint8_t>>>(field);
+  } else if constexpr (std::is_same_v<T, std::uint16_t>) {
+    return *std::get<std::shared_ptr<std::vector<std::uint16_t>>>(field);
   } else if constexpr (std::is_same_v<T, std::int32_t>) {
     return *std::get<std::shared_ptr<std::vector<std::int32_t>>>(field);
   } else if constexpr (std::is_same_v<T, std::int16_t>) {

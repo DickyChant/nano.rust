@@ -32,6 +32,10 @@ Collection::Collection(Event &event, std::string object_name) : event_(event), o
     }
     if (info->type == BranchType::kVecFloat) {
       size = std::max(size, event.vector<float>(info->full_name).size());
+    } else if (info->type == BranchType::kVecUInt8) {
+      size = std::max(size, event.vector<std::uint8_t>(info->full_name).size());
+    } else if (info->type == BranchType::kVecUInt16) {
+      size = std::max(size, event.vector<std::uint16_t>(info->full_name).size());
     } else if (info->type == BranchType::kVecInt16) {
       size = std::max(size, event.vector<std::int16_t>(info->full_name).size());
     } else if (info->type == BranchType::kVecInt32) {

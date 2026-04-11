@@ -1,0 +1,3 @@
+[submodule "external/CMSJMECalculators"]
+	path = external/CMSJMECalculators
+	url = https://gitlab.cern.ch/cms-analysis/general/CMSJMECalculators.git
