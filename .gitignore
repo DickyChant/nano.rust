@@ -50,7 +50,6 @@ run/
 !configs/run/*.yaml
 out.root
 tests/data/muon_validation/inputs/
-tests/data/muon_validation/references/
 data/jme-derived/Run2-2016preVFP-UL-NanoAODv9/latest/fatJet_jerc.json.gz
 CLAUDE.md
 AGENTS.md
@@ -58,4 +57,6 @@ AGENTS.md
 
 # Temp
 references/
+!tests/data/muon_validation/references/
+!tests/data/muon_validation/references/**
 tmp/
