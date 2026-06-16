@@ -258,8 +258,9 @@ void HeavyFlavBaseProducer::load_gen_history(Event &event, std::vector<ObjectVie
 // Reset and fill event-level output shared by all heavy-flavour channels:
 // identifiers, era/lumi labels, MET filters, L1 prefiring, lepton count, HT,
 // corrected MET, generator weight, optional LHE weights, PU weights, and top-pt
-// weights.
-void HeavyFlavBaseProducer::fill_base_event_info(Event &event) {
+// weights. LHE weights are copied only to the nominal output stream because the
+// same input vector would otherwise be duplicated across every JME variation.
+void HeavyFlavBaseProducer::fill_base_event_info(Event &event, JmeVariation variation) {
   out_.reset();
   out_.fill("run", event.scalar<std::uint32_t>("run"));
   out_.fill("luminosityBlock", event.scalar<std::uint32_t>("luminosityBlock"));
@@ -293,8 +294,9 @@ void HeavyFlavBaseProducer::fill_base_event_info(Event &event) {
   out_.fill("jetVetoFlag", event.has("jetVetoFlag") ? event.get<std::int32_t>("jetVetoFlag") : std::int32_t{-99});
   out_.fill("genWeight", event.is_mc() ? event.scalar<float>("genWeight") : 1.0f);
   if (config_.include_lhe_weights) {
-    out_.fill("LHEScaleWeight",
-              event.has_physical_branch("LHEScaleWeight") ? event.vector<float>("LHEScaleWeight") : std::vector<float>{});
+    out_.fill("LHEScaleWeight", variation == JmeVariation::Nominal && event.has_physical_branch("LHEScaleWeight")
+                                    ? event.vector<float>("LHEScaleWeight")
+                                    : std::vector<float>{});
   }
   pu_weight_producer_->fill(event, out_);
   top_pt_weight_producer_->fill(event, out_);

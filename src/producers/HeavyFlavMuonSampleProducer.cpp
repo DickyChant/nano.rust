@@ -115,7 +115,7 @@ bool HeavyFlavMuonSampleProducer::analyze_variation(Event &event, const JmeEvent
   // The muon channel keeps only the leading probe jet in the current workflow.
   probe_jets.erase(probe_jets.begin() + 1, probe_jets.end());
 
-  fill_base_event_info(event);
+  fill_base_event_info(event, variation);
   fill_fatjet_info(event, probe_jets);
 
   out_.fill("passMuTrig", pass_trigger(event, config_.required_triggers));

@@ -104,7 +104,7 @@ protected:
   JmeEventResult compute_jme(Event &event) const;
   void apply_jme_and_select_jets(Event &event, const JmeEventResult &jme_result, JmeVariation variation) const;
   void load_gen_history(Event &event, std::vector<ObjectView> &fatjets) const;
-  void fill_base_event_info(Event &event);
+  void fill_base_event_info(Event &event, JmeVariation variation);
   void fill_fatjet_info(Event &event, const std::vector<ObjectView> &fatjets);
 
   ProducerConfig config_;
