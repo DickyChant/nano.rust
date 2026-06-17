@@ -132,7 +132,7 @@ Create a Condor work directory from a sample YAML:
 
 ```bash
 build/nano_make_condor \
-  --input-yaml configs/samples/muon_2018_v9_samples.yaml \
+  --input-yaml configs/samples/muon_2018_v9_MC.yaml \
   --output-dir /path/to/output \
   --config configs/run/muon_2018_v9.yaml \
   --channel muon \
