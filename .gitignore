@@ -48,12 +48,12 @@ Thumbs.db
 run/
 !configs/run/
 !configs/run/*.yaml
+jobs/
 out.root
 tests/data/muon_validation/inputs/
 data/jme-derived/Run2-2016preVFP-UL-NanoAODv9/latest/fatJet_jerc.json.gz
 CLAUDE.md
 AGENTS.md
-.gitignore
 
 # Temp
 references/

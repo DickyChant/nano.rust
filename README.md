@@ -14,11 +14,11 @@ The guiding idea is:
 
 > Agents write, you review.
 
-The framework is designed so AI agents can write straightforward C++ while humans can still review the physics logic directly.
+The framework is designed so AI agents can write straightforward C++ while humans can still review the physics logic in a direct, readable way.
 
 ## Why This Exists
 
-The original NanoAOD-tools code is Python-based and flexible, but it is not as fast as columnar analysis frameworks such as RDataFrame or coffea. This repository keeps the useful NanoAOD-tools programming model and moves the event processing to C++ for faster ntuplization.
+The original NanoAOD-tools code is Python-based and flexible, but it is not as fast as columnar analysis frameworks such as RDataFrame or awkward-array/coffea. This repository keeps the useful NanoAOD-tools programming model and moves the event processing to C++ for faster ntuplization.
 
 The intended style is explicit event-level code:
 
@@ -46,11 +46,18 @@ In practice this means:
 
 - Object collections are accessed from the event, for example `event.collection("FatJet")`.
 - NanoAOD branches are accessed as typed object attributes, for example `fj.get<float>("msoftdrop")`.
-- New event-level values can be attached to `event`, for example selected muons, corrected MET, or the reconstructed W candidate.
-- New object-level features can be attached to each object, for example corrected four-vectors, linked subjets, or gen-matching labels on a fatjet.
-- Channel producers are plain C++ event loops.
+- New event-level values can be attached to `event`, for example:
+  - attach selected muons: `event.set("muons", selected_muons);`
+  - attach corrected MET: `event.set("met_pt", corrected_met_pt);`
+  - attach the reconstructed W candidate: `event.set("leptonicW", leptonic_w);`
+- New object-level features can be attached to each object, for example:
+  - attach corrected four-vectors: `auto corrected_p4 = polar_p4(obj); obj.set("p4", corrected_p4);`
+  - attach linked subjets to a given fatjet: `fj.set("subjets", linked_subjets);`
+- Channel producers are plain C++ event loops. In the main `analyze()` function, use `return false` to veto an event.
 - A YAML card in `configs/run/` contains all information to guide the run.
 - Corrections use modern correctionlib payloads where possible. JEC and MET corrections build on the CMSJMECalculators project.
+
+You do not need to write this code or worry about C++ syntax; agents will fill in the implementation, and you only need to review it.
 
 ## Current Scope
 
@@ -65,7 +72,7 @@ Main files:
 - `configs/run/`: runnable YAML cards.
 - `configs/samples/`: dataset YAML files for batch submission.
 
-For framework details, read `docs/framework-structure.md`.
+For agents: for framework details, read `docs/framework-structure.md`.
 
 ## Build the Project
 
@@ -82,13 +89,13 @@ cmake -S . -B build
 cmake --build build -j
 ```
 
-## Run One Input
+## Process One Input
 
 Example using a local validation file:
 
 ```bash
 build/nano_run \
-  --input-files tests/data/muon_validation/inputs/ttbarsl_2018_nanov9_example.root \
+  --input-files /store/mc/RunIISummer20UL18NanoAODv9/TTToSemiLeptonic_TuneCP5_13TeV-powheg-pythia8/NANOAODSIM/106X_upgrade2018_realistic_v16_L1v1-v1/120000/87DEE912-70CF-A549-B10B-1A229B256E88.root \
   --output-file run/muon_2018_test.root \
   --config configs/run/muon_2018_v9.yaml \
   --channel muon \

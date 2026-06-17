@@ -179,14 +179,26 @@ inline std::vector<std::string> yaml_string_list(const YAML::Node &node, const s
   return out;
 }
 
+inline void append_yaml_strings(const YAML::Node &node, std::vector<std::string> &out) {
+  if (node.IsScalar()) {
+    out.push_back(node.as<std::string>());
+    return;
+  }
+  if (node.IsSequence()) {
+    for (const auto &item : node) {
+      append_yaml_strings(item, out);
+    }
+    return;
+  }
+  throw std::runtime_error("Sample YAML entries must be strings or nested string lists");
+}
+
 inline std::map<std::string, std::vector<std::string>> parse_sample_yaml(const std::string &path) {
   const auto root = YAML::LoadFile(path);
   std::map<std::string, std::vector<std::string>> out;
   for (const auto &item : root) {
     const auto key = item.first.as<std::string>();
-    for (const auto &entry : item.second) {
-      out[key].push_back(entry.as<std::string>());
-    }
+    append_yaml_strings(item.second, out[key]);
   }
   return out;
 }
@@ -235,7 +247,7 @@ inline std::vector<std::string> resolve_dataset_entry(const std::string &entry) 
   const auto normalized = normalize_input_path(entry);
   if (starts_with(entry, "/") && std::count(entry.begin(), entry.end(), '/') >= 3 && !fs::exists(entry) && !starts_with(entry, "/store/")) {
     std::vector<std::string> files;
-    const auto output = run_command("dasgoclient -query=\"file dataset=" + entry + "\"");
+    const auto output = run_command("env -u PYTHONHOME -u PYTHONPATH dasgoclient -query=\"file dataset=" + entry + "\"");
     std::stringstream ss(output);
     std::string line;
     while (std::getline(ss, line)) {

@@ -3,6 +3,7 @@ import argparse
 import math
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import ROOT
@@ -107,13 +108,55 @@ CORRECTION_DEPENDENT_BRANCHES = {"ht", "leptonicW_pt"}
 
 
 def tree(path):
-    f = ROOT.TFile.Open(str(path), "READ")
+    path = str(path)
+    if path.startswith("/store/"):
+        path = "root://cms-xrd-global.cern.ch/" + path
+    f = ROOT.TFile.Open(path, "READ")
     if not f or f.IsZombie():
         raise RuntimeError(f"cannot open {path}")
     t = f.Get("Events")
     if not t:
         raise RuntimeError(f"missing Events tree in {path}")
     return f, t
+
+
+def markdown_code(text):
+    text = text.strip()
+    if text.startswith("`") and text.endswith("`"):
+        return text[1:-1]
+    return text
+
+
+def store_path(path):
+    path = markdown_code(path)
+    if path.startswith("/store/"):
+        return path
+    marker = "/store/"
+    pos = path.find(marker)
+    if pos >= 0:
+        return path[pos:]
+    return path
+
+
+@lru_cache(maxsize=None)
+def remote_inputs_from_readme(source_dir):
+    readme = Path(source_dir) / DATA_DIR / "README.md"
+    if not readme.exists():
+        return {}
+
+    remote_inputs = {}
+    for line in readme.read_text().splitlines():
+        line = line.strip()
+        if not line.startswith("|") or "`" not in line:
+            continue
+        columns = [column.strip() for column in line.strip("|").split("|")]
+        if len(columns) < 3:
+            continue
+        local_file = markdown_code(columns[1])
+        original_path = store_path(columns[2])
+        if local_file.startswith("inputs/") and original_path:
+            remote_inputs[f"{DATA_DIR}/{local_file}"] = original_path
+    return remote_inputs
 
 
 def branch_names(t):
@@ -373,8 +416,14 @@ def resolve_input(source_dir, input_file):
         return input_file
     path = Path(input_file)
     if path.is_absolute():
-        return str(path)
-    return str(source_dir / path)
+        resolved = path
+        lookup = str(path)
+    else:
+        resolved = source_dir / path
+        lookup = str(path)
+    if resolved.exists():
+        return str(resolved)
+    return remote_inputs_from_readme(source_dir).get(lookup, str(resolved))
 
 
 def run_case(case, source_dir, build_dir, output_dir, max_input_events=None, report=None):
