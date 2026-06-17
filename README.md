@@ -1,6 +1,6 @@
-# NanoAODTools.Cpp
+# nano.cpp
 
-NanoAODTools.Cpp is a C++ rewrite of selected [NanoAOD-tools](https://github.com/cms-nanoAOD/nanoAOD-tools)/[NanoHRTTools](https://github.com/hqucms/NanoHRT-tools) workflows.
+`nano.cpp` (also named as `NanoAODTools.Cpp`) is a C++ rewrite of selected [NanoAOD-tools](https://github.com/cms-nanoAOD/nanoAOD-tools)/[NanoHRTTools](https://github.com/hqucms/NanoHRT-tools) workflows.
 
 The goal is to keep the analysis logic human-readable while making the event loop faster and easier to validate. The style is intentionally close to the traditional ROOT event loop:
 
