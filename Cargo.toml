@@ -1,11 +1,10 @@
 # nano.rust — Rust rewrite of the nano.cpp NanoAOD analysis framework.
 # The C++ tree (CMake) still builds alongside this during the migration;
-# see docs/rust-migration.md. The forked ROOT I/O crate lives at
-# external/alice-rs/root-io and is brought in by nano-io once it builds standalone.
+# see docs/rust-migration.md. ROOT I/O lives in-tree at crates/root-io
+# (vendored from alice-rs, MPL-2.0, extended with a native write path).
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["external/alice-rs/root-io"]
 
 [workspace.package]
 version = "0.0.0"
@@ -16,5 +15,4 @@ repository = "https://github.com/DickyChant/nano.rust"
 [workspace.dependencies]
 nano-core = { path = "crates/nano-core" }
 nano-io = { path = "crates/nano-io" }
-# Brought online after the root-io fork builds standalone as a path dependency:
-# root-io = { path = "external/alice-rs/root-io" }
+root-io = { path = "crates/root-io" }

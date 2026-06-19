@@ -1,0 +1,44 @@
+[package]
+name = "root-io"
+version = "0.3.0"
+# Vendored from https://github.com/cbourjau/alice-rs (the `root-io` crate, MPL-2.0)
+# and evolved in-tree for nano.rust: ALICE remote-fetch (alice-open-data/reqwest)
+# dropped, native ROOT write path added here. Original author retained below.
+authors = ["cbourjau <c.bourjau@posteo.de>", "nano.rust contributors"]
+exclude = ["*test_data/", "*.root"]
+description = "Reading/writing of ROOT binary files; vendored from alice-rs, extended for nano.rust"
+repository = "https://github.com/DickyChant/nano.rust"
+readme = "README.md"
+keywords = ["root", "cern", "physics"]
+categories = ["parser-implementations", "science", "data-structures"]
+license = "MPL-2.0"
+edition = "2021"
+
+[dependencies]
+bitflags = "1.0.0"
+failure = "0.1"
+flate2 = "^1"
+futures = "0.3"
+nom = "^7"
+lzma-rs = "0.1.1"
+quote = "0.3.15"
+uuid = "0.8.2"
+lz4-compress = "0.1.1"
+regex = "1.8.1"
+
+[features]
+default = []
+# Remote ALICE-open-data HTTP source, kept gated and dep-free in-tree (the
+# reqwest/alice-open-data backing was removed). Not used by nano.rust.
+remote = []
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4.10"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen = "0.2.60"
+wasm-bindgen-test = "0.3.10"
+web-sys = { version = "0.3.4", features = ["console"] }

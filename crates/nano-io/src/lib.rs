@@ -43,7 +43,7 @@ mod tests {
 
     #[tokio::test]
     async fn reads_simple_root_i32_branch() {
-        let path = Path::new("../../external/alice-rs/root-io/src/test_data/simple.root");
+        let path = Path::new("../root-io/src/test_data/simple.root");
         let values = read_i32_branch(path, "one").await.unwrap();
         assert_eq!(values, vec![1, 2, 3, 4]);
     }
