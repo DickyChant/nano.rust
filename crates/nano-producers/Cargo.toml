@@ -1,0 +1,10 @@
+[package]
+name = "nano-producers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Channel producers for the nano.rust event loop"
+
+[dependencies]
+nano-core = { workspace = true }

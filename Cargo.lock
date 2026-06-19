@@ -352,9 +352,17 @@ dependencies = [
  "failure",
  "futures",
  "nano-core",
+ "nano-producers",
  "nom",
  "root-io",
  "tokio",
+]
+
+[[package]]
+name = "nano-producers"
+version = "0.0.0"
+dependencies = [
+ "nano-core",
 ]
 
 [[package]]

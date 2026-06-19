@@ -15,4 +15,5 @@ repository = "https://github.com/DickyChant/nano.rust"
 [workspace.dependencies]
 nano-core = { path = "crates/nano-core" }
 nano-io = { path = "crates/nano-io" }
+nano-producers = { path = "crates/nano-producers" }
 root-io = { path = "crates/root-io" }
