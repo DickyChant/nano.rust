@@ -65,6 +65,10 @@ The implemented channel is:
 
 - `muon`: a heavy-flavour muon control region targeting semileptonic ttbar-like phase space, enriched in boosted top/W jets.
 
+### Direction: rewrite in Rust
+
+The implementation in this tree is C++17, but the framework is being repositioned toward **Rust**. Under the "agents write, you review" model, the language's safety floor matters most: Rust's explicit ownership/lifetime semantics and stronger compiler catch agent-authored mistakes at compile time instead of letting them become subtle physics bugs, and `cargo` removes the ROOT/CMake build friction. NanoAOD is TTree-based, so the pure-Rust [`root-io`](https://crates.io/crates/root-io) crate covers the input side (it is read-only — the output writer is the main open problem). The C++ implementation is frozen on the `cpp-snapshot` branch as the behavioral reference. Full rationale and staged plan: `docs/rust-migration.md`.
+
 Main files:
 
 - `app/nano_run.cpp`: local runner.

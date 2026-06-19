@@ -4,6 +4,10 @@
 /out/
 /dist/
 
+# Rust / Cargo
+/target/
+target/
+
 # CMake
 CMakeCache.txt
 CMakeFiles/

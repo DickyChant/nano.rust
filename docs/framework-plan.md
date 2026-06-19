@@ -1,5 +1,10 @@
 # NanoHRTTools C++ Framework Plan
 
+> **Status:** This documents the current **C++** scaffold, preserved on the `cpp-snapshot`
+> branch. The framework is being rewritten in **Rust** — see `docs/rust-migration.md` for the
+> rationale (agent-authored code + Rust's ownership/compiler guarantees) and the staged plan,
+> including ROOT I/O via the `root-io` crate. This file remains the C++ behavioral reference.
+
 ## Current scope
 
 This scaffold only covers the execution path of:

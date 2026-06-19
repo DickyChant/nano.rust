@@ -1,0 +1,17 @@
+[package]
+name = "nano-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NanoAOD ROOT input reading and skim output writing for nano.rust"
+
+[dependencies]
+nano-core = { workspace = true }
+failure = "0.1"
+futures = "0.3"
+nom = "^7"
+root-io = { path = "../../external/alice-rs/root-io", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

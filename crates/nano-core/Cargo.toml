@@ -1,0 +1,9 @@
+[package]
+name = "nano-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Event model and NanoAOD branch-grouping for the nano.rust framework"
+
+[dependencies]
