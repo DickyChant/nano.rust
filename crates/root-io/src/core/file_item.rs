@@ -1,8 +1,8 @@
-use failure::Error;
 use nom::multi::length_value;
 
 use crate::core::{checked_byte_count, decompress, Context, Source, TKeyHeader};
 use crate::tree_reader::{ttree, Tree};
+use crate::{Result, RootError};
 
 /// Describes a single item within this file (e.g. a `Tree`)
 #[derive(Debug)]
@@ -31,14 +31,15 @@ impl FileItem {
         )
     }
 
-    async fn get_buffer(&self) -> Result<Vec<u8>, Error> {
+    async fn get_buffer(&self) -> Result<Vec<u8>> {
         let start = self.tkey_hdr.seek_key + self.tkey_hdr.key_len as u64;
         let len = self.tkey_hdr.total_size - self.tkey_hdr.key_len as u32;
         let comp_buf = self.source.fetch(start, len as u64).await?;
 
         let buf = if self.tkey_hdr.total_size < self.tkey_hdr.uncomp_len {
             // Decompress the read buffer; buf is Vec<u8>
-            let (_, buf) = decompress(comp_buf.as_slice()).unwrap();
+            let (_, buf) = decompress(comp_buf.as_slice())
+                .map_err(|err| RootError::parse(format!("decompression parser failed: {err:?}")))?;
             buf
         } else {
             comp_buf
@@ -46,7 +47,7 @@ impl FileItem {
         Ok(buf)
     }
 
-    pub(crate) async fn get_context<'s>(&self) -> Result<Context, Error> {
+    pub(crate) async fn get_context<'s>(&self) -> Result<Context> {
         let buffer = self.get_buffer().await?;
         let k_map_offset = 2;
         Ok(Context {
@@ -57,7 +58,7 @@ impl FileItem {
     }
 
     /// Parse this `FileItem` as a `Tree`
-    pub async fn as_tree(&self) -> Result<Tree, Error> {
+    pub async fn as_tree(&self) -> Result<Tree> {
         let ctx = self.get_context().await?;
         let buf = ctx.s.as_slice();
 
@@ -65,7 +66,7 @@ impl FileItem {
         match res {
             Ok((_, obj)) => Ok(obj),
             Err(nom::Err::Error(e)) | Err(nom::Err::Failure(e)) => {
-                Err(format_err!("Supplied parser failed! {:?}", e))
+                Err(RootError::parse(format!("Supplied parser failed! {e:?}")))
             }
             _ => panic!(),
         }

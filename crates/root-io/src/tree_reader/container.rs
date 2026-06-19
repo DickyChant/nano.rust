@@ -1,9 +1,9 @@
-use failure::Error;
 use nom::combinator::rest;
 use nom::number::complete::*;
 use nom::*;
 
 use crate::core::*;
+use crate::{Result, RootError};
 
 #[derive(Debug, Clone)]
 pub(crate) enum Container {
@@ -15,14 +15,14 @@ pub(crate) enum Container {
 
 impl Container {
     /// Return the number of entries and the data; reading it from disk if necessary
-    pub(crate) async fn raw_data(self) -> Result<(u32, Vec<u8>), Error> {
+    pub(crate) async fn raw_data(self) -> Result<(u32, Vec<u8>)> {
         let buf = match self {
             Container::InMemory(buf) => buf,
             Container::OnDisk(source, seek, len) => source.fetch(seek, len).await?,
         };
         match tbasket2vec(buf.as_slice()) {
             Ok((_, v)) => Ok(v),
-            _ => Err(format_err!("tbasket2vec parser failed")),
+            _ => Err(RootError::parse("tbasket2vec parser failed")),
         }
     }
     // /// For debugging: Try to find the file of this container. Out of luck if the container was inlined
@@ -47,7 +47,9 @@ fn tbasket2vec(input: &[u8]) -> IResult<&[u8], (u32, Vec<u8>)> {
     let (input, _flag) = be_i8(input)?;
     let (input, buf) = rest(input)?;
     let buf = if hdr.uncomp_len as usize > buf.len() {
-        decompress(buf).unwrap().1
+        decompress(buf)
+            .map(|(_, out)| out)
+            .map_err(|_| nom::Err::Failure(nom::error::Error::new(input, error::ErrorKind::MapRes)))?
     } else {
         buf.to_vec()
     };

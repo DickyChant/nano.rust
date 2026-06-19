@@ -7,9 +7,7 @@ use nom::{
     IResult,
 };
 
-use quote::{Ident, Tokens};
-
-use crate::{code_gen::rust::ToRustType, core::*};
+use crate::core::*;
 
 /// Parse a bool from a big endian u8
 fn be_bool(i: &[u8]) -> IResult<&[u8], bool> {
@@ -202,20 +200,16 @@ impl TLeafBase {
     }
 }
 
-/// If we have more than one element make this
-fn arrayfy_maybe(ty_name: &str, len: usize) -> Tokens {
-    // not an array
-    let t = Ident::new(ty_name);
+fn arrayfy_maybe(ty_name: &str, len: usize) -> String {
     if len == 1 {
-        quote! {#t}
+        ty_name.to_string()
     } else {
-        // array
-        quote! {[#t; #len]}
+        format!("[{ty_name}; {len}]")
     }
 }
 
-impl ToRustType for TLeaf {
-    fn type_name(&self) -> Tokens {
+impl TLeaf {
+    pub(crate) fn type_name(&self) -> String {
         use TLeafVariant::*;
         let (type_name, len) = match &self.variant {
             TLeafO(l) => ("bool", l.base.flen),

@@ -18,10 +18,6 @@
 #[macro_use]
 extern crate bitflags;
 extern crate nom;
-#[macro_use]
-extern crate quote;
-#[macro_use]
-extern crate failure;
 extern crate flate2;
 extern crate lzma_rs;
 #[cfg(feature = "remote")]
@@ -30,9 +26,8 @@ extern crate reqwest;
 #[cfg(feature = "remote")]
 extern crate alice_open_data;
 
-// pub mod core_types;
-mod code_gen;
 pub mod core;
+pub mod error;
 pub mod test_utils;
 mod tests;
 pub mod tree_reader;
@@ -42,6 +37,7 @@ pub mod write;
 pub mod utils;
 
 pub use crate::core::{FileItem, RootFile, Source};
+pub use crate::error::{Result, RootError};
 
 /// Offset when using Context; should be in `Context`, maybe?
 const MAP_OFFSET: u64 = 2;

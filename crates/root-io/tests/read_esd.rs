@@ -2,7 +2,6 @@
 // exists in the `remote` build. Gating the file keeps the default build clean.
 #![cfg(feature = "remote")]
 
-use failure::Error;
 use futures::prelude::*;
 use nom::number::complete::*;
 use nom::sequence::tuple;
@@ -11,6 +10,7 @@ use root_io::{
     core::parsers::{parse_custom_mantissa, parse_tobjarray_of_tnameds},
     stream_zip,
     tree_reader::Tree,
+    Result,
     RootFile,
 };
 
@@ -34,7 +34,7 @@ struct Model {
 }
 
 impl Model {
-    async fn stream_from_tree(t: &Tree) -> Result<impl Stream<Item = Self> + '_, Error> {
+    async fn stream_from_tree(t: &Tree) -> Result<impl Stream<Item = Self> + '_> {
         let track_counter: Vec<_> = t
             .branch_by_name("Tracks")?
             .as_fixed_size_iterator(|i| be_u32(i))

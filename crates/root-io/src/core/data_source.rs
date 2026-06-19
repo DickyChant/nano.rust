@@ -4,12 +4,13 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::path::PathBuf;
 
-use failure::Error;
 #[cfg(feature = "remote")]
 use reqwest::{
     header::{RANGE, USER_AGENT},
     Client, Url,
 };
+
+use crate::Result;
 
 /// The source from where the Root file is read. Construct it using
 /// `.into()` on a `Path`, or on a `Url` when the `remote` feature is
@@ -32,7 +33,7 @@ impl Source {
         thing.into()
     }
 
-    pub async fn fetch(&self, start: u64, len: u64) -> Result<Vec<u8>, Error> {
+    pub async fn fetch(&self, start: u64, len: u64) -> Result<Vec<u8>> {
         match &self.0 {
             SourceInner::Local(path) => {
                 let mut f = File::open(path)?;

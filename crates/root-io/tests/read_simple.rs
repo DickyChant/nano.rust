@@ -1,10 +1,9 @@
 use std::pin::Pin;
 
-use failure::Error;
 use futures::{Stream, StreamExt};
 use nom::number::complete::*;
 
-use root_io::{core::parsers::string, stream_zip, tree_reader::Tree, RootFile};
+use root_io::{core::parsers::string, stream_zip, tree_reader::Tree, Result, RootFile};
 
 /// A model for the (or a subset) of the data.
 /// This is the object which contains the data of one "event"
@@ -17,7 +16,7 @@ struct Model {
 }
 
 impl Model {
-    fn stream_from_tree(t: Tree) -> Result<Pin<Box<dyn Stream<Item = Self>>>, Error> {
+    fn stream_from_tree(t: Tree) -> Result<Pin<Box<dyn Stream<Item = Self>>>> {
         Ok(stream_zip!(
             t.branch_by_name("one")?
                 .as_fixed_size_iterator(|i| be_i32(i)),

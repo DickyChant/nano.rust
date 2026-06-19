@@ -1,14 +1,14 @@
 use std::path::{Path, PathBuf};
 
 use nano_core::{BranchSchema, BranchSpec, BranchType};
-use nano_io::reader::read_events;
+use nano_io::read_events;
 use nano_io::writer::{write_events, OutputBranch};
 use nano_producers::MuonProducer;
 
 // This validates Phase-1 plumbing with synthetic data. It is not physics
 // validation against the C++ references or correction payloads.
-#[tokio::test]
-async fn synthetic_muon_skim_round_trips_through_root_io() {
+#[test]
+fn synthetic_muon_skim_round_trips_through_root_io() {
     let input_path = temp_root_path("synthetic_muon_input.root");
     let skim_path = temp_root_path("synthetic_muon_skim.root");
     let _ = std::fs::remove_file(&input_path);
@@ -29,7 +29,7 @@ async fn synthetic_muon_skim_round_trips_through_root_io() {
     ])
     .unwrap();
 
-    let events = read_events(&input_path, input_schema).await.unwrap();
+    let events = read_events(&input_path, input_schema).unwrap();
     assert_eq!(events.len(), 5);
     assert_eq!(events[0].scalar::<bool>("pass_preselection").unwrap(), true);
     assert_eq!(events[4].scalar::<u64>("event").unwrap(), 1005);
@@ -76,7 +76,7 @@ async fn synthetic_muon_skim_round_trips_through_root_io() {
         BranchSpec::new("lead_muon_pt", BranchType::F32),
     ])
     .unwrap();
-    let skim_events = read_events(&skim_path, skim_schema).await.unwrap();
+    let skim_events = read_events(&skim_path, skim_schema).unwrap();
 
     assert_eq!(skim_events.len(), 3);
     assert_eq!(

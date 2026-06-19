@@ -9,7 +9,6 @@ use std::io::Read;
 /// themselves.
 use std::str;
 
-use failure::Error;
 use flate2::bufread::ZlibDecoder;
 use lz4_compress::decompress as lz4_decompress;
 use lzma_rs::xz_decompress;
@@ -25,6 +24,7 @@ use nom::{
 };
 
 use crate::core::*;
+use crate::RootError;
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_byte_count(v: &u32) -> bool {
@@ -161,34 +161,35 @@ fn decode_reader<'s>(bytes: &'s [u8], magic: &[u8]) -> nom::IResult<&'s [u8], Ve
             let mut ret = vec![];
             let mut decoder = ZlibDecoder::new(bytes);
             decoder.read_to_end(&mut ret)?;
-            Ok::<_, Error>(ret)
+            Ok::<_, RootError>(ret)
         })(bytes),
         b"XZ" => map_res(rest, |bytes| {
             let mut ret = vec![];
             let mut reader = std::io::BufReader::new(bytes);
-            xz_decompress(&mut reader, &mut ret).unwrap();
-            Ok::<_, Error>(ret)
+            xz_decompress(&mut reader, &mut ret)
+                .map_err(|err| RootError::decompression(format!("{err:?}")))?;
+            Ok::<_, RootError>(ret)
         })(bytes),
         b"L4" => {
             let (bytes, _checksum) = be_u64(bytes)?;
-            map_res(rest, lz4_decompress)(bytes)
+            map_res(rest, |bytes| {
+                lz4_decompress(bytes).map_err(|err| RootError::decompression(err.to_string()))
+            })(bytes)
         }
         b"ZS" => map_res(rest, |bytes| {
             // ROOT's zstd block ("ZS"): the remaining bytes are a standalone
             // zstd frame. Decoded with the pure-Rust ruzstd implementation.
             let mut ret = vec![];
             let mut decoder = ruzstd::StreamingDecoder::new(bytes)
-                .map_err(|e| failure::format_err!("zstd init: {e}"))?;
+                .map_err(|err| RootError::decompression(format!("zstd init: {err}")))?;
             decoder.read_to_end(&mut ret)?;
-            Ok::<_, Error>(ret)
+            Ok::<_, RootError>(ret)
         })(bytes),
         m => {
             // Unsupported algorithm: surface it instead of panicking.
             let magic = String::from_utf8_lossy(m).into_owned();
             map_res(rest, move |_| {
-                Err::<Vec<u8>, Error>(failure::format_err!(
-                    "unsupported ROOT compression algorithm `{magic}`"
-                ))
+                Err::<Vec<u8>, RootError>(RootError::UnsupportedCompression(magic.clone()))
             })(bytes)
         }
     }

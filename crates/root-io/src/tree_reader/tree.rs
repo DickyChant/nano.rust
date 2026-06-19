@@ -2,7 +2,6 @@ use std::fmt;
 use std::fmt::Debug;
 use std::ops::Deref;
 
-use failure::Error;
 use nom::{
     combinator::{cond, peek, verify},
     multi::{count, length_data, length_value},
@@ -14,6 +13,7 @@ use nom::{
 use crate::{
     core::parsers::*, core::types::*, tree_reader::branch::tbranch_hdr,
     tree_reader::branch::TBranch, tree_reader::leafs::TLeaf,
+    Result, RootError,
 };
 
 /// `TTree` potentially has members with very large `Vec<u8>` buffers
@@ -107,19 +107,19 @@ impl Tree {
             .collect()
     }
 
-    pub fn branch_by_name(&self, name: &str) -> Result<&TBranch, Error> {
+    pub fn branch_by_name(&self, name: &str) -> Result<&TBranch> {
         self.branches()
             .into_iter()
             .find(|b| b.name == name)
             .ok_or_else(|| {
-                format_err!(
+                RootError::other(format!(
                     "Branch {} not found in tree: \n {:#?}",
                     name,
                     self.branches()
                         .iter()
                         .map(|b| b.name.to_owned())
                         .collect::<Vec<_>>()
-                )
+                ))
             })
     }
 }

@@ -5,11 +5,30 @@
 //! (`bool`, `i32`, `u32`, `u64`, `f32`, `Vec<f32>`) plus filtered
 //! `Runs`/`LuminosityBlocks`. See `docs/rust-migration.md`.
 
+use std::path::Path;
+
+use futures::executor::block_on;
+use nano_core::{BranchSchema, Event};
+pub use root_io::{Result, RootError};
+
+/// Synchronously read the `Events` TTree from a ROOT file into one [`Event`] per entry.
+pub fn read_events(path: &Path, schema: BranchSchema) -> Result<Vec<Event>> {
+    block_on(reader::read_events(path, schema))
+}
+
+/// Synchronously read one named TTree from a ROOT file into one [`Event`] per entry.
+pub fn read_events_from_tree(
+    path: &Path,
+    tree_name: &str,
+    schema: BranchSchema,
+) -> Result<Vec<Event>> {
+    block_on(reader::read_events_from_tree(path, tree_name, schema))
+}
+
 pub mod reader {
     use std::collections::HashMap;
     use std::path::Path;
 
-    use failure::Error;
     use futures::StreamExt;
     use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
     use nom::number::complete::{
@@ -18,8 +37,10 @@ pub mod reader {
     use root_io::tree_reader::Tree;
     use root_io::RootFile;
 
+    use crate::{Result, RootError};
+
     /// Read the `Events` TTree from a ROOT file into one [`Event`] per entry.
-    pub async fn read_events(path: &Path, schema: BranchSchema) -> Result<Vec<Event>, Error> {
+    pub async fn read_events(path: &Path, schema: BranchSchema) -> Result<Vec<Event>> {
         read_events_from_tree(path, "Events", schema).await
     }
 
@@ -28,7 +49,7 @@ pub mod reader {
         path: &Path,
         tree_name: &str,
         schema: BranchSchema,
-    ) -> Result<Vec<Event>, Error> {
+    ) -> Result<Vec<Event>> {
         let file = RootFile::new(path).await?;
         let tree = tree_by_name_or_first(&file, path, tree_name).await?;
         let columns = read_columns(&tree, schema.specs()).await?;
@@ -38,7 +59,7 @@ pub mod reader {
         for entry in 0..n_entries {
             events.push(
                 Event::from_columns(schema.clone(), columns.clone(), entry)
-                    .map_err(|err| failure::format_err!("{err}"))?,
+                    .map_err(|err| RootError::other(err.to_string()))?,
             );
         }
         Ok(events)
@@ -48,7 +69,7 @@ pub mod reader {
         file: &RootFile,
         path: &Path,
         tree_name: &str,
-    ) -> Result<Tree, Error> {
+    ) -> Result<Tree> {
         if let Some(item) = file
             .items()
             .iter()
@@ -60,7 +81,7 @@ pub mod reader {
         file.items()
             .iter()
             .find(|item| item.verbose_info().contains("TTree"))
-            .ok_or_else(|| failure::format_err!("No TTree found in {}", path.display()))?
+            .ok_or_else(|| RootError::other(format!("No TTree found in {}", path.display())))?
             .as_tree()
             .await
     }
@@ -68,7 +89,7 @@ pub mod reader {
     async fn read_columns(
         tree: &Tree,
         specs: &[BranchSpec],
-    ) -> Result<HashMap<String, BranchColumn>, Error> {
+    ) -> Result<HashMap<String, BranchColumn>> {
         let mut columns = HashMap::new();
 
         for spec in specs.iter().filter(|spec| !spec.branch_type.is_vector()) {
@@ -98,7 +119,7 @@ pub mod reader {
         Ok(columns)
     }
 
-    async fn read_scalar_column(tree: &Tree, spec: &BranchSpec) -> Result<BranchColumn, Error> {
+    async fn read_scalar_column(tree: &Tree, spec: &BranchSpec) -> Result<BranchColumn> {
         let branch = tree.branch_by_name(&spec.name)?;
         let column = match spec.branch_type {
             BranchType::Bool => BranchColumn::Bool(
@@ -135,11 +156,11 @@ pub mod reader {
                 BranchColumn::F32(branch.as_fixed_size_iterator(|i| be_f32(i)).collect().await)
             }
             branch_type => {
-                return Err(failure::format_err!(
+                return Err(RootError::other(format!(
                     "branch `{}` has non-scalar type {:?}",
                     spec.name,
                     branch_type
-                ));
+                )));
             }
         };
         Ok(column)
@@ -149,7 +170,7 @@ pub mod reader {
         tree: &Tree,
         spec: &BranchSpec,
         columns: &HashMap<String, BranchColumn>,
-    ) -> Result<BranchColumn, Error> {
+    ) -> Result<BranchColumn> {
         let branch = tree.branch_by_name(&spec.name)?;
         let count_branch = count_branch_name(&spec.name)?;
         let counts = if let Some(BranchColumn::U32(values)) = columns.get(&count_branch) {
@@ -223,21 +244,21 @@ pub mod reader {
                     .await,
             ),
             branch_type => {
-                return Err(failure::format_err!(
+                return Err(RootError::other(format!(
                     "branch `{}` has non-vector type {:?}",
                     spec.name,
                     branch_type
-                ));
+                )));
             }
         };
         Ok(column)
     }
 
-    fn count_branch_name(branch_name: &str) -> Result<String, Error> {
+    fn count_branch_name(branch_name: &str) -> Result<String> {
         let (object_name, _) = branch_name.split_once('_').ok_or_else(|| {
-            failure::format_err!(
+            RootError::other(format!(
                 "cannot infer NanoAOD count branch for vector branch `{branch_name}`"
-            )
+            ))
         })?;
         Ok(format!("n{object_name}"))
     }
@@ -246,8 +267,9 @@ pub mod reader {
 pub mod writer {
     use std::path::Path;
 
-    use failure::Error;
     use root_io::write::{write_tree, Branch};
+
+    use crate::Result;
 
     /// One selected output column for the `Events` skim tree.
     #[derive(Debug, Clone, PartialEq)]
@@ -298,7 +320,7 @@ pub mod writer {
     }
 
     /// Write selected rows to a skim TTree named `Events`.
-    pub fn write_events(path: &Path, branches: &[OutputBranch]) -> Result<(), Error> {
+    pub fn write_events(path: &Path, branches: &[OutputBranch]) -> Result<()> {
         let root_branches = branches
             .iter()
             .map(OutputBranch::to_root_branch)
@@ -310,19 +332,26 @@ pub mod writer {
 pub mod read {
     use std::path::Path;
 
-    use failure::Error;
+    use futures::executor::block_on;
     use futures::StreamExt;
     use nom::number::complete::be_i32;
     use root_io::RootFile;
 
+    use crate::{Result, RootError};
+
     /// Read an `i32` branch from the first TTree in a local ROOT file.
-    pub async fn read_i32_branch(path: &Path, branch_name: &str) -> Result<Vec<i32>, Error> {
+    pub fn read_i32_branch(path: &Path, branch_name: &str) -> Result<Vec<i32>> {
+        block_on(read_i32_branch_async(path, branch_name))
+    }
+
+    /// Asynchronously read an `i32` branch from the first TTree in a local ROOT file.
+    pub async fn read_i32_branch_async(path: &Path, branch_name: &str) -> Result<Vec<i32>> {
         let file = RootFile::new(path).await?;
         let tree = file
             .items()
             .iter()
             .find(|item| item.verbose_info().contains("TTree"))
-            .ok_or_else(|| failure::format_err!("No TTree found in {}", path.display()))?
+            .ok_or_else(|| RootError::other(format!("No TTree found in {}", path.display())))?
             .as_tree()
             .await?;
         let values = tree
@@ -340,10 +369,10 @@ mod tests {
 
     use super::read::read_i32_branch;
 
-    #[tokio::test]
-    async fn reads_simple_root_i32_branch() {
+    #[test]
+    fn reads_simple_root_i32_branch() {
         let path = Path::new("../root-io/src/test_data/simple.root");
-        let values = read_i32_branch(path, "one").await.unwrap();
+        let values = read_i32_branch(path, "one").unwrap();
         assert_eq!(values, vec![1, 2, 3, 4]);
     }
 }

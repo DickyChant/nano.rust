@@ -10,8 +10,8 @@ use nom::{
 };
 
 use crate::{
-    code_gen::rust::ToRustType, core::parsers::*, core::types::*,
-    tree_reader::container::Container, tree_reader::leafs::TLeaf,
+    core::parsers::*, core::types::*, tree_reader::container::Container,
+    tree_reader::leafs::TLeaf,
 };
 
 /// A `TBranch` describes one "Column" of a `TTree`
@@ -80,7 +80,7 @@ impl TBranch {
     pub fn element_types(&self) -> Vec<String> {
         self.fleaves
             .iter()
-            .map(|l| l.type_name().to_string())
+            .map(TLeaf::type_name)
             .collect()
     }
 
@@ -91,7 +91,6 @@ impl TBranch {
     ///
     /// # Example
     /// ```
-    /// extern crate failure;
     /// extern crate nom;
     /// extern crate root_io;
     /// use futures::StreamExt;

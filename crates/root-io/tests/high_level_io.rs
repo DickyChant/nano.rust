@@ -67,7 +67,6 @@ mod local {
                 .expect("Failed to open file");
             let mut s = String::new();
             f.streamer_info_as_yaml(&mut s).await.unwrap();
-            f.streamer_info_as_rust(&mut s).await.unwrap();
             for item in f.items() {
                 item.name();
                 if item.verbose_info().contains("TTree") {
@@ -89,7 +88,6 @@ mod local {
                 .expect("Failed to open file");
             let mut s = String::new();
             f.streamer_info_as_yaml(&mut s).await.unwrap();
-            f.streamer_info_as_rust(&mut s).await.unwrap();
             for item in f.items() {
                 item.name();
                 item.verbose_info();

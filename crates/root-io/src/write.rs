@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use failure::Error;
+use crate::{Result, RootError};
 
 const FILE_BEGIN: u32 = 100;
 const DIRECTORY_OFFSET: u64 = FILE_BEGIN as u64;
@@ -239,23 +239,23 @@ pub fn write_tree<P: AsRef<Path>>(
     path: P,
     tree_name: &str,
     branches: &[Branch],
-) -> Result<(), Error> {
+) -> Result<()> {
     if branches.is_empty() {
-        return Err(format_err!("cannot write a TTree without branches"));
+        return Err(RootError::other("cannot write a TTree without branches"));
     }
 
     let entries = branches[0].data.len();
     for branch in branches {
         if branch.name.is_empty() {
-            return Err(format_err!("branch names must not be empty"));
+            return Err(RootError::other("branch names must not be empty"));
         }
         if branch.data.len() != entries {
-            return Err(format_err!(
+            return Err(RootError::other(format!(
                 "branch `{}` has {} entries, expected {}",
                 branch.name,
                 branch.data.len(),
                 entries
-            ));
+            )));
         }
     }
 

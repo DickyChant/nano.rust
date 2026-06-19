@@ -1,10 +1,8 @@
 use std::f64::consts::PI;
 
-use failure::Error;
-use quote::*;
 use regex::Regex;
 
-use crate::code_gen::rust::{ToRustParser, ToRustType};
+use crate::{Result, RootError};
 
 /// Integer ID describing a streamed type in a `TStreamer`
 #[derive(Debug, Clone)]
@@ -49,7 +47,7 @@ pub(crate) enum PrimitiveID {
     KFloat,                   // 5 => "f32"
     KCharStar,                // 7 => "&'s str"
     KDouble,                  // 8 => "f64"
-    KDouble32(f64, f64, u32), // 9 => "f64"
+    KDouble32,                // 9 => "f64"
     KLegacyChar,              // 10 => unimplemented!()
     KUChar,                   // 11 => "u8"
     KUShort,                  // 12 => "u16"
@@ -63,7 +61,7 @@ pub(crate) enum PrimitiveID {
 }
 
 impl PrimitiveID {
-    fn new(id: i32, comment_str: &str) -> Result<PrimitiveID, Error> {
+    fn new(id: i32, comment_str: &str) -> Result<PrimitiveID> {
         use PrimitiveID::*;
         Ok(match id {
             1 => KChar,
@@ -101,7 +99,8 @@ impl PrimitiveID {
                             }
                         };
 
-                        KDouble32(mod_min, max, nbits)
+                        let _ = (mod_min, max, nbits);
+                        KDouble32
                     }
                     // No range specified. This is a normal f32.
                     None => KFloat,
@@ -117,13 +116,13 @@ impl PrimitiveID {
             17 => KULong64,
             18 => KBool,
             19 => KFloat16,
-            id => Err(format_err!("Invalid base type id {}", id))?,
+            id => Err(RootError::parse(format!("Invalid base type id {id}")))?,
         })
     }
 }
 
 impl TypeID {
-    pub(crate) fn new(id: i32, comment_str: &str) -> Result<TypeID, Error> {
+    pub(crate) fn new(id: i32, comment_str: &str) -> Result<TypeID> {
         use self::TypeID::*;
         Ok(match id {
             // -1 may mean that this branch / leaf has no data, or that it has an elements-per-entry array...
@@ -161,60 +160,6 @@ impl StlTypeID {
     }
 }
 
-impl ToRustType for TypeID {
-    fn type_name(&self) -> Tokens {
-        use self::TypeID::*;
-        let t = match self {
-            Primitive(ref id) | Offset(ref id) => id.type_name().to_string(),
-            Array(ref id) => format!("Vec<{}>", id.type_name()),
-            // "kObjectP"; might be null!
-            ObjectP => "Option<Raw<'s>>".to_string(),
-            String => "String".to_string(),
-            // Some funky things which we just treat as byte strings for now
-            Object | Stl | StlString | Streamer | Unknown(82) => "Vec<u8>".to_string(),
-            Any => "Vec<u8>".to_string(),
-            AnyP => "Vec<u8>".to_string(),
-            InvalidOrCounter(-1) => "u32".to_string(),
-            _ => panic!("{:?}: type not implemented, yet", self),
-        };
-        let t = Ident::new(t);
-        quote!(#t)
-    }
-}
-
-impl ToRustParser for PrimitiveID {
-    fn to_inline_parser(&self) -> Tokens {
-        match self {
-            PrimitiveID::KChar => quote! {nom::number::complete::be_i8},
-            PrimitiveID::KShort => quote! {nom::number::complete::be_i16},
-            PrimitiveID::KInt => quote! {nom::number::complete::be_i32},
-            PrimitiveID::KCounter => quote! {nom::number::complete::be_i32},
-            PrimitiveID::KLong => quote! {nom::number::complete::be_i64},
-            PrimitiveID::KFloat => quote! {nom::number::complete::be_f32},
-            PrimitiveID::KCharStar => quote! { c_string },
-            PrimitiveID::KDouble => quote! {nom::number::complete::be_f64},
-            // This one is nasty! Check the
-            // TFileBuffer.cxx sources in ROOT and:
-            // https://root.cern/root/html606/classTBufferFile.html#a44c2adb6fb1194ec999b84aed259e5bc
-            // and
-            // https://root.cern/root/html606/TStreamerElement_8cxx.html#a4d6c86845bee19cf28c93a531ec50f29
-            PrimitiveID::KDouble32(min, max, nbits) => {
-                quote!(parse_custom_mantissa(#min, #max, #nbits))
-            }
-            PrimitiveID::KLegacyChar => unimplemented!("{:?}: type not implemented, yet", self),
-            PrimitiveID::KUChar => quote! {nom::number::complete::be_u8},
-            PrimitiveID::KUShort => quote! {nom::number::complete::be_u16},
-            PrimitiveID::KUInt => quote! {nom::number::complete::be_u32},
-            PrimitiveID::KULong => quote! {nom::number::complete::be_u64},
-            PrimitiveID::KBits => quote! {nom::number::complete::be_u32},
-            PrimitiveID::KLong64 => quote! {nom::number::complete::be_i64},
-            PrimitiveID::KULong64 => quote! {nom::number::complete::be_u64},
-            PrimitiveID::KBool => quote! {nom::number::complete::be_u8},
-            PrimitiveID::KFloat16 => quote! {custom_float16},
-        }
-    }
-}
-
 impl PrimitiveID {
     pub(crate) fn type_name_str(&self) -> &str {
         use PrimitiveID::*;
@@ -227,7 +172,7 @@ impl PrimitiveID {
             KFloat => "f32",
             KCharStar => "&'s str",
             KDouble => "f64",
-            KDouble32(_, _, _) => "f64",
+            KDouble32 => "f64",
             KLegacyChar => unimplemented!("{:?}: type not implemented", self),
             KUChar => "u8",
             KUShort => "u16",
@@ -242,19 +187,12 @@ impl PrimitiveID {
     }
 }
 
-impl ToRustType for PrimitiveID {
-    fn type_name(&self) -> Tokens {
-        let t = Ident::new(self.type_name_str());
-        quote!(#t)
-    }
-}
-
 fn remove_whitespace(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// Very primitve logic for evaluating comment ranges
-fn evaluate_range_element(comment_str: &str) -> Result<f64, Error> {
+fn evaluate_range_element(comment_str: &str) -> Result<f64> {
     // Remove all whites spaces
     let comment_string = remove_whitespace(comment_str);
     let comment_str = comment_string.as_str();
@@ -276,7 +214,9 @@ fn evaluate_range_element(comment_str: &str) -> Result<f64, Error> {
         "pi/2" => PI / 2.,
         "pi/4" => PI / 4.,
         "pi" => PI,
-        s => Err(format_err!("Unrecognized element in comment string {}", s))?,
+        s => Err(RootError::parse(format!(
+            "Unrecognized element in comment string {s}"
+        )))?,
     };
 
     if negate {

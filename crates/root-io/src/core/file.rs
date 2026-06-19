@@ -1,6 +1,5 @@
 use std::fmt;
 
-use failure::Error;
 use nom::{
     self,
     bytes::complete::tag,
@@ -12,9 +11,9 @@ use nom::{
 use uuid::Uuid;
 
 use crate::{
-    code_gen::rust::{ToNamedRustParser, ToRustStruct},
     core::tstreamer::streamers,
     core::*,
+    Result, RootError,
     MAP_OFFSET,
 };
 
@@ -147,11 +146,11 @@ fn directory(input: &[u8]) -> nom::IResult<&[u8], Directory> {
 impl RootFile {
     /// Open a new ROOT file from a local `Path`, or from a `Url` when the
     /// `remote` feature is enabled. Local paths are not available on `wasm32`.
-    pub async fn new<S: Into<Source>>(source: S) -> Result<Self, Error> {
+    pub async fn new<S: Into<Source>>(source: S) -> Result<Self> {
         let source = source.into();
         let hdr = source.fetch(0, FILE_HEADER_SIZE).await.and_then(|buf| {
             file_header(&buf)
-                .map_err(|_| format_err!("Failed to parse file header"))
+                .map_err(|_| RootError::parse("Failed to parse file header"))
                 .map(|(_i, o)| o)
         })?;
         // Jump to the TDirectory and parse it
@@ -160,7 +159,7 @@ impl RootFile {
             .await
             .and_then(|buf| {
                 directory(&buf)
-                    .map_err(|_| format_err!("Failed to parse TDirectory"))
+                    .map_err(|_| RootError::parse("Failed to parse TDirectory"))
                     .map(|(_i, o)| o)
             })?;
         let tkey_of_keys = source
@@ -168,12 +167,12 @@ impl RootFile {
             .await
             .and_then(|buf| {
                 tkey(&buf)
-                    .map_err(|_| format_err!("Failed to parse TKeys"))
+                    .map_err(|_| RootError::parse("Failed to parse TKeys"))
                     .map(|(_i, o)| o)
             })?;
         let keys = match tkey_headers(&tkey_of_keys.obj) {
             Ok((_, hdrs)) => Ok(hdrs),
-            _ => Err(format_err!("Expected TKeyHeaders")),
+            _ => Err(RootError::parse("Expected TKeyHeaders")),
         }?;
         let items = keys
             .iter()
@@ -183,7 +182,7 @@ impl RootFile {
         Ok(RootFile { source, hdr, items })
     }
 
-    pub async fn get_streamer_context(&self) -> Result<Context, Error> {
+    pub async fn get_streamer_context(&self) -> Result<Context> {
         let seek_info_len = (self.hdr.nbytes_info + 4) as u64;
         let info_key = self
             .source
@@ -205,58 +204,22 @@ impl RootFile {
     }
 
     /// Translate the streamer info of this file to a YAML file
-    pub async fn streamer_infos(&self) -> Result<Vec<TStreamerInfo>, Error> {
+    pub async fn streamer_infos(&self) -> Result<Vec<TStreamerInfo>> {
         let ctx = self.get_streamer_context().await?;
         let buf = ctx.s.as_slice();
         let (_, streamer_vec) =
-            streamers(buf, &ctx).map_err(|_| format_err!("Failed to parse TStreamers"))?;
+            streamers(buf, &ctx).map_err(|_| RootError::parse("Failed to parse TStreamers"))?;
         Ok(streamer_vec)
     }
 
     /// Translate the streamer info of this file to a YAML file
-    pub async fn streamer_info_as_yaml<W: fmt::Write>(&self, s: &mut W) -> Result<(), Error> {
+    pub async fn streamer_info_as_yaml<W: fmt::Write>(&self, s: &mut W) -> Result<()> {
         for el in &self.streamer_infos().await? {
             writeln!(s, "{:#}", el.to_yaml())?;
         }
         Ok(())
     }
 
-    /// Generate Rust code from the streamer info of this file
-    pub async fn streamer_info_as_rust<W: fmt::Write>(&self, s: &mut W) -> Result<(), Error> {
-        // Add necessary imports at the top of the file
-        writeln!(
-            s,
-            "{}",
-            quote! {
-                use std::marker::PhantomData;
-                use nom::*;
-                use parsers::*;
-                use parsers::utils::*;
-                use core_types::*;
-            }
-        )?;
-        let streamer_infos = self.streamer_infos().await?;
-        // generate structs
-        for el in &streamer_infos {
-            // The structs contain comments which introduce line breaks; i.e. readable
-            writeln!(s, "{}", el.to_struct())?;
-        }
-
-        // generate parsers
-        for el in &streamer_infos {
-            // The parsers have no comments, but are ugly; We introduce some
-            // Linebreaks here to not have rustfmt choke later (doing it later
-            // is inconvinient since the comments in the structs might contain
-            // the patterns
-            let parsers = el.to_named_parser().to_string();
-            let parsers = parsers.replace(',', ",\n");
-            let parsers = parsers.replace(">>", ">>\n");
-            // macro names are generated as my_macro ! (...) by `quote`
-            let parsers = parsers.replace(" ! (", "!(");
-            writeln!(s, "{}", parsers)?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -291,7 +254,7 @@ mod test {
             .await
             .and_then(|buf| {
                 file_header(&buf)
-                    .map_err(|_| format_err!("Failed to parse file header"))
+                    .map_err(|_| RootError::parse("Failed to parse file header"))
                     .map(|(_i, o)| o)
             })
             .unwrap();
@@ -333,7 +296,7 @@ mod test {
             .await
             .and_then(|buf| {
                 file_header(&buf)
-                    .map_err(|_| format_err!("Failed to parse file header"))
+                    .map_err(|_| RootError::parse("Failed to parse file header"))
                     .map(|(_i, o)| o)
             })
             .unwrap();
@@ -343,7 +306,7 @@ mod test {
             .await
             .and_then(|buf| {
                 directory(&buf)
-                    .map_err(|_| format_err!("Failed to parse file header"))
+                    .map_err(|_| RootError::parse("Failed to parse file header"))
                     .map(|(_i, o)| o)
             })
             .unwrap();
@@ -382,7 +345,7 @@ mod test {
             .await
             .and_then(|buf| {
                 tkey(&buf)
-                    .map_err(|_| format_err!("Failed to parse file header"))
+                    .map_err(|_| RootError::parse("Failed to parse file header"))
                     .map(|(_i, o)| o)
             })
             .unwrap();
