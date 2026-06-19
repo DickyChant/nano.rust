@@ -33,7 +33,7 @@ fn is_byte_count(v: &u32) -> bool {
 
 /// Return the size in bytes of the following object in the input. The
 /// count is the remainder of this object minus the size of the count.
-pub fn checked_byte_count<'s, E>(input: &'s [u8]) -> nom::IResult<&[u8], u32, E>
+pub fn checked_byte_count<'s, E>(input: &'s [u8]) -> nom::IResult<&'s [u8], u32, E>
 where
     E: ParseError<&'s [u8]> + Debug,
 {
@@ -124,7 +124,7 @@ where
 }
 
 /// Parse a `TObjArray` which does not have references pointing outside of the input buffer
-pub fn tobjarray_no_context(input: &[u8]) -> nom::IResult<&[u8], Vec<(ClassInfo, &[u8])>> {
+pub fn tobjarray_no_context(input: &[u8]) -> nom::IResult<&[u8], Vec<(ClassInfo<'_>, &[u8])>> {
     let (input, _ver) = be_u16(input)?;
     let (input, _tobj) = tobject(input)?;
     let (input, _name) = c_string(input)?;
@@ -173,7 +173,24 @@ fn decode_reader<'s>(bytes: &'s [u8], magic: &[u8]) -> nom::IResult<&'s [u8], Ve
             let (bytes, _checksum) = be_u64(bytes)?;
             map_res(rest, lz4_decompress)(bytes)
         }
-        _ => panic!(), // m => return Err(format_err!("Unsupported compression format `{}`", m)),
+        b"ZS" => map_res(rest, |bytes| {
+            // ROOT's zstd block ("ZS"): the remaining bytes are a standalone
+            // zstd frame. Decoded with the pure-Rust ruzstd implementation.
+            let mut ret = vec![];
+            let mut decoder = ruzstd::StreamingDecoder::new(bytes)
+                .map_err(|e| failure::format_err!("zstd init: {e}"))?;
+            decoder.read_to_end(&mut ret)?;
+            Ok::<_, Error>(ret)
+        })(bytes),
+        m => {
+            // Unsupported algorithm: surface it instead of panicking.
+            let magic = String::from_utf8_lossy(m).into_owned();
+            map_res(rest, move |_| {
+                Err::<Vec<u8>, Error>(failure::format_err!(
+                    "unsupported ROOT compression algorithm `{magic}`"
+                ))
+            })(bytes)
+        }
     }
 }
 
@@ -182,6 +199,34 @@ pub fn decompress(input: &[u8]) -> nom::IResult<&[u8], Vec<u8>> {
     let (input, magic) = take(2usize)(input)?;
     let (input, _header) = take(7usize)(input)?;
     decode_reader(input, magic)
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::decompress;
+
+    /// Frame bytes as a ROOT compressed block: [algo:2][method:1][csize:3 LE][usize:3 LE][payload].
+    fn root_block(magic: &[u8; 2], frame: &[u8], uncompressed_len: usize) -> Vec<u8> {
+        let mut block = Vec::new();
+        block.extend_from_slice(magic);
+        block.push(0); // method byte (ignored by the reader)
+        let c = frame.len();
+        block.extend_from_slice(&[c as u8, (c >> 8) as u8, (c >> 16) as u8]);
+        let u = uncompressed_len;
+        block.extend_from_slice(&[u as u8, (u >> 8) as u8, (u >> 16) as u8]);
+        block.extend_from_slice(frame);
+        block
+    }
+
+    #[test]
+    fn decompresses_root_framed_zstd_block() {
+        let original: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let frame = zstd::stream::encode_all(original.as_slice(), 3).unwrap();
+        let block = root_block(b"ZS", &frame, original.len());
+        let (rest, out) = decompress(&block).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(out, original);
+    }
 }
 
 /// Parse a null terminated string
@@ -196,7 +241,7 @@ pub fn c_string(i: &[u8]) -> nom::IResult<&[u8], &str> {
 /// saved locally but rather in a reference to some other place in the
 /// buffer.This is modeled after ROOT's `TBufferFile::ReadObjectAny` and
 /// `TBufferFile::ReadClass`
-pub fn classinfo(i: &[u8]) -> nom::IResult<&[u8], ClassInfo> {
+pub fn classinfo(i: &[u8]) -> nom::IResult<&[u8], ClassInfo<'_>> {
     let (i, tag) = {
         let (i, bcnt) = be_u32(i)?;
         if !is_byte_count(&bcnt) || bcnt == Flags::NEW_CLASSTAG.bits() {
@@ -275,7 +320,7 @@ pub fn raw<'s>(input: &'s [u8], context: &'s Context) -> nom::IResult<&'s [u8], 
 /// Same as `raw` but doesn't require a `Context` as input. Panics if
 /// a `Context` is required to parse the underlying buffer (i.e., the
 /// given buffer contains a reference to some other part of the file.
-pub fn raw_no_context(input: &[u8]) -> nom::IResult<&[u8], (ClassInfo, &[u8])> {
+pub fn raw_no_context(input: &[u8]) -> nom::IResult<&[u8], (ClassInfo<'_>, &[u8])> {
     use super::ClassInfo::*;
     let (input, ci) = classinfo(input)?;
     let (input, obj) = match ci {

@@ -1,3 +1,7 @@
+// This whole integration test reads ALICE ESD data over the network; it only
+// exists in the `remote` build. Gating the file keeps the default build clean.
+#![cfg(feature = "remote")]
+
 use failure::Error;
 use futures::prelude::*;
 use nom::number::complete::*;

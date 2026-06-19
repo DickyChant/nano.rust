@@ -34,6 +34,9 @@ impl TLeaf {
     }
 }
 
+// Some leaf variants (TLeafD32, TLeafElement) are parsed for completeness but
+// their payloads are not yet surfaced through the reader API.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum TLeafVariant {
     TLeafB(TLeafB),

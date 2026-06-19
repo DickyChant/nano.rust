@@ -24,6 +24,7 @@ lzma-rs = "0.1.1"
 quote = "0.3.15"
 uuid = "0.8.2"
 lz4-compress = "0.1.1"
+ruzstd = "0.7"
 regex = "1.8.1"
 
 [features]
@@ -34,6 +35,8 @@ remote = []
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Encoder only, for the zstd round-trip test; runtime decoding uses pure-Rust ruzstd.
+zstd = "0.13"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4.10"
