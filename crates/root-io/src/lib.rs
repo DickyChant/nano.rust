@@ -36,6 +36,7 @@ pub mod core;
 pub mod test_utils;
 mod tests;
 pub mod tree_reader;
+pub mod write;
 
 // Contains the stream_zip macro
 pub mod utils;
