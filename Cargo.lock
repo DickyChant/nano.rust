@@ -559,6 +559,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-inference"
+version = "0.0.0"
+dependencies = [
+ "nano-core",
+ "rayon",
+ "serde",
+ "serde_json",
+ "ureq",
+ "url",
+]
+
+[[package]]
 name = "nano-io"
 version = "0.0.0"
 dependencies = [

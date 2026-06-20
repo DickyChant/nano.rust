@@ -16,6 +16,7 @@ repository = "https://github.com/DickyChant/nano.rust"
 nano-analysis = { path = "crates/nano-analysis" }
 nano-core = { path = "crates/nano-core" }
 nano-io = { path = "crates/nano-io" }
+nano-inference = { path = "crates/nano-inference" }
 nano-producers = { path = "crates/nano-producers" }
 nano-rootio = { path = "crates/nano-rootio" }
 nano-corrections = { path = "crates/nano-corrections" }

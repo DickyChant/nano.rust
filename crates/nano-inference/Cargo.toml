@@ -1,0 +1,19 @@
+[package]
+name = "nano-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Inference protocol, providers, and feature extraction for nano.rust"
+
+[dependencies]
+nano-core = { workspace = true }
+rayon = "1"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+ureq = { version = "~2.8", default-features = false, features = ["tls"], optional = true }
+url = { version = "2", optional = true }
+
+[features]
+default = []
+http = ["dep:serde", "dep:serde_json", "dep:ureq", "dep:url"]
