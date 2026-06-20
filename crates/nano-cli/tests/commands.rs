@@ -185,14 +185,16 @@ fn run_muon_spec_writes_skim_matching_single_pass_producer() {
         output: Some(output.clone()),
         parallel: false,
         kernel: None,
+        interpret: false,
     })
     .expect("run workflow");
 
+    assert_eq!(report.mode, "compiled");
     assert_eq!(report.kernel, "muon");
     assert_eq!(report.events_seen, 5);
     assert_eq!(report.events_selected, 3);
     assert_eq!(read_skim_rows(&output), single_pass_rows(&input));
-    assert!(report.manifest.exists());
+    assert!(report.manifest.as_ref().expect("manifest path").exists());
 }
 
 #[test]
@@ -219,8 +221,113 @@ fn run_json_output_is_well_formed() {
     let value = serde_json::from_str::<serde_json::Value>(&json).expect("well-formed JSON");
     assert_eq!(value["command"], "run");
     assert_eq!(value["status"], "ok");
+    assert_eq!(value["mode"], "compiled");
     assert_eq!(value["kernel"], "muon");
     assert_eq!(value["events_selected"], 3);
+}
+
+#[test]
+fn run_interpret_writes_same_skim_as_compiled_kernel() {
+    let fixture = Fixture::new("run-interpret-cross-backend");
+    let input = fixture.path("input.root");
+    let compiled_output = fixture.path("compiled.root");
+    let interpreted_output = fixture.path("interpreted.root");
+    write_synthetic_input(&input);
+
+    let compiled = run_workflow(WorkflowRunOptions {
+        spec_path: repo_path("crates/nano-spec/examples/muon.toml"),
+        inputs: vec![input.clone()],
+        output: Some(compiled_output.clone()),
+        parallel: false,
+        kernel: None,
+        interpret: false,
+    })
+    .expect("compiled run");
+    let interpreted = run([
+        "run",
+        "--interpret",
+        repo_path("crates/nano-spec/examples/muon.toml")
+            .to_str()
+            .unwrap(),
+        "--inputs",
+        input.to_str().unwrap(),
+        "--output",
+        interpreted_output.to_str().unwrap(),
+    ])
+    .expect("interpreted run");
+
+    let Output::Run(interpreted) = interpreted else {
+        panic!("expected run report");
+    };
+
+    assert_eq!(compiled.mode, "compiled");
+    assert_eq!(interpreted.mode, "interpret");
+    assert_eq!(compiled.events_seen, interpreted.events_seen);
+    assert_eq!(compiled.events_selected, interpreted.events_selected);
+    assert_eq!(
+        read_skim_rows(&compiled_output),
+        read_skim_rows(&interpreted_output)
+    );
+}
+
+#[test]
+fn run_interpret_json_output_is_well_formed() {
+    let fixture = Fixture::new("run-interpret-json");
+    let input = fixture.path("input.root");
+    write_synthetic_input(&input);
+
+    let output = run([
+        "--json",
+        "run",
+        "--interpret",
+        repo_path("crates/nano-spec/examples/muon.toml")
+            .to_str()
+            .unwrap(),
+        "--inputs",
+        input.to_str().unwrap(),
+    ])
+    .expect("interpreted run command");
+
+    let json = nano_cli::render_json_output(&output).expect("JSON run");
+    let value = serde_json::from_str::<serde_json::Value>(&json).expect("well-formed JSON");
+    assert_eq!(value["command"], "run");
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["mode"], "interpret");
+    assert_eq!(value["kernel"], "interpret");
+    assert_eq!(value["events_seen"], 5);
+    assert_eq!(value["events_selected"], 3);
+    assert!(value.get("output").is_none());
+}
+
+#[test]
+fn run_interpret_model_spec_returns_structured_unsupported_error() {
+    let fixture = Fixture::new("run-interpret-model");
+    let input = fixture.path("input.root");
+    let error = run([
+        "--json",
+        "run",
+        "--interpret",
+        repo_path("crates/nano-spec/examples/muon_tagger.toml")
+            .to_str()
+            .unwrap(),
+        "--inputs",
+        input.to_str().unwrap(),
+    ])
+    .expect_err("model specs are not interpreted yet");
+
+    assert_eq!(error.kind, ErrorKind::Interpret);
+    assert!(error
+        .message
+        .contains("models not yet interpreted; use the compiled path"));
+
+    let json = nano_cli::render_json_error(&error).expect("JSON error");
+    let value = serde_json::from_str::<serde_json::Value>(&json).expect("well-formed JSON");
+    assert_eq!(value["status"], "error");
+    assert_eq!(value["kind"], "interpret");
+    assert!(value["message"]
+        .as_str()
+        .unwrap()
+        .contains("models not yet interpreted"));
 }
 
 #[test]
@@ -239,6 +346,7 @@ fn run_spec_without_registered_kernel_returns_structured_error() {
         output: Some(fixture.path("skim.root")),
         parallel: false,
         kernel: None,
+        interpret: false,
     })
     .expect_err("spec should not resolve to a registered kernel");
 
@@ -260,6 +368,7 @@ fn run_muon_like_spec_with_incompatible_schema_returns_structured_error() {
         output: Some(fixture.path("skim.root")),
         parallel: false,
         kernel: None,
+        interpret: false,
     })
     .expect_err("muon_tagger spec should not match the registered muon kernel");
 
@@ -284,6 +393,7 @@ fn run_serial_and_parallel_outputs_are_identical() {
         output: Some(serial_output.clone()),
         parallel: false,
         kernel: None,
+        interpret: false,
     })
     .expect("serial run");
     let parallel = run_workflow(WorkflowRunOptions {
@@ -292,6 +402,7 @@ fn run_serial_and_parallel_outputs_are_identical() {
         output: Some(parallel_output.clone()),
         parallel: true,
         kernel: None,
+        interpret: false,
     })
     .expect("parallel run");
 

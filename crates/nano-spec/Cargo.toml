@@ -16,3 +16,6 @@ url = "2"
 
 [features]
 default = []
+
+[dev-dependencies]
+nano-producers = { workspace = true }

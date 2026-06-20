@@ -185,6 +185,7 @@ pub enum ToolErrorKind {
     Validation,
     Codegen,
     Inspect,
+    Interpret,
     Kernel,
     Workflow,
 }
@@ -383,6 +384,7 @@ pub fn run_workflow(input: RunWorkflowInput) -> RunWorkflowResult {
         output: input.output,
         parallel: input.parallel,
         kernel: None,
+        interpret: false,
     }) {
         Ok(report) => run_workflow_success(report),
         Err(error) => RunWorkflowResult {
@@ -667,8 +669,8 @@ fn run_workflow_success(report: RunReport) -> RunWorkflowResult {
         kernel: Some(report.kernel),
         events_seen: Some(report.events_seen),
         events_selected: Some(report.events_selected),
-        output: Some(report.output),
-        manifest: Some(report.manifest),
+        output: report.output,
+        manifest: report.manifest,
         errors: Vec::new(),
     }
 }
@@ -682,6 +684,7 @@ fn tool_error_from_cli(error: nano_cli::CliError) -> ToolError {
             nano_cli::ErrorKind::Validation => ToolErrorKind::Validation,
             nano_cli::ErrorKind::Codegen => ToolErrorKind::Codegen,
             nano_cli::ErrorKind::Inspect => ToolErrorKind::Inspect,
+            nano_cli::ErrorKind::Interpret => ToolErrorKind::Interpret,
             nano_cli::ErrorKind::Kernel => ToolErrorKind::Kernel,
             nano_cli::ErrorKind::Workflow => ToolErrorKind::Workflow,
         },

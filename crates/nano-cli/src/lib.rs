@@ -2,9 +2,11 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use nano_core::BranchType;
+use nano_io::writer::{write_events, OutputBranch};
 use nano_rootio::RootFile;
 use nano_spec::codegen;
-use nano_spec::{AnalysisSpec, Catalogue, ParseError, SpecError};
+use nano_spec::interpret::{interpret, InterpretError, OutputRow, Value};
+use nano_spec::{AnalysisSpec, Catalogue, Expr, OutputDef, ParseError, SpecError};
 use nano_workflow::{
     plan_workflow_with_kernel_id, ExecutionMode, Executor, KernelBinding, KernelRegistry,
 };
@@ -113,6 +115,7 @@ pub struct WorkflowRunOptions {
     pub output: Option<PathBuf>,
     pub parallel: bool,
     pub kernel: Option<String>,
+    pub interpret: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -120,11 +123,14 @@ pub struct RunReport {
     pub status: Status,
     pub spec: PathBuf,
     pub inputs: Vec<PathBuf>,
+    pub mode: String,
     pub kernel: String,
     pub events_seen: u64,
     pub events_selected: u64,
-    pub output: PathBuf,
-    pub manifest: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -159,6 +165,7 @@ pub enum ErrorKind {
     Validation,
     Codegen,
     Inspect,
+    Interpret,
     Kernel,
     Workflow,
 }
@@ -267,7 +274,7 @@ pub fn render_text(output: &Output) -> String {
         }
         Output::Codegen(report) => report.source.clone(),
         Output::Run(report) => format!(
-            "OK run {}\ninputs: {}\nkernel: {}\nevents_seen: {}\nevents_selected: {}\noutput: {}\nmanifest: {}",
+            "OK run {}\ninputs: {}\nmode: {}\nkernel: {}\nevents_seen: {}\nevents_selected: {}\noutput: {}\nmanifest: {}",
             report.spec.display(),
             report
                 .inputs
@@ -275,11 +282,20 @@ pub fn render_text(output: &Output) -> String {
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
+            report.mode,
             report.kernel,
             report.events_seen,
             report.events_selected,
-            report.output.display(),
-            report.manifest.display()
+            report
+                .output
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(not written)".to_string()),
+            report
+                .manifest
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(not written)".to_string())
         ),
     }
 }
@@ -349,6 +365,10 @@ pub fn run_workflow(options: WorkflowRunOptions) -> Result<RunReport> {
         return Err(usage_error("`nano run` needs at least one input"));
     }
 
+    if options.interpret {
+        return run_interpreted(options);
+    }
+
     let (spec, plan) = load_validated_plan(&options.spec_path)?;
     let registry = KernelRegistry::with_muon();
     let requested_kernel = options.kernel.clone().unwrap_or_else(|| spec.name.clone());
@@ -391,11 +411,117 @@ pub fn run_workflow(options: WorkflowRunOptions) -> Result<RunReport> {
         status: Status::Ok,
         spec: options.spec_path,
         inputs: options.inputs,
+        mode: "compiled".to_string(),
         kernel: workflow.kernel_id,
         events_seen: cutflow.events_seen,
         events_selected: cutflow.events_selected,
-        output: output_path.clone(),
-        manifest: manifest_path_for_output(&output_path),
+        output: Some(output_path.clone()),
+        manifest: Some(manifest_path_for_output(&output_path)),
+    })
+}
+
+fn run_interpreted(options: WorkflowRunOptions) -> Result<RunReport> {
+    let (_, plan) = load_validated_plan(&options.spec_path)?;
+    if !plan.spec.models.is_empty() {
+        return Err(interpret_cli_error(
+            &options.spec_path,
+            InterpretError::Unsupported(
+                "models not yet interpreted; use the compiled path".to_string(),
+            ),
+        ));
+    }
+    if options.parallel {
+        return Err(CliError {
+            status: ErrorStatus::Error,
+            kind: ErrorKind::Usage,
+            message: "`nano run --interpret` does not support --parallel".to_string(),
+            spec_path: Some(options.spec_path),
+            validation_errors: Vec::new(),
+        });
+    }
+    if options.kernel.is_some() {
+        return Err(CliError {
+            status: ErrorStatus::Error,
+            kind: ErrorKind::Usage,
+            message: "`nano run --interpret` does not use --kernel".to_string(),
+            spec_path: Some(options.spec_path),
+            validation_errors: Vec::new(),
+        });
+    }
+
+    let output_names = plan
+        .spec
+        .outputs
+        .iter()
+        .map(|output| output.name.clone())
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    let mut events_seen = 0_u64;
+    let mut events_selected = 0_u64;
+
+    for input in &options.inputs {
+        let events =
+            nano_io::events_chunked(input, &plan.read_branches, 10_000).map_err(|error| {
+                CliError {
+                    status: ErrorStatus::Error,
+                    kind: ErrorKind::Workflow,
+                    message: error.to_string(),
+                    spec_path: Some(options.spec_path.clone()),
+                    validation_errors: Vec::new(),
+                }
+            })?;
+        for event in events {
+            let event = event.map_err(|error| CliError {
+                status: ErrorStatus::Error,
+                kind: ErrorKind::Workflow,
+                message: error.to_string(),
+                spec_path: Some(options.spec_path.clone()),
+                validation_errors: Vec::new(),
+            })?;
+            events_seen += 1;
+            if let Some(row) = interpret(&plan, &event)
+                .map_err(|error| interpret_cli_error(&options.spec_path, error))?
+            {
+                validate_row_shape(&output_names, &row).map_err(|message| CliError {
+                    status: ErrorStatus::Error,
+                    kind: ErrorKind::Interpret,
+                    message,
+                    spec_path: Some(options.spec_path.clone()),
+                    validation_errors: Vec::new(),
+                })?;
+                events_selected += 1;
+                rows.push(row);
+            }
+        }
+    }
+
+    if let Some(output_path) = &options.output {
+        let branches = output_branches(&plan.spec.outputs, &rows).map_err(|message| CliError {
+            status: ErrorStatus::Error,
+            kind: ErrorKind::Interpret,
+            message,
+            spec_path: Some(options.spec_path.clone()),
+            validation_errors: Vec::new(),
+        })?;
+        write_events(output_path, &branches).map_err(|error| CliError {
+            status: ErrorStatus::Error,
+            kind: ErrorKind::Workflow,
+            message: error.to_string(),
+            spec_path: Some(options.spec_path.clone()),
+            validation_errors: Vec::new(),
+        })?;
+    }
+
+    Ok(RunReport {
+        status: Status::Ok,
+        spec: options.spec_path,
+        inputs: options.inputs,
+        mode: "interpret".to_string(),
+        kernel: "interpret".to_string(),
+        events_seen,
+        events_selected,
+        output: options.output,
+        manifest: None,
     })
 }
 
@@ -572,6 +698,123 @@ fn cache_dir_for_output(output_path: &Path) -> PathBuf {
 
 fn manifest_path_for_output(output_path: &Path) -> PathBuf {
     output_path.with_extension("root.manifest.json")
+}
+
+fn interpret_cli_error(spec_path: &Path, error: InterpretError) -> CliError {
+    CliError {
+        status: ErrorStatus::Error,
+        kind: ErrorKind::Interpret,
+        message: error.to_string(),
+        spec_path: Some(spec_path.to_path_buf()),
+        validation_errors: Vec::new(),
+    }
+}
+
+fn validate_row_shape(output_names: &[String], row: &OutputRow) -> std::result::Result<(), String> {
+    if row.values.len() != output_names.len() {
+        return Err(format!(
+            "interpreted row has {} fields, expected {}",
+            row.values.len(),
+            output_names.len()
+        ));
+    }
+    for (index, expected) in output_names.iter().enumerate() {
+        let Some((actual, _)) = row.values.get(index) else {
+            return Err(format!("interpreted row is missing output `{expected}`"));
+        };
+        if actual != expected {
+            return Err(format!(
+                "interpreted row field {} is `{actual}`, expected `{expected}`",
+                index + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn output_branches(
+    outputs: &[OutputDef],
+    rows: &[OutputRow],
+) -> std::result::Result<Vec<OutputBranch>, String> {
+    if outputs.is_empty() {
+        return Err("interpreted skim needs at least one declared output".to_string());
+    }
+
+    outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| output_branch(output, rows, index))
+        .collect()
+}
+
+fn output_branch(
+    output: &OutputDef,
+    rows: &[OutputRow],
+    index: usize,
+) -> std::result::Result<OutputBranch, String> {
+    let name = output.name.as_str();
+    let first_value = rows
+        .first()
+        .and_then(|row| row.values.get(index))
+        .map(|(_, value)| *value)
+        .or_else(|| default_output_value(&output.expr));
+
+    match first_value {
+        Some(Value::F64(_)) | None => rows
+            .iter()
+            .map(|row| match row.values.get(index).map(|(_, value)| *value) {
+                Some(Value::F64(value)) => Ok(value as f32),
+                Some(other) => Err(format!(
+                    "output `{name}` changed type from F64 to {other:?}"
+                )),
+                None => Err(format!("row is missing output `{name}`")),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(|values| OutputBranch::f32(name, values)),
+        Some(Value::I64(_)) => rows
+            .iter()
+            .map(|row| match row.values.get(index).map(|(_, value)| *value) {
+                Some(Value::I64(value)) => i32::try_from(value).map_err(|error| {
+                    format!("output `{name}` value {value} cannot be written as i32: {error}")
+                }),
+                Some(other) => Err(format!(
+                    "output `{name}` changed type from I64 to {other:?}"
+                )),
+                None => Err(format!("row is missing output `{name}`")),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(|values| OutputBranch::i32(name, values)),
+        Some(Value::U32(_)) => rows
+            .iter()
+            .map(|row| match row.values.get(index).map(|(_, value)| *value) {
+                Some(Value::U32(value)) => Ok(value),
+                Some(other) => Err(format!(
+                    "output `{name}` changed type from U32 to {other:?}"
+                )),
+                None => Err(format!("row is missing output `{name}`")),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(|values| OutputBranch::u32(name, values)),
+        Some(Value::Bool(_)) => rows
+            .iter()
+            .map(|row| match row.values.get(index).map(|(_, value)| *value) {
+                Some(Value::Bool(value)) => Ok(value),
+                Some(other) => Err(format!(
+                    "output `{name}` changed type from Bool to {other:?}"
+                )),
+                None => Err(format!("row is missing output `{name}`")),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(|values| OutputBranch::bool(name, values)),
+    }
+}
+
+fn default_output_value(expr: &Expr) -> Option<Value> {
+    match expr {
+        Expr::Count(_) => Some(Value::U32(0)),
+        Expr::LeadingAttr { .. } => Some(Value::F64(0.0)),
+        _ => None,
+    }
 }
 
 fn workflow_error(spec_path: &Path, error: nano_workflow::WorkflowError) -> CliError {
@@ -886,20 +1129,19 @@ fn one_operand(command: &str, args: &[String]) -> Result<PathBuf> {
 }
 
 fn parse_run_args(args: &[String]) -> Result<WorkflowRunOptions> {
-    let Some(spec) = args.first() else {
-        return Err(usage_error("`nano run` needs one spec path"));
-    };
-    if spec.starts_with("--") {
-        return Err(usage_error("`nano run` needs the spec path before flags"));
-    }
-
+    let mut spec = None;
     let mut inputs = None;
     let mut output = None;
     let mut parallel = false;
     let mut kernel = None;
-    let mut index = 1;
+    let mut interpret = false;
+    let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--interpret" => {
+                interpret = true;
+                index += 1;
+            }
             "--inputs" => {
                 let value = flag_value(args, index, "--inputs")?;
                 inputs = Some(parse_input_list(value)?);
@@ -923,23 +1165,32 @@ fn parse_run_args(args: &[String]) -> Result<WorkflowRunOptions> {
                 return Err(usage_error(format!("unknown `nano run` flag `{flag}`")));
             }
             operand => {
-                return Err(usage_error(format!(
-                    "unexpected `nano run` argument `{operand}`"
-                )));
+                if spec.is_some() {
+                    return Err(usage_error(format!(
+                        "unexpected `nano run` argument `{operand}`"
+                    )));
+                }
+                spec = Some(PathBuf::from(operand));
+                index += 1;
             }
         }
     }
+
+    let Some(spec_path) = spec else {
+        return Err(usage_error("`nano run` needs one spec path"));
+    };
 
     let Some(inputs) = inputs else {
         return Err(usage_error("`nano run` needs --inputs <f1,f2,...>"));
     };
 
     Ok(WorkflowRunOptions {
-        spec_path: PathBuf::from(spec),
+        spec_path,
         inputs,
         output,
         parallel,
         kernel,
+        interpret,
     })
 }
 

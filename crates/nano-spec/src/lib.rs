@@ -13,6 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub mod codegen;
+pub mod interpret;
 
 /// Typed semantic analysis specification.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

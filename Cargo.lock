@@ -641,6 +641,7 @@ name = "nano-spec"
 version = "0.0.0"
 dependencies = [
  "nano-core",
+ "nano-producers",
  "serde",
  "serde_json",
  "serde_yaml",

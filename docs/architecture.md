@@ -48,7 +48,7 @@ verified IR with pluggable back-ends.
 
 | Back-end | What it is | Guarantee from | Status |
 |---|---|---|---|
-| **interpret** | walk the IR per event (`nano-spec::interpret`) | the spec *validator* | building |
+| **interpret** | walk the IR per event (`nano-spec::interpret`, `nano run --interpret`) | the spec *validator* | built |
 | **codegen + AOT** | IR → generated Rust (`nano-analysis` typestate) → compiled kernel | the **Rust compiler** | built |
 | **JIT (compile + dlopen)** | IR → Rust → `rustc` at runtime → `libloading` | the **Rust compiler** | future |
 | ~~Cranelift / LLVM JIT~~ | lower IR to a codegen backend ourselves | nothing reusable — rejected | — |
