@@ -1,6 +1,13 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use nano_cli::{run, CliError, ErrorKind, Output, ValidationErrorKind};
+use nano_cli::{
+    run, run_workflow, CliError, ErrorKind, Output, ValidationErrorKind, WorkflowRunOptions,
+};
+use nano_core::{BranchSchema, BranchSpec, BranchType};
+use nano_io::read_events;
+use nano_io::writer::{write_events, OutputBranch};
+use nano_producers::{MuonProducer, MuonSkimRow};
 
 fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -165,6 +172,137 @@ fn inspect_bundled_root_file_lists_ttrees() {
     assert!(json.contains("\"name\": \"tree\""));
 }
 
+#[test]
+fn run_muon_spec_writes_skim_matching_single_pass_producer() {
+    let fixture = Fixture::new("run-muon");
+    let input = fixture.path("input.root");
+    let output = fixture.path("skim.root");
+    write_synthetic_input(&input);
+
+    let report = run_workflow(WorkflowRunOptions {
+        spec_path: repo_path("crates/nano-spec/examples/muon.toml"),
+        inputs: vec![input.clone()],
+        output: Some(output.clone()),
+        parallel: false,
+        kernel: None,
+    })
+    .expect("run workflow");
+
+    assert_eq!(report.kernel, "muon");
+    assert_eq!(report.events_seen, 5);
+    assert_eq!(report.events_selected, 3);
+    assert_eq!(read_skim_rows(&output), single_pass_rows(&input));
+    assert!(report.manifest.exists());
+}
+
+#[test]
+fn run_json_output_is_well_formed() {
+    let fixture = Fixture::new("run-json");
+    let input = fixture.path("input.root");
+    let output = fixture.path("skim.root");
+    write_synthetic_input(&input);
+
+    let output = run([
+        "--json",
+        "run",
+        repo_path("crates/nano-spec/examples/muon.toml")
+            .to_str()
+            .unwrap(),
+        "--inputs",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ])
+    .expect("run command");
+
+    let json = nano_cli::render_json_output(&output).expect("JSON run");
+    let value = serde_json::from_str::<serde_json::Value>(&json).expect("well-formed JSON");
+    assert_eq!(value["command"], "run");
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["kernel"], "muon");
+    assert_eq!(value["events_selected"], 3);
+}
+
+#[test]
+fn run_spec_without_registered_kernel_returns_structured_error() {
+    let fixture = Fixture::new("run-no-kernel");
+    let spec = fixture.path("electron_demo.toml");
+    std::fs::write(
+        &spec,
+        include_str!("../../nano-spec/examples/muon.toml").replace("muon_demo", "electron_demo"),
+    )
+    .unwrap();
+
+    let error = run_workflow(WorkflowRunOptions {
+        spec_path: spec,
+        inputs: vec![fixture.path("input.root")],
+        output: Some(fixture.path("skim.root")),
+        parallel: false,
+        kernel: None,
+    })
+    .expect_err("spec should not resolve to a registered kernel");
+
+    assert_eq!(error.kind, ErrorKind::Kernel);
+    assert!(error
+        .message
+        .contains("no compiled kernel for spec `electron_demo`"));
+    assert!(error
+        .message
+        .contains("codegen produces source to compile in"));
+}
+
+#[test]
+fn run_muon_like_spec_with_incompatible_schema_returns_structured_error() {
+    let fixture = Fixture::new("run-incompatible-kernel");
+    let error = run_workflow(WorkflowRunOptions {
+        spec_path: repo_path("crates/nano-spec/examples/muon_tagger.toml"),
+        inputs: vec![fixture.path("input.root")],
+        output: Some(fixture.path("skim.root")),
+        parallel: false,
+        kernel: None,
+    })
+    .expect_err("muon_tagger spec should not match the registered muon kernel");
+
+    assert_eq!(error.kind, ErrorKind::Kernel);
+    assert!(error
+        .message
+        .contains("not compatible with registered kernel `muon`"));
+    assert!(error.message.contains("read_branches differ"));
+}
+
+#[test]
+fn run_serial_and_parallel_outputs_are_identical() {
+    let fixture = Fixture::new("run-serial-parallel");
+    let input = fixture.path("input.root");
+    let serial_output = fixture.path("serial.root");
+    let parallel_output = fixture.path("parallel.root");
+    write_synthetic_input(&input);
+
+    let serial = run_workflow(WorkflowRunOptions {
+        spec_path: repo_path("crates/nano-spec/examples/muon.toml"),
+        inputs: vec![input.clone()],
+        output: Some(serial_output.clone()),
+        parallel: false,
+        kernel: None,
+    })
+    .expect("serial run");
+    let parallel = run_workflow(WorkflowRunOptions {
+        spec_path: repo_path("crates/nano-spec/examples/muon.toml"),
+        inputs: vec![input],
+        output: Some(parallel_output.clone()),
+        parallel: true,
+        kernel: None,
+    })
+    .expect("parallel run");
+
+    assert_eq!(serial.events_seen, parallel.events_seen);
+    assert_eq!(serial.events_selected, parallel.events_selected);
+    assert_eq!(
+        read_skim_rows(&serial_output),
+        read_skim_rows(&parallel_output)
+    );
+}
+
 fn assert_validation_kind(error: &CliError, kind: ValidationErrorKind) {
     assert!(
         error
@@ -173,4 +311,95 @@ fn assert_validation_kind(error: &CliError, kind: ValidationErrorKind) {
             .any(|validation_error| validation_error.kind == kind),
         "missing {kind:?} in {error:#?}"
     );
+}
+
+fn input_schema() -> BranchSchema {
+    BranchSchema::new([
+        BranchSpec::new("nMuon", BranchType::U32),
+        BranchSpec::new("Muon_pt", BranchType::VecF32),
+        BranchSpec::new("Muon_eta", BranchType::VecF32),
+    ])
+    .unwrap()
+}
+
+fn skim_schema() -> BranchSchema {
+    BranchSchema::new([
+        BranchSpec::new("n_good_muon", BranchType::U32),
+        BranchSpec::new("lead_muon_pt", BranchType::F32),
+    ])
+    .unwrap()
+}
+
+fn write_synthetic_input(path: &Path) {
+    write_events(
+        path,
+        &[
+            OutputBranch::u32("nMuon", vec![2, 1, 2, 0, 1]),
+            OutputBranch::vec_f32(
+                "Muon_pt",
+                vec![
+                    vec![31.0, 10.0],
+                    vec![29.9],
+                    vec![45.0, 35.0],
+                    vec![],
+                    vec![60.0],
+                ],
+            ),
+            OutputBranch::vec_f32(
+                "Muon_eta",
+                vec![
+                    vec![0.1, 0.2],
+                    vec![0.0],
+                    vec![2.39, -2.0],
+                    vec![],
+                    vec![2.39],
+                ],
+            ),
+        ],
+    )
+    .unwrap();
+    assert_eq!(read_events(path, input_schema()).unwrap().len(), 5);
+}
+
+fn single_pass_rows(path: &Path) -> Vec<MuonSkimRow> {
+    read_events(path, input_schema())
+        .unwrap()
+        .iter()
+        .filter_map(|event| MuonProducer::analyze(event).unwrap())
+        .collect()
+}
+
+fn read_skim_rows(path: &Path) -> Vec<MuonSkimRow> {
+    read_events(path, skim_schema())
+        .unwrap()
+        .iter()
+        .map(|event| MuonSkimRow {
+            n_good_muon: event.scalar::<u32>("n_good_muon").unwrap(),
+            lead_muon_pt: event.scalar::<f32>("lead_muon_pt").unwrap(),
+        })
+        .collect()
+}
+
+struct Fixture {
+    root: PathBuf,
+}
+
+impl Fixture {
+    fn new(name: &str) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "nano-cli-{}-{timestamp}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Self { root }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.root.join(name)
+    }
 }

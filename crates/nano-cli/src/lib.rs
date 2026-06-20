@@ -5,6 +5,9 @@ use nano_core::BranchType;
 use nano_rootio::RootFile;
 use nano_spec::codegen;
 use nano_spec::{AnalysisSpec, Catalogue, ParseError, SpecError};
+use nano_workflow::{
+    plan_workflow_with_kernel_id, ExecutionMode, Executor, KernelBinding, KernelRegistry,
+};
 use serde::Serialize;
 
 const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
@@ -24,6 +27,7 @@ pub enum Output {
     Branches(BranchesReport),
     Inspect(InspectReport),
     Codegen(CodegenReport),
+    Run(RunReport),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -102,6 +106,27 @@ pub struct CodegenReport {
     pub source: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunOptions {
+    pub spec_path: PathBuf,
+    pub inputs: Vec<PathBuf>,
+    pub output: Option<PathBuf>,
+    pub parallel: bool,
+    pub kernel: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunReport {
+    pub status: Status,
+    pub spec: PathBuf,
+    pub inputs: Vec<PathBuf>,
+    pub kernel: String,
+    pub events_seen: u64,
+    pub events_selected: u64,
+    pub output: PathBuf,
+    pub manifest: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -134,6 +159,8 @@ pub enum ErrorKind {
     Validation,
     Codegen,
     Inspect,
+    Kernel,
+    Workflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -185,6 +212,7 @@ where
         Command::Branches { spec } => branches_command(&spec),
         Command::Inspect { file } => inspect_command(&file),
         Command::Codegen { spec } => codegen_command(&spec),
+        Command::Run(options) => run_workflow(options).map(Output::Run),
     }
 }
 
@@ -238,6 +266,21 @@ pub fn render_text(output: &Output) -> String {
             lines.join("\n")
         }
         Output::Codegen(report) => report.source.clone(),
+        Output::Run(report) => format!(
+            "OK run {}\ninputs: {}\nkernel: {}\nevents_seen: {}\nevents_selected: {}\noutput: {}\nmanifest: {}",
+            report.spec.display(),
+            report
+                .inputs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            report.kernel,
+            report.events_seen,
+            report.events_selected,
+            report.output.display(),
+            report.manifest.display()
+        ),
     }
 }
 
@@ -299,6 +342,61 @@ fn codegen_command(spec_path: &Path) -> Result<Output> {
         status: Status::Ok,
         source,
     }))
+}
+
+pub fn run_workflow(options: WorkflowRunOptions) -> Result<RunReport> {
+    if options.inputs.is_empty() {
+        return Err(usage_error("`nano run` needs at least one input"));
+    }
+
+    let (spec, plan) = load_validated_plan(&options.spec_path)?;
+    let registry = KernelRegistry::with_muon();
+    let requested_kernel = options.kernel.clone().unwrap_or_else(|| spec.name.clone());
+    let kernel_id =
+        resolve_kernel_id(&registry, &requested_kernel, &spec.name, &options.spec_path)?;
+    let binding = registry.get(&kernel_id).map_err(|error| CliError {
+        status: ErrorStatus::Error,
+        kind: ErrorKind::Kernel,
+        message: error.to_string(),
+        spec_path: Some(options.spec_path.clone()),
+        validation_errors: Vec::new(),
+    })?;
+    validate_kernel_compatibility(&options.spec_path, &spec, &plan, binding)?;
+
+    let output_path = options.output.unwrap_or_else(|| default_output_path(&spec));
+    let cache_dir = cache_dir_for_output(&output_path);
+    let kernel = binding.kernel.clone();
+    let workflow = plan_workflow_with_kernel_id(
+        options.inputs.iter(),
+        plan.read_branches,
+        10_000,
+        &cache_dir,
+        &output_path,
+        move |event| kernel(event),
+        binding.id.clone(),
+    )
+    .map_err(|error| workflow_error(&options.spec_path, error))?;
+
+    let mode = if options.parallel {
+        ExecutionMode::Parallel
+    } else {
+        ExecutionMode::Serial
+    };
+    let report = Executor::new()
+        .run(&workflow, mode)
+        .map_err(|error| workflow_error(&options.spec_path, error))?;
+    let cutflow = report.merged.cutflow;
+
+    Ok(RunReport {
+        status: Status::Ok,
+        spec: options.spec_path,
+        inputs: options.inputs,
+        kernel: workflow.kernel_id,
+        events_seen: cutflow.events_seen,
+        events_selected: cutflow.events_selected,
+        output: output_path.clone(),
+        manifest: manifest_path_for_output(&output_path),
+    })
 }
 
 fn inspect_command(file: &Path) -> Result<Output> {
@@ -368,6 +466,122 @@ fn load_validated_plan(spec_path: &Path) -> Result<(AnalysisSpec, nano_spec::Res
         validation_errors: errors.iter().map(validation_error_report).collect(),
     })?;
     Ok((spec, plan))
+}
+
+fn resolve_kernel_id(
+    registry: &KernelRegistry,
+    requested_kernel: &str,
+    spec_name: &str,
+    spec_path: &Path,
+) -> Result<String> {
+    if registry.get(requested_kernel).is_ok() {
+        return Ok(requested_kernel.to_string());
+    }
+
+    if requested_kernel.to_ascii_lowercase().starts_with("muon") {
+        return Ok("muon".to_string());
+    }
+
+    Err(CliError {
+        status: ErrorStatus::Error,
+        kind: ErrorKind::Kernel,
+        message: format!(
+            "no compiled kernel for spec `{spec_name}` (requested `{requested_kernel}`); codegen produces source to compile in - this runtime path uses registered kernels"
+        ),
+        spec_path: Some(spec_path.to_path_buf()),
+        validation_errors: Vec::new(),
+    })
+}
+
+fn validate_kernel_compatibility(
+    spec_path: &Path,
+    spec: &AnalysisSpec,
+    plan: &nano_spec::ResolvedPlan,
+    binding: &KernelBinding,
+) -> Result<()> {
+    let expected = sorted_branch_signature(binding.schema.specs());
+    let actual = sorted_branch_signature(plan.read_branches.specs());
+    if actual != expected {
+        return Err(CliError {
+            status: ErrorStatus::Error,
+            kind: ErrorKind::Kernel,
+            message: format!(
+                "spec `{}` is not compatible with registered kernel `{}`: read_branches differ (expected {}, got {})",
+                spec.name,
+                binding.id,
+                expected.join(", "),
+                actual.join(", ")
+            ),
+            spec_path: Some(spec_path.to_path_buf()),
+            validation_errors: Vec::new(),
+        });
+    }
+
+    if binding.id == "muon" {
+        let outputs = spec
+            .outputs
+            .iter()
+            .map(|output| output.name.as_str())
+            .collect::<Vec<_>>();
+        if !same_strings(&outputs, &["lead_muon_pt", "n_good_muon"]) {
+            return Err(CliError {
+                status: ErrorStatus::Error,
+                kind: ErrorKind::Kernel,
+                message: format!(
+                    "spec `{}` is not compatible with registered kernel `muon`: outputs must be lead_muon_pt and n_good_muon",
+                    spec.name
+                ),
+                spec_path: Some(spec_path.to_path_buf()),
+                validation_errors: Vec::new(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn sorted_branch_signature(branches: &[nano_core::BranchSpec]) -> Vec<String> {
+    let mut signature = branches
+        .iter()
+        .map(|branch| {
+            format!(
+                "{}:{:?}:optional={}",
+                branch.name, branch.branch_type, branch.optional
+            )
+        })
+        .collect::<Vec<_>>();
+    signature.sort();
+    signature
+}
+
+fn same_strings(left: &[&str], right: &[&str]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
+}
+
+fn default_output_path(spec: &AnalysisSpec) -> PathBuf {
+    PathBuf::from(format!("{}.root", spec.name))
+}
+
+fn cache_dir_for_output(output_path: &Path) -> PathBuf {
+    output_path.with_extension("nano-cache")
+}
+
+fn manifest_path_for_output(output_path: &Path) -> PathBuf {
+    output_path.with_extension("root.manifest.json")
+}
+
+fn workflow_error(spec_path: &Path, error: nano_workflow::WorkflowError) -> CliError {
+    CliError {
+        status: ErrorStatus::Error,
+        kind: ErrorKind::Workflow,
+        message: error.to_string(),
+        spec_path: Some(spec_path.to_path_buf()),
+        validation_errors: Vec::new(),
+    }
 }
 
 fn parse_cli_error(spec_path: &Path, error: ParseError) -> CliError {
@@ -618,6 +832,7 @@ enum Command {
     Branches { spec: PathBuf },
     Inspect { file: PathBuf },
     Codegen { spec: PathBuf },
+    Run(WorkflowRunOptions),
 }
 
 impl ParsedArgs {
@@ -630,12 +845,20 @@ impl ParsedArgs {
         let Some(command) = positional.first().map(String::as_str) else {
             return Err(usage_error("missing command"));
         };
-        let operand = one_operand(command, &positional[1..])?;
         let command = match command {
-            "validate" => Command::Validate { spec: operand },
-            "branches" => Command::Branches { spec: operand },
-            "inspect" => Command::Inspect { file: operand },
-            "codegen" => Command::Codegen { spec: operand },
+            "validate" => Command::Validate {
+                spec: one_operand(command, &positional[1..])?,
+            },
+            "branches" => Command::Branches {
+                spec: one_operand(command, &positional[1..])?,
+            },
+            "inspect" => Command::Inspect {
+                file: one_operand(command, &positional[1..])?,
+            },
+            "codegen" => Command::Codegen {
+                spec: one_operand(command, &positional[1..])?,
+            },
+            "run" => Command::Run(parse_run_args(&positional[1..])?),
             _ => return Err(usage_error(format!("unknown command `{command}`"))),
         };
         Ok(Self { command })
@@ -660,6 +883,87 @@ fn one_operand(command: &str, args: &[String]) -> Result<PathBuf> {
             "`nano {command}` accepts exactly one path"
         ))),
     }
+}
+
+fn parse_run_args(args: &[String]) -> Result<WorkflowRunOptions> {
+    let Some(spec) = args.first() else {
+        return Err(usage_error("`nano run` needs one spec path"));
+    };
+    if spec.starts_with("--") {
+        return Err(usage_error("`nano run` needs the spec path before flags"));
+    }
+
+    let mut inputs = None;
+    let mut output = None;
+    let mut parallel = false;
+    let mut kernel = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--inputs" => {
+                let value = flag_value(args, index, "--inputs")?;
+                inputs = Some(parse_input_list(value)?);
+                index += 2;
+            }
+            "--output" => {
+                let value = flag_value(args, index, "--output")?;
+                output = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--parallel" => {
+                parallel = true;
+                index += 1;
+            }
+            "--kernel" => {
+                let value = flag_value(args, index, "--kernel")?;
+                kernel = Some(value.to_string());
+                index += 2;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(usage_error(format!("unknown `nano run` flag `{flag}`")));
+            }
+            operand => {
+                return Err(usage_error(format!(
+                    "unexpected `nano run` argument `{operand}`"
+                )));
+            }
+        }
+    }
+
+    let Some(inputs) = inputs else {
+        return Err(usage_error("`nano run` needs --inputs <f1,f2,...>"));
+    };
+
+    Ok(WorkflowRunOptions {
+        spec_path: PathBuf::from(spec),
+        inputs,
+        output,
+        parallel,
+        kernel,
+    })
+}
+
+fn flag_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str> {
+    let Some(value) = args.get(index + 1) else {
+        return Err(usage_error(format!("`nano run {flag}` needs a value")));
+    };
+    if value.starts_with("--") {
+        return Err(usage_error(format!("`nano run {flag}` needs a value")));
+    }
+    Ok(value)
+}
+
+fn parse_input_list(value: &str) -> Result<Vec<PathBuf>> {
+    let inputs = value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if inputs.is_empty() {
+        return Err(usage_error("`nano run --inputs` needs at least one path"));
+    }
+    Ok(inputs)
 }
 
 fn usage_error(message: impl Into<String>) -> CliError {

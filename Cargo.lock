@@ -531,8 +531,11 @@ name = "nano-cli"
 version = "0.0.0"
 dependencies = [
  "nano-core",
+ "nano-io",
+ "nano-producers",
  "nano-rootio",
  "nano-spec",
+ "nano-workflow",
  "serde",
  "serde_json",
 ]
@@ -598,6 +601,7 @@ dependencies = [
 name = "nano-mcp"
 version = "0.0.0"
 dependencies = [
+ "nano-cli",
  "nano-core",
  "nano-io",
  "nano-rootio",

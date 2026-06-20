@@ -1,10 +1,15 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use nano_core::{BranchSchema, BranchSpec, BranchType};
+use nano_io::read_events;
+use nano_io::writer::{write_events, OutputBranch};
 use nano_mcp::{
-    derive_read_branches, generate_kernel, handle_json_rpc, inspect_file, validate_spec,
-    InspectFileInput, SpecInput, ToolErrorKind, ValidationErrorKind,
+    derive_read_branches, generate_kernel, handle_json_rpc, inspect_file, run_workflow,
+    validate_spec, InspectFileInput, RunWorkflowInput, SpecInput, ToolErrorKind,
+    ValidationErrorKind,
 };
 use serde_json::{json, Value};
 
@@ -103,6 +108,32 @@ fn inspect_file_bundled_root_file_lists_trees() {
 }
 
 #[test]
+fn run_workflow_muon_spec_returns_structured_success() {
+    let fixture = Fixture::new("mcp-run");
+    let input = fixture.path("input.root");
+    let output = fixture.path("skim.root");
+    write_synthetic_input(&input);
+
+    let result = run_workflow(RunWorkflowInput {
+        spec_path: repo_path("crates/nano-spec/examples/muon.toml"),
+        inputs: vec![input],
+        output: Some(output.clone()),
+        parallel: false,
+    });
+
+    assert!(result.ok);
+    assert_eq!(result.command.as_deref(), Some("run"));
+    assert_eq!(result.status.as_deref(), Some("ok"));
+    assert_eq!(result.kernel.as_deref(), Some("muon"));
+    assert_eq!(result.events_seen, Some(5));
+    assert_eq!(result.events_selected, Some(3));
+    assert_eq!(result.output.as_ref(), Some(&output));
+    assert!(result.manifest.expect("manifest").exists());
+    assert_eq!(read_events(&output, skim_schema()).unwrap().len(), 3);
+    assert!(result.errors.is_empty());
+}
+
+#[test]
 fn json_rpc_tools_list_and_call_shape_match_mcp() {
     let initialize = handle_json_rpc(json!({
         "jsonrpc": "2.0",
@@ -132,7 +163,8 @@ fn json_rpc_tools_list_and_call_shape_match_mcp() {
             "validate_spec",
             "derive_read_branches",
             "inspect_file",
-            "generate_kernel"
+            "generate_kernel",
+            "run_workflow"
         ]
     );
 
@@ -210,10 +242,82 @@ fn stdio_round_trip_lists_tools_and_validates_muon_toml() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|tool| tool["name"] == "validate_spec"));
+        .any(|tool| tool["name"] == "run_workflow"));
     assert_eq!(responses[2]["result"]["structuredContent"]["ok"], true);
     assert_eq!(
         responses[2]["result"]["structuredContent"]["analysis"]["name"],
         "muon_demo"
     );
+}
+
+fn input_schema() -> BranchSchema {
+    BranchSchema::new([
+        BranchSpec::new("nMuon", BranchType::U32),
+        BranchSpec::new("Muon_pt", BranchType::VecF32),
+        BranchSpec::new("Muon_eta", BranchType::VecF32),
+    ])
+    .unwrap()
+}
+
+fn skim_schema() -> BranchSchema {
+    BranchSchema::new([
+        BranchSpec::new("n_good_muon", BranchType::U32),
+        BranchSpec::new("lead_muon_pt", BranchType::F32),
+    ])
+    .unwrap()
+}
+
+fn write_synthetic_input(path: &Path) {
+    write_events(
+        path,
+        &[
+            OutputBranch::u32("nMuon", vec![2, 1, 2, 0, 1]),
+            OutputBranch::vec_f32(
+                "Muon_pt",
+                vec![
+                    vec![31.0, 10.0],
+                    vec![29.9],
+                    vec![45.0, 35.0],
+                    vec![],
+                    vec![60.0],
+                ],
+            ),
+            OutputBranch::vec_f32(
+                "Muon_eta",
+                vec![
+                    vec![0.1, 0.2],
+                    vec![0.0],
+                    vec![2.39, -2.0],
+                    vec![],
+                    vec![2.39],
+                ],
+            ),
+        ],
+    )
+    .unwrap();
+    assert_eq!(read_events(path, input_schema()).unwrap().len(), 5);
+}
+
+struct Fixture {
+    root: PathBuf,
+}
+
+impl Fixture {
+    fn new(name: &str) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "nano-mcp-{}-{timestamp}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Self { root }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.root.join(name)
+    }
 }

@@ -11,6 +11,7 @@ name = "nano-mcp"
 path = "src/main.rs"
 
 [dependencies]
+nano-cli = { workspace = true }
 nano-core = { workspace = true }
 nano-io = { workspace = true }
 nano-rootio = { workspace = true }

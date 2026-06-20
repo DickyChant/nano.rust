@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use nano_cli::{RunReport, WorkflowRunOptions};
 use nano_core::BranchType;
 use nano_rootio::RootFile;
 use nano_spec::codegen;
@@ -52,6 +53,16 @@ pub struct InspectFileInput {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunWorkflowInput {
+    pub spec_path: PathBuf,
+    pub inputs: Vec<PathBuf>,
+    pub output: Option<PathBuf>,
+    #[serde(default)]
+    pub parallel: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ValidateSpecResult {
     pub ok: bool,
@@ -92,6 +103,31 @@ pub struct GenerateKernelResult {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(default)]
+    pub errors: Vec<ToolError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunWorkflowResult {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec: Option<PathBuf>,
+    #[serde(default)]
+    pub inputs: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events_seen: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events_selected: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<PathBuf>,
     #[serde(default)]
     pub errors: Vec<ToolError>,
 }
@@ -149,6 +185,8 @@ pub enum ToolErrorKind {
     Validation,
     Codegen,
     Inspect,
+    Kernel,
+    Workflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -338,6 +376,31 @@ pub fn generate_kernel(input: SpecInput) -> GenerateKernelResult {
     }
 }
 
+pub fn run_workflow(input: RunWorkflowInput) -> RunWorkflowResult {
+    match nano_cli::run_workflow(WorkflowRunOptions {
+        spec_path: input.spec_path,
+        inputs: input.inputs,
+        output: input.output,
+        parallel: input.parallel,
+        kernel: None,
+    }) {
+        Ok(report) => run_workflow_success(report),
+        Err(error) => RunWorkflowResult {
+            ok: false,
+            command: Some("run".to_string()),
+            status: None,
+            spec: error.spec_path.clone(),
+            inputs: Vec::new(),
+            kernel: None,
+            events_seen: None,
+            events_selected: None,
+            output: None,
+            manifest: None,
+            errors: vec![tool_error_from_cli(error)],
+        },
+    }
+}
+
 pub fn handle_json_rpc_line(line: &str) -> Option<Value> {
     match serde_json::from_str::<Value>(line) {
         Ok(request) => handle_json_rpc(request),
@@ -407,6 +470,7 @@ fn handle_tools_call(id: Value, params: Option<Value>) -> Value {
         "derive_read_branches" => decode_and_call(id, arguments, derive_read_branches),
         "inspect_file" => decode_and_call(id, arguments, inspect_file),
         "generate_kernel" => decode_and_call(id, arguments, generate_kernel),
+        "run_workflow" => decode_and_call(id, arguments, run_workflow),
         _ => json_rpc_error(
             id,
             -32602,
@@ -590,6 +654,80 @@ fn usage_error(message: impl Into<String>) -> ToolError {
         spec_path: None,
         path: None,
         validation_errors: Vec::new(),
+    }
+}
+
+fn run_workflow_success(report: RunReport) -> RunWorkflowResult {
+    RunWorkflowResult {
+        ok: true,
+        command: Some("run".to_string()),
+        status: Some("ok".to_string()),
+        spec: Some(report.spec),
+        inputs: report.inputs,
+        kernel: Some(report.kernel),
+        events_seen: Some(report.events_seen),
+        events_selected: Some(report.events_selected),
+        output: Some(report.output),
+        manifest: Some(report.manifest),
+        errors: Vec::new(),
+    }
+}
+
+fn tool_error_from_cli(error: nano_cli::CliError) -> ToolError {
+    ToolError {
+        kind: match error.kind {
+            nano_cli::ErrorKind::Usage => ToolErrorKind::Usage,
+            nano_cli::ErrorKind::Parse => ToolErrorKind::Parse,
+            nano_cli::ErrorKind::Catalogue => ToolErrorKind::Catalogue,
+            nano_cli::ErrorKind::Validation => ToolErrorKind::Validation,
+            nano_cli::ErrorKind::Codegen => ToolErrorKind::Codegen,
+            nano_cli::ErrorKind::Inspect => ToolErrorKind::Inspect,
+            nano_cli::ErrorKind::Kernel => ToolErrorKind::Kernel,
+            nano_cli::ErrorKind::Workflow => ToolErrorKind::Workflow,
+        },
+        message: error.message,
+        spec_path: error.spec_path,
+        path: None,
+        validation_errors: error
+            .validation_errors
+            .into_iter()
+            .map(validation_error_from_cli)
+            .collect(),
+    }
+}
+
+fn validation_error_from_cli(error: nano_cli::ValidationErrorReport) -> ValidationErrorInfo {
+    ValidationErrorInfo {
+        kind: match error.kind {
+            nano_cli::ValidationErrorKind::MissingBranch => ValidationErrorKind::MissingBranch,
+            nano_cli::ValidationErrorKind::UnsupportedBranchType => {
+                ValidationErrorKind::UnsupportedBranchType
+            }
+            nano_cli::ValidationErrorKind::WrongBranchType => ValidationErrorKind::WrongBranchType,
+            nano_cli::ValidationErrorKind::MissingUnit => ValidationErrorKind::MissingUnit,
+            nano_cli::ValidationErrorKind::UnitMismatch => ValidationErrorKind::UnitMismatch,
+            nano_cli::ValidationErrorKind::UndefinedObject => ValidationErrorKind::UndefinedObject,
+            nano_cli::ValidationErrorKind::UndefinedBatch => ValidationErrorKind::UndefinedBatch,
+            nano_cli::ValidationErrorKind::ModelOutputCollision => {
+                ValidationErrorKind::ModelOutputCollision
+            }
+            nano_cli::ValidationErrorKind::InvalidModel => ValidationErrorKind::InvalidModel,
+            nano_cli::ValidationErrorKind::InvalidProvider => ValidationErrorKind::InvalidProvider,
+            nano_cli::ValidationErrorKind::InvalidExpression => {
+                ValidationErrorKind::InvalidExpression
+            }
+            nano_cli::ValidationErrorKind::InvalidReadSchema => {
+                ValidationErrorKind::InvalidReadSchema
+            }
+        },
+        message: error.message,
+        context: error.context,
+        branch: error.branch,
+        object: error.object,
+        expr: error.expr,
+        expected: error.expected,
+        actual: error.actual,
+        detail: error.detail,
     }
 }
 
@@ -854,6 +992,42 @@ fn tool_descriptions() -> Vec<Value> {
                 "properties": {
                     "ok": { "type": "boolean" },
                     "source": { "type": "string" },
+                    "errors": errors_schema()
+                }
+            }
+        }),
+        json!({
+            "name": "run_workflow",
+            "description": "Validate a spec, resolve a registered runtime kernel, execute the local workflow DAG over ROOT inputs, and write the skim plus provenance manifest.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["spec_path", "inputs"],
+                "additionalProperties": false,
+                "properties": {
+                    "spec_path": { "type": "string", "description": "Path to a TOML, YAML, or JSON analysis spec." },
+                    "inputs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Local ROOT input paths."
+                    },
+                    "output": { "type": "string", "description": "Optional output skim path." },
+                    "parallel": { "type": "boolean", "description": "Run map/reduce nodes in parallel when true." }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["ok", "inputs", "errors"],
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "command": { "type": "string" },
+                    "status": { "type": "string" },
+                    "spec": { "type": "string" },
+                    "inputs": { "type": "array", "items": { "type": "string" } },
+                    "kernel": { "type": "string" },
+                    "events_seen": { "type": "integer" },
+                    "events_selected": { "type": "integer" },
+                    "output": { "type": "string" },
+                    "manifest": { "type": "string" },
                     "errors": errors_schema()
                 }
             }
