@@ -2,13 +2,21 @@ use std::path::{Path, PathBuf};
 
 use futures::executor::block_on;
 use futures::StreamExt;
+use nano_rootio::write::{write_tree, Branch};
 use nano_rootio::{ColumnData, ColumnRequest, RootFile};
-use root_io::write::{write_tree, Branch};
 
 type NomResult<'a, T> = nom::IResult<&'a [u8], T, nom::error::Error<&'a [u8]>>;
 
 fn be_i32(input: &[u8]) -> NomResult<'_, i32> {
     nom::number::complete::be_i32(input)
+}
+
+fn be_i16(input: &[u8]) -> NomResult<'_, i16> {
+    nom::number::complete::be_i16(input)
+}
+
+fn be_i8(input: &[u8]) -> NomResult<'_, i8> {
+    nom::number::complete::be_i8(input)
 }
 
 fn be_i64(input: &[u8]) -> NomResult<'_, i64> {
@@ -19,12 +27,24 @@ fn be_u32(input: &[u8]) -> NomResult<'_, u32> {
     nom::number::complete::be_u32(input)
 }
 
+fn be_u16(input: &[u8]) -> NomResult<'_, u16> {
+    nom::number::complete::be_u16(input)
+}
+
+fn be_u8(input: &[u8]) -> NomResult<'_, u8> {
+    nom::number::complete::be_u8(input)
+}
+
 fn be_u64(input: &[u8]) -> NomResult<'_, u64> {
     nom::number::complete::be_u64(input)
 }
 
 fn be_f32(input: &[u8]) -> NomResult<'_, f32> {
     nom::number::complete::be_f32(input)
+}
+
+fn be_f64(input: &[u8]) -> NomResult<'_, f64> {
+    nom::number::complete::be_f64(input)
 }
 
 fn repo_path(relative: &str) -> PathBuf {
@@ -285,6 +305,175 @@ fn ab_written_jagged_f32_and_auto_counter() {
     assert_eq!(explicit, expected);
     assert_eq!(auto, expected);
     assert_eq!(auto, pts);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn nano_rootio_writer_roundtrips_scalars_and_jagged_object_refs() {
+    let path = temp_root_path("nano-rootio-owned-writer-roundtrip.root");
+    let _ = std::fs::remove_file(&path);
+
+    let u8_values = vec![0_u8, 1, 127, 255, 42, 9];
+    let i8_values = vec![-128_i8, -1, 0, 1, 42, 127];
+    let u16_values = vec![0_u16, 1, 255, 1024, 65535, 17];
+    let i16_values = vec![-32768_i16, -2, 0, 2, 1234, 32767];
+    let u32_values = vec![0_u32, 1, 4_000_000_000, 17, 33, 99];
+    let i32_values = vec![-2_000_000_000_i32, -7, 0, 42, 123456, i32::MAX];
+    let u64_values = vec![0_u64, 1, 9_000_000_000, u64::MAX - 5, 17, 99];
+    let i64_values = vec![i64::MIN + 5, -9_000_000_000, 0, 1, 42, i64::MAX];
+    let f32_values = vec![1.25_f32, -2.5, 0.0, 3.75, f32::INFINITY, -0.0];
+    let bool_values = vec![true, false, true, true, false, false];
+    let counts = vec![0_u32, 2, 1, 8, 0, 33];
+    let jet_pt = vec![
+        Vec::new(),
+        vec![10.0_f32, 11.5],
+        vec![-1.25],
+        (0..8).map(|index| index as f32 + 0.5).collect(),
+        Vec::new(),
+        (0..33).map(|index| 100.0 + index as f32).collect(),
+    ];
+    let jet_charge = vec![
+        Vec::new(),
+        vec![-1_i16, 1],
+        vec![0],
+        vec![1, 1, -1, 0, 2, -2, 3, -3],
+        Vec::new(),
+        (0..33).map(|index| index as i16 - 16).collect(),
+    ];
+    let jet_id = vec![
+        Vec::new(),
+        vec![1_u32, 2],
+        vec![3],
+        (10_u32..18).collect(),
+        Vec::new(),
+        (100_u32..133).collect(),
+    ];
+
+    write_tree(
+        &path,
+        "Events",
+        &[
+            Branch::u8("u8_branch", u8_values.clone()),
+            Branch::i8("i8_branch", i8_values.clone()),
+            Branch::u16("u16_branch", u16_values.clone()),
+            Branch::i16("i16_branch", i16_values.clone()),
+            Branch::u32("u32_branch", u32_values.clone()),
+            Branch::i32("i32_branch", i32_values.clone()),
+            Branch::u64("u64_branch", u64_values.clone()),
+            Branch::i64("i64_branch", i64_values.clone()),
+            Branch::f32("f32_branch", f32_values.clone()),
+            Branch::bool("bool_branch", bool_values.clone()),
+            Branch::u32("nJet", counts.clone()),
+            Branch::vec_f32("Jet_pt", jet_pt.clone()),
+            Branch::vec_i16("Jet_charge", jet_charge.clone()),
+            Branch::vec_u32("Jet_id", jet_id.clone()),
+        ],
+    )
+    .expect("write owned ROOT file");
+
+    let file = RootFile::open(&path).expect("nano-rootio open");
+    let tree = file.tree("Events").expect("nano-rootio tree");
+    assert_eq!(tree.read_scalar::<u8>("u8_branch").unwrap(), u8_values);
+    assert_eq!(tree.read_scalar::<i8>("i8_branch").unwrap(), i8_values);
+    assert_eq!(tree.read_scalar::<u16>("u16_branch").unwrap(), u16_values);
+    assert_eq!(tree.read_scalar::<i16>("i16_branch").unwrap(), i16_values);
+    assert_eq!(tree.read_scalar::<u32>("u32_branch").unwrap(), u32_values);
+    assert_eq!(tree.read_scalar::<i32>("i32_branch").unwrap(), i32_values);
+    assert_eq!(tree.read_scalar::<u64>("u64_branch").unwrap(), u64_values);
+    assert_eq!(tree.read_scalar::<i64>("i64_branch").unwrap(), i64_values);
+    assert_eq!(tree.read_scalar::<f32>("f32_branch").unwrap(), f32_values);
+    assert_eq!(
+        tree.read_scalar::<bool>("bool_branch").unwrap(),
+        bool_values
+    );
+    assert_eq!(tree.read_scalar::<u32>("nJet").unwrap(), counts);
+    assert_eq!(tree.read_jagged_auto::<f32>("Jet_pt").unwrap(), jet_pt);
+    assert_eq!(
+        tree.read_jagged_auto::<i16>("Jet_charge").unwrap(),
+        jet_charge
+    );
+    assert_eq!(tree.read_jagged_auto::<u32>("Jet_id").unwrap(), jet_id);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn nano_rootio_writer_scalars_are_readable_by_vendored_root_io() {
+    let path = temp_root_path("nano-rootio-owned-writer-vendored-read.root");
+    let _ = std::fs::remove_file(&path);
+
+    let u8_values = vec![0_u8, 1, 255, 42];
+    let i8_values = vec![-128_i8, -1, 0, 127];
+    let u16_values = vec![0_u16, 1, 65535, 42];
+    let i16_values = vec![-32768_i16, -1, 0, 32767];
+    let u32_values = vec![0_u32, 1, 4_000_000_000, 17];
+    let i32_values = vec![-7_i32, 0, 42, 123456];
+    let u64_values = vec![0_u64, 1, 9_000_000_000, u64::MAX - 5];
+    let i64_values = vec![i64::MIN + 5, -1, 0, i64::MAX];
+    let f32_values = vec![1.25_f32, -2.5, 3.75, 8.0];
+    let f64_values = vec![1.25_f64, -2.5, 3.75, 8.0];
+    let bool_values = vec![true, false, true, true];
+
+    write_tree(
+        &path,
+        "Events",
+        &[
+            Branch::u8("u8_branch", u8_values.clone()),
+            Branch::i8("i8_branch", i8_values.clone()),
+            Branch::u16("u16_branch", u16_values.clone()),
+            Branch::i16("i16_branch", i16_values.clone()),
+            Branch::u32("u32_branch", u32_values.clone()),
+            Branch::i32("i32_branch", i32_values.clone()),
+            Branch::u64("u64_branch", u64_values.clone()),
+            Branch::i64("i64_branch", i64_values.clone()),
+            Branch::f32("f32_branch", f32_values.clone()),
+            Branch::f64("f64_branch", f64_values.clone()),
+            Branch::bool("bool_branch", bool_values.clone()),
+        ],
+    )
+    .expect("write owned ROOT file");
+
+    assert_eq!(read_rootio(&path, "Events", "u8_branch", be_u8), u8_values);
+    assert_eq!(read_rootio(&path, "Events", "i8_branch", be_i8), i8_values);
+    assert_eq!(
+        read_rootio(&path, "Events", "u16_branch", be_u16),
+        u16_values
+    );
+    assert_eq!(
+        read_rootio(&path, "Events", "i16_branch", be_i16),
+        i16_values
+    );
+    assert_eq!(
+        read_rootio(&path, "Events", "u32_branch", be_u32),
+        u32_values
+    );
+    assert_eq!(
+        read_rootio(&path, "Events", "i32_branch", be_i32),
+        i32_values
+    );
+    assert_eq!(
+        read_rootio(&path, "Events", "u64_branch", be_u64),
+        u64_values
+    );
+    assert_eq!(
+        read_rootio(&path, "Events", "i64_branch", be_i64),
+        i64_values
+    );
+    assert_eq!(
+        read_rootio(&path, "Events", "f32_branch", be_f32),
+        f32_values
+    );
+    assert_eq!(
+        read_rootio(&path, "Events", "f64_branch", be_f64),
+        f64_values
+    );
+    assert_eq!(
+        read_rootio(&path, "Events", "bool_branch", |i| {
+            be_u8(i).map(|(i, value)| (i, value != 0))
+        }),
+        bool_values
+    );
 
     let _ = std::fs::remove_file(&path);
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::decompress::decompress_root_blocks;
 use crate::error::{Error, Result};
-use crate::parse::{Cursor, ObjectContext};
+use crate::parse::{Cursor, ObjectContext, TBUFFER_OBJECT_MAP_OFFSET};
 use crate::tree::{parse_tree, Tree};
 
 const FILE_HEADER_SIZE: usize = 75;
@@ -164,7 +164,10 @@ impl FileItem {
         let payload = self.payload()?;
         let mut cur = Cursor::new(&payload);
         let mut tree_payload = cur.checked_sub()?;
-        let ctx = ObjectContext::new(&payload, (self.key.key_len + 2) as u64);
+        let ctx = ObjectContext::new(
+            &payload,
+            self.key.key_len as u64 + TBUFFER_OBJECT_MAP_OFFSET,
+        );
         parse_tree(&mut tree_payload, &ctx, self.source.clone())
     }
 }
@@ -281,7 +284,10 @@ fn parse_streamer_infos(source: &Source, header: &FileHeader) -> Result<Vec<Stre
         header.seek_info,
         u64::try_from(header.nbytes_info + 4).unwrap_or_default(),
     )?)?;
-    let ctx = ObjectContext::new(&info_key.payload, info_key.header.key_len as u64 + 2);
+    let ctx = ObjectContext::new(
+        &info_key.payload,
+        info_key.header.key_len as u64 + TBUFFER_OBJECT_MAP_OFFSET,
+    );
     let mut cur = Cursor::new(&info_key.payload);
     let mut list = cur.checked_sub()?;
     let _version = list.u16()?;

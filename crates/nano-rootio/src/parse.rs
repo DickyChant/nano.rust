@@ -6,6 +6,7 @@ const BYTE_COUNT_MASK: u32 = 0x4000_0000;
 const CLASS_MASK: u32 = 0x8000_0000;
 const NEW_CLASSTAG: u32 = 0xFFFF_FFFF;
 const IS_REFERENCED: u32 = 1 << 4;
+pub(crate) const TBUFFER_OBJECT_MAP_OFFSET: u64 = 2;
 
 #[derive(Clone)]
 pub(crate) struct Cursor<'a> {
@@ -256,6 +257,21 @@ impl<'a> ObjectContext<'a> {
     fn class_name_at(&self, absolute: u32) -> Result<&'a str> {
         self.raw_at(absolute).map(|raw| raw.class_name)
     }
+}
+
+/// Return the absolute object-reference tag consumed by `read_raw`.
+///
+/// ROOT's object pointer references are not file offsets. They are offsets into
+/// the current `TBufferFile` payload plus the buffer's object-map offset. The
+/// reader subtracts `map_offset` before reparsing the referenced raw object; the
+/// writer uses this helper to emit the inverse tag.
+pub(crate) fn object_reference_tag(map_offset: u64, local_offset: usize) -> Result<u32> {
+    let local = u64::try_from(local_offset)
+        .map_err(|_| Error::parse(0, "object reference local offset overflows u64"))?;
+    let tag = map_offset
+        .checked_add(local)
+        .ok_or_else(|| Error::parse(0, "object reference tag overflow"))?;
+    u32::try_from(tag).map_err(|_| Error::parse(0, "object reference tag overflows u32"))
 }
 
 fn read_class_info<'a>(cur: &mut Cursor<'a>) -> Result<ClassInfo<'a>> {
