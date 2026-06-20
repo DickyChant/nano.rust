@@ -1,6 +1,6 @@
 name: docs
 
-# Build rustdoc API docs for the whole workspace and publish to GitHub Pages.
+# Build the project site (landing page + blog + rustdoc API) and publish to Pages.
 on:
   push:
     branches: [main]
@@ -23,11 +23,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build rustdoc (all crates, all features)
         run: cargo doc --no-deps --all-features --workspace
-      - name: Landing redirect -> nano_io
-        run: echo '<meta http-equiv="refresh" content="0; url=nano_io/index.html">' > target/doc/index.html
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Site dependencies
+        run: python -m pip install --upgrade pip markdown
+      - name: Assemble site (landing + blog + api)
+        run: python scripts/build_site.py
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: target/doc
+          path: public
 
   deploy:
     needs: build

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>nano.rust — a Rust-native NanoAOD analysis framework</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="hero">
+  <h1>nano<span class="dot">.</span>rust</h1>
+  <p class="tag">A pure-Rust, semantics-first NanoAOD analysis framework for high-energy physics — built for the agentic-coding era.</p>
+  <p class="badges">
+    <a href="https://github.com/DickyChant/nano.rust/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DickyChant/nano.rust/actions/workflows/ci.yml/badge.svg" /></a>
+    <a href="https://github.com/DickyChant/nano.rust/actions/workflows/docs.yml"><img alt="docs" src="https://github.com/DickyChant/nano.rust/actions/workflows/docs.yml/badge.svg" /></a>
+    <a href="https://github.com/DickyChant/nano.rust"><img alt="repo" src="https://img.shields.io/badge/source-GitHub-24292f?logo=github" /></a>
+  </p>
+</header>
+
+<main>
+  <section class="lede">
+    <p><strong>The thesis:</strong> soft guardrails (prompts, skills, harnesses, review) can <em>steer</em> agent-generated analysis code but cannot <em>guarantee</em> its correctness. A hard guarantee needs a mechanical enforcer — so we model the analysis as a typed <strong>state machine</strong> and let the Rust compiler make invalid analysis states unrepresentable, then add Rust's strengths: performance, FFI to legacy libraries, SIMD per-event execution, and a TUI for orchestration and agentic execution.</p>
+  </section>
+
+  <section class="cards">
+    <a class="card" href="api/nano_io/index.html">
+      <h3>API docs →</h3>
+      <p>rustdoc for the workspace crates.</p>
+      <p class="crates"><code>nano_io</code> · <code>nano_core</code> · <code>root_io</code> · <code>nano_producers</code></p>
+    </a>
+    <a class="card" href="blog/index.html">
+      <h3>Notes / blog →</h3>
+      <p>Design notes and essays — the working drafts of our arXiv note.</p>
+    </a>
+    <a class="card" href="https://github.com/DickyChant/nano.rust">
+      <h3>Source →</h3>
+      <p>Code, design docs, and roadmap on GitHub.</p>
+    </a>
+  </section>
+
+  <section class="status">
+    <h2>What works today</h2>
+    <ul>
+      <li><strong>Pure-Rust ROOT I/O</strong> — reads &amp; writes <code>TTree</code> (zlib/LZMA/lz4/zstd), no ROOT/C++ dependency.</li>
+      <li><strong>Real CMS NanoAODv9</strong> — reads it locally and <strong>remotely on-demand</strong> over HTTPS byte-range (10 events ≈ 1.3&nbsp;MB of a 2&nbsp;GB file).</li>
+      <li><strong>Bounded streaming</strong> — real NanoAOD → skim at ~72&nbsp;MB resident, any file size.</li>
+      <li><strong>uproot-validated</strong> — the reader is value-correct against uproot on real data; CI cross-checks every push.</li>
+      <li><strong>Typed event model</strong> — collections, attributes, and a compile-time analysis state machine (in design).</li>
+    </ul>
+  </section>
+</main>
+
+<footer>
+  <p>nano.rust · MPL-2.0 (vendored root-io) · built in an "agents write, the compiler reviews" loop.</p>
+</footer>
+</body>
+</html>

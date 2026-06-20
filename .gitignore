@@ -64,3 +64,4 @@ references/
 !tests/data/muon_validation/references/
 !tests/data/muon_validation/references/**
 tmp/
+public/
