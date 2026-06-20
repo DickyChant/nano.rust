@@ -8,13 +8,14 @@ description = "NanoAOD ROOT input reading and skim output writing for nano.rust"
 
 [dependencies]
 nano-core = { workspace = true }
-futures = "0.3"
-nom = "^7"
-root-io = { workspace = true }
+nano-rootio = { workspace = true }
+futures = { version = "0.3", optional = true }
+nom = { version = "^7", optional = true }
+root-io = { workspace = true, optional = true }
 
 [features]
 default = []
-http = ["root-io/http"]
+http = ["dep:futures", "dep:nom", "dep:root-io", "root-io/http"]
 
 [dev-dependencies]
 nano-producers = { workspace = true }

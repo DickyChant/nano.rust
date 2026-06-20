@@ -1,16 +1,132 @@
 //! nano-io — ROOT input reading and skim output writing for nano.rust.
 //!
-//! Reading wraps the forked `root-io` crate (TTree reader); writing extends
-//! that fork with a native pure-Rust TTree writer for the fixed skim schema
-//! (`bool`, `i32`, `u32`, `u64`, `f32`, `Vec<f32>`) plus filtered
+//! Local reading wraps the owned synchronous `nano-rootio` crate; remote
+//! HTTP(S) byte-range reading still uses the forked `root-io` crate behind the
+//! `http` feature. Writing uses the owned pure-Rust TTree writer for the fixed
+//! skim schema (`bool`, `i32`, `u32`, `u64`, `f32`, `Vec<f32>`) plus filtered
 //! `Runs`/`LuminosityBlocks`. See `docs/rust-migration.md`.
 
+use std::fmt;
+use std::num::{ParseFloatError, ParseIntError, TryFromIntError};
 use std::path::Path;
 
 use nano_core::{BranchSchema, Event};
 #[cfg(feature = "http")]
 pub use root_io::HttpSourceOptions;
-pub use root_io::{Result, RootError};
+
+pub type Result<T> = std::result::Result<T, RootError>;
+
+#[derive(Debug)]
+pub enum RootError {
+    Io(std::io::Error),
+    Parse(String),
+    Format(fmt::Error),
+    Decompression(String),
+    UnsupportedCompression(String),
+    IntConversion(TryFromIntError),
+    ParseFloat(ParseFloatError),
+    ParseInt(ParseIntError),
+    Other(String),
+}
+
+impl RootError {
+    pub fn parse(message: impl Into<String>) -> Self {
+        Self::Parse(message.into())
+    }
+
+    pub fn decompression(message: impl Into<String>) -> Self {
+        Self::Decompression(message.into())
+    }
+
+    pub fn other(message: impl Into<String>) -> Self {
+        Self::Other(message.into())
+    }
+}
+
+impl fmt::Display for RootError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "{err}"),
+            Self::Parse(message) => write!(f, "{message}"),
+            Self::Format(err) => write!(f, "{err}"),
+            Self::Decompression(message) => write!(f, "{message}"),
+            Self::UnsupportedCompression(magic) => {
+                write!(f, "unsupported ROOT compression algorithm `{magic}`")
+            }
+            Self::IntConversion(err) => write!(f, "{err}"),
+            Self::ParseFloat(err) => write!(f, "{err}"),
+            Self::ParseInt(err) => write!(f, "{err}"),
+            Self::Other(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for RootError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::Format(err) => Some(err),
+            Self::IntConversion(err) => Some(err),
+            Self::ParseFloat(err) => Some(err),
+            Self::ParseInt(err) => Some(err),
+            Self::Parse(_)
+            | Self::Decompression(_)
+            | Self::UnsupportedCompression(_)
+            | Self::Other(_) => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for RootError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<fmt::Error> for RootError {
+    fn from(err: fmt::Error) -> Self {
+        Self::Format(err)
+    }
+}
+
+impl From<TryFromIntError> for RootError {
+    fn from(err: TryFromIntError) -> Self {
+        Self::IntConversion(err)
+    }
+}
+
+impl From<ParseFloatError> for RootError {
+    fn from(err: ParseFloatError) -> Self {
+        Self::ParseFloat(err)
+    }
+}
+
+impl From<ParseIntError> for RootError {
+    fn from(err: ParseIntError) -> Self {
+        Self::ParseInt(err)
+    }
+}
+
+impl From<nano_rootio::Error> for RootError {
+    fn from(err: nano_rootio::Error) -> Self {
+        match err {
+            nano_rootio::Error::Io(err) => Self::Io(err),
+            nano_rootio::Error::Parse { message, .. } => Self::Parse(message),
+            nano_rootio::Error::Decompression(message) => Self::Decompression(message),
+            nano_rootio::Error::UnsupportedCompression(magic) => {
+                Self::UnsupportedCompression(magic)
+            }
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+#[cfg(feature = "http")]
+impl From<root_io::RootError> for RootError {
+    fn from(err: root_io::RootError) -> Self {
+        Self::Other(err.to_string())
+    }
+}
 
 /// Synchronously read the `Events` TTree from a ROOT file into one [`Event`] per entry.
 pub fn read_events(path: &Path, schema: BranchSchema) -> Result<Vec<Event>> {
@@ -112,35 +228,49 @@ pub fn events_url_chunked_from_tree_with_options(
     chunk_size: usize,
     options: HttpSourceOptions,
 ) -> Result<reader::EventIterator> {
+    // TODO: port an HTTP byte-range Source to nano-rootio so root-io can be
+    // fully retired from nano-io.
     let source = root_io::Source::http_with_options(url, options)?;
     reader::EventIterator::new_from_source(source, url, tree_name, schema, chunk_size)
 }
 
 pub mod reader {
-    use std::collections::HashMap;
     use std::path::Path;
     use std::rc::Rc;
 
-    use futures::executor::block_on;
     use nano_core::{BranchColumn, BranchColumns, BranchSchema, BranchSpec, BranchType, Event};
-    use nom::multi::count;
-    use nom::number::complete::{
-        be_f32, be_i16, be_i32, be_i64, be_i8, be_u16, be_u32, be_u64, be_u8,
+    use nano_rootio::{RootFile, Tree};
+    #[cfg(feature = "http")]
+    use {
+        futures::executor::block_on,
+        nom::multi::count,
+        nom::number::complete::{
+            be_f32, be_i16, be_i32, be_i64, be_i8, be_u16, be_u32, be_u64, be_u8,
+        },
+        nom::IResult,
+        root_io::tree_reader::{TBranch as RemoteBranch, Tree as RemoteTree},
+        root_io::{RootFile as RemoteRootFile, Source},
+        std::collections::HashMap,
     };
-    use nom::IResult;
-    use root_io::tree_reader::TBranch;
-    use root_io::tree_reader::Tree;
-    use root_io::RootFile;
-    use root_io::Source;
 
     use crate::{Result, RootError};
 
     pub const DEFAULT_CHUNK_SIZE: usize = 65_536;
 
+    enum EventIteratorBackend {
+        Local {
+            tree: Tree,
+        },
+        #[cfg(feature = "http")]
+        Remote {
+            source: Source,
+            tree: RemoteTree,
+        },
+    }
+
     pub struct EventIterator {
-        source: Source,
         file_size: u64,
-        tree: Tree,
+        backend: EventIteratorBackend,
         schema: Rc<BranchSchema>,
         chunk_size: usize,
         total_entries: usize,
@@ -158,15 +288,25 @@ pub mod reader {
             schema: &BranchSchema,
             chunk_size: usize,
         ) -> Result<Self> {
-            Self::new_from_source(
-                Source::new(path),
-                &path.display().to_string(),
-                tree_name,
-                schema,
-                chunk_size,
-            )
+            let file = RootFile::open(path)?;
+            let file_size = file.file_size();
+            let tree = tree_by_name_or_first(&file, &path.display().to_string(), tree_name)?;
+            let total_entries = usize::try_from(tree.entries())?;
+            Ok(Self {
+                file_size,
+                backend: EventIteratorBackend::Local { tree },
+                schema: Rc::new(schema.clone()),
+                chunk_size: chunk_size.max(1),
+                total_entries,
+                next_entry: 0,
+                chunk_start: 0,
+                chunk_len: 0,
+                chunk_row: 0,
+                columns: None,
+            })
         }
 
+        #[cfg(feature = "http")]
         pub fn new_from_source(
             source: Source,
             source_label: &str,
@@ -174,14 +314,13 @@ pub mod reader {
             schema: &BranchSchema,
             chunk_size: usize,
         ) -> Result<Self> {
-            let file = block_on(RootFile::from_source(source.clone()))?;
+            let file = block_on(RemoteRootFile::from_source(source.clone()))?;
             let file_size = file.file_size();
-            let tree = block_on(tree_by_name_or_first(&file, source_label, tree_name))?;
+            let tree = block_on(remote_tree_by_name_or_first(&file, source_label, tree_name))?;
             let total_entries = usize::try_from(tree.entries()).map_err(RootError::from)?;
             Ok(Self {
-                source,
                 file_size,
-                tree,
+                backend: EventIteratorBackend::Remote { source, tree },
                 schema: Rc::new(schema.clone()),
                 chunk_size: chunk_size.max(1),
                 total_entries,
@@ -194,7 +333,11 @@ pub mod reader {
         }
 
         pub fn bytes_fetched(&self) -> u64 {
-            self.source.bytes_fetched()
+            match &self.backend {
+                EventIteratorBackend::Local { .. } => 0,
+                #[cfg(feature = "http")]
+                EventIteratorBackend::Remote { source, .. } => source.bytes_fetched(),
+            }
         }
 
         pub fn file_size(&self) -> u64 {
@@ -211,7 +354,15 @@ pub mod reader {
 
             let start = self.next_entry;
             let len = self.chunk_size.min(self.total_entries - start);
-            let columns = read_columns_window(&self.tree, self.schema.specs(), start, len)?;
+            let columns = match &self.backend {
+                EventIteratorBackend::Local { tree } => {
+                    read_columns_window(tree, self.schema.specs(), start, len)?
+                }
+                #[cfg(feature = "http")]
+                EventIteratorBackend::Remote { tree, .. } => {
+                    read_remote_columns_window(tree, self.schema.specs(), start, len)?
+                }
+            };
             self.columns = Some(Rc::new(columns));
             self.chunk_start = start;
             self.chunk_len = len;
@@ -245,25 +396,21 @@ pub mod reader {
         }
     }
 
-    async fn tree_by_name_or_first(
-        file: &RootFile,
-        source_label: &str,
-        tree_name: &str,
-    ) -> Result<Tree> {
-        if let Some(item) = file
-            .items()
+    fn tree_by_name_or_first(file: &RootFile, source_label: &str, tree_name: &str) -> Result<Tree> {
+        if file
+            .objects()
             .iter()
-            .find(|item| item.name() == format!("`{tree_name}` of type `TTree`"))
+            .any(|item| item.name() == tree_name && item.class() == "TTree")
         {
-            return item.as_tree().await;
+            return file.tree(tree_name).map_err(RootError::from);
         }
 
-        file.items()
-            .iter()
-            .find(|item| item.verbose_info().contains("TTree"))
-            .ok_or_else(|| RootError::other(format!("No TTree found in {source_label}")))?
-            .as_tree()
-            .await
+        let object = file
+            .objects()
+            .into_iter()
+            .find(|item| item.class() == "TTree")
+            .ok_or_else(|| RootError::other(format!("No TTree found in {source_label}")))?;
+        file.tree(object.name()).map_err(RootError::from)
     }
 
     fn read_columns_window(
@@ -273,7 +420,6 @@ pub mod reader {
         len: usize,
     ) -> Result<BranchColumns> {
         let mut columns = BranchColumns::new();
-        let mut count_cache = HashMap::new();
 
         for spec in specs.iter().filter(|spec| !spec.branch_type.is_vector()) {
             match read_scalar_column_window(tree, spec, start, len) {
@@ -288,7 +434,7 @@ pub mod reader {
         }
 
         for spec in specs.iter().filter(|spec| spec.branch_type.is_vector()) {
-            match read_vector_column_window(tree, spec, start, len, &mut count_cache) {
+            match read_vector_column_window(tree, spec, start, len) {
                 Ok(column) => {
                     columns.insert(spec.name.clone(), column);
                 }
@@ -308,38 +454,18 @@ pub mod reader {
         start: usize,
         len: usize,
     ) -> Result<BranchColumn> {
-        let branch = tree.branch_by_name(&spec.name)?;
+        let start = i64::try_from(start)?;
         let column = match spec.branch_type {
-            BranchType::Bool => BranchColumn::Bool(read_fixed_window(branch, start, len, |i| {
-                be_u8(i).map(|(i, value)| (i, value != 0))
-            })?),
-            BranchType::I8 => {
-                BranchColumn::I8(read_fixed_window(branch, start, len, |i| be_i8(i))?)
-            }
-            BranchType::U8 => {
-                BranchColumn::U8(read_fixed_window(branch, start, len, |i| be_u8(i))?)
-            }
-            BranchType::I16 => {
-                BranchColumn::I16(read_fixed_window(branch, start, len, |i| be_i16(i))?)
-            }
-            BranchType::U16 => {
-                BranchColumn::U16(read_fixed_window(branch, start, len, |i| be_u16(i))?)
-            }
-            BranchType::I32 => {
-                BranchColumn::I32(read_fixed_window(branch, start, len, |i| be_i32(i))?)
-            }
-            BranchType::U32 => {
-                BranchColumn::U32(read_fixed_window(branch, start, len, |i| be_u32(i))?)
-            }
-            BranchType::I64 => {
-                BranchColumn::I64(read_fixed_window(branch, start, len, |i| be_i64(i))?)
-            }
-            BranchType::U64 => {
-                BranchColumn::U64(read_fixed_window(branch, start, len, |i| be_u64(i))?)
-            }
-            BranchType::F32 => {
-                BranchColumn::F32(read_fixed_window(branch, start, len, |i| be_f32(i))?)
-            }
+            BranchType::Bool => BranchColumn::Bool(tree.read_scalar_range(&spec.name, start, len)?),
+            BranchType::I8 => BranchColumn::I8(tree.read_scalar_range(&spec.name, start, len)?),
+            BranchType::U8 => BranchColumn::U8(tree.read_scalar_range(&spec.name, start, len)?),
+            BranchType::I16 => BranchColumn::I16(tree.read_scalar_range(&spec.name, start, len)?),
+            BranchType::U16 => BranchColumn::U16(tree.read_scalar_range(&spec.name, start, len)?),
+            BranchType::I32 => BranchColumn::I32(tree.read_scalar_range(&spec.name, start, len)?),
+            BranchType::U32 => BranchColumn::U32(tree.read_scalar_range(&spec.name, start, len)?),
+            BranchType::I64 => BranchColumn::I64(tree.read_scalar_range(&spec.name, start, len)?),
+            BranchType::U64 => BranchColumn::U64(tree.read_scalar_range(&spec.name, start, len)?),
+            BranchType::F32 => BranchColumn::F32(tree.read_scalar_range(&spec.name, start, len)?),
             branch_type => {
                 return Err(RootError::other(format!(
                     "branch `{}` has non-scalar type {:?}",
@@ -355,13 +481,205 @@ pub mod reader {
         spec: &BranchSpec,
         start: usize,
         len: usize,
+    ) -> Result<BranchColumn> {
+        let count_branch = count_branch_name(&spec.name)?;
+        let start = i64::try_from(start)?;
+
+        let column = match spec.branch_type {
+            BranchType::VecBool => BranchColumn::VecBool(tree.read_jagged_range(
+                &spec.name,
+                &count_branch,
+                start,
+                len,
+            )?),
+            BranchType::VecI8 => BranchColumn::VecI8(tree.read_jagged_range(
+                &spec.name,
+                &count_branch,
+                start,
+                len,
+            )?),
+            BranchType::VecU8 => BranchColumn::VecU8(tree.read_jagged_range(
+                &spec.name,
+                &count_branch,
+                start,
+                len,
+            )?),
+            BranchType::VecI16 => BranchColumn::VecI16(tree.read_jagged_range(
+                &spec.name,
+                &count_branch,
+                start,
+                len,
+            )?),
+            BranchType::VecU16 => BranchColumn::VecU16(tree.read_jagged_range(
+                &spec.name,
+                &count_branch,
+                start,
+                len,
+            )?),
+            BranchType::VecI32 => BranchColumn::VecI32(tree.read_jagged_range(
+                &spec.name,
+                &count_branch,
+                start,
+                len,
+            )?),
+            BranchType::VecU32 => BranchColumn::VecU32(tree.read_jagged_range(
+                &spec.name,
+                &count_branch,
+                start,
+                len,
+            )?),
+            BranchType::VecI64 => BranchColumn::VecI64(tree.read_jagged_range(
+                &spec.name,
+                &count_branch,
+                start,
+                len,
+            )?),
+            BranchType::VecU64 => BranchColumn::VecU64(tree.read_jagged_range(
+                &spec.name,
+                &count_branch,
+                start,
+                len,
+            )?),
+            BranchType::VecF32 => BranchColumn::VecF32(tree.read_jagged_range(
+                &spec.name,
+                &count_branch,
+                start,
+                len,
+            )?),
+            branch_type => {
+                return Err(RootError::other(format!(
+                    "branch `{}` has non-vector type {:?}",
+                    spec.name, branch_type
+                )));
+            }
+        };
+        Ok(column)
+    }
+
+    #[cfg(feature = "http")]
+    async fn remote_tree_by_name_or_first(
+        file: &RemoteRootFile,
+        source_label: &str,
+        tree_name: &str,
+    ) -> Result<RemoteTree> {
+        if let Some(item) = file
+            .items()
+            .iter()
+            .find(|item| item.name() == format!("`{tree_name}` of type `TTree`"))
+        {
+            return item.as_tree().await.map_err(RootError::from);
+        }
+
+        file.items()
+            .iter()
+            .find(|item| item.verbose_info().contains("TTree"))
+            .ok_or_else(|| RootError::other(format!("No TTree found in {source_label}")))?
+            .as_tree()
+            .await
+            .map_err(RootError::from)
+    }
+
+    #[cfg(feature = "http")]
+    fn read_remote_columns_window(
+        tree: &RemoteTree,
+        specs: &[BranchSpec],
+        start: usize,
+        len: usize,
+    ) -> Result<BranchColumns> {
+        let mut columns = BranchColumns::new();
+        let mut count_cache = HashMap::new();
+
+        for spec in specs.iter().filter(|spec| !spec.branch_type.is_vector()) {
+            match read_remote_scalar_column_window(tree, spec, start, len) {
+                Ok(column) => {
+                    columns.insert(spec.name.clone(), column);
+                }
+                Err(err) if spec.optional => {
+                    let _ = err;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        for spec in specs.iter().filter(|spec| spec.branch_type.is_vector()) {
+            match read_remote_vector_column_window(tree, spec, start, len, &mut count_cache) {
+                Ok(column) => {
+                    columns.insert(spec.name.clone(), column);
+                }
+                Err(err) if spec.optional => {
+                    let _ = err;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(columns)
+    }
+
+    #[cfg(feature = "http")]
+    fn read_remote_scalar_column_window(
+        tree: &RemoteTree,
+        spec: &BranchSpec,
+        start: usize,
+        len: usize,
+    ) -> Result<BranchColumn> {
+        let branch = tree.branch_by_name(&spec.name)?;
+        let column = match spec.branch_type {
+            BranchType::Bool => {
+                BranchColumn::Bool(read_remote_fixed_window(branch, start, len, |i| {
+                    be_u8(i).map(|(i, value)| (i, value != 0))
+                })?)
+            }
+            BranchType::I8 => {
+                BranchColumn::I8(read_remote_fixed_window(branch, start, len, |i| be_i8(i))?)
+            }
+            BranchType::U8 => {
+                BranchColumn::U8(read_remote_fixed_window(branch, start, len, |i| be_u8(i))?)
+            }
+            BranchType::I16 => {
+                BranchColumn::I16(read_remote_fixed_window(branch, start, len, |i| be_i16(i))?)
+            }
+            BranchType::U16 => {
+                BranchColumn::U16(read_remote_fixed_window(branch, start, len, |i| be_u16(i))?)
+            }
+            BranchType::I32 => {
+                BranchColumn::I32(read_remote_fixed_window(branch, start, len, |i| be_i32(i))?)
+            }
+            BranchType::U32 => {
+                BranchColumn::U32(read_remote_fixed_window(branch, start, len, |i| be_u32(i))?)
+            }
+            BranchType::I64 => {
+                BranchColumn::I64(read_remote_fixed_window(branch, start, len, |i| be_i64(i))?)
+            }
+            BranchType::U64 => {
+                BranchColumn::U64(read_remote_fixed_window(branch, start, len, |i| be_u64(i))?)
+            }
+            BranchType::F32 => {
+                BranchColumn::F32(read_remote_fixed_window(branch, start, len, |i| be_f32(i))?)
+            }
+            branch_type => {
+                return Err(RootError::other(format!(
+                    "branch `{}` has non-scalar type {:?}",
+                    spec.name, branch_type
+                )));
+            }
+        };
+        Ok(column)
+    }
+
+    #[cfg(feature = "http")]
+    fn read_remote_vector_column_window(
+        tree: &RemoteTree,
+        spec: &BranchSpec,
+        start: usize,
+        len: usize,
         count_cache: &mut HashMap<(String, usize, usize), Vec<u32>>,
     ) -> Result<BranchColumn> {
         let branch = tree.branch_by_name(&spec.name)?;
         let count_branch = count_branch_name(&spec.name)?;
 
         let column = match spec.branch_type {
-            BranchType::VecBool => BranchColumn::VecBool(read_vector_window(
+            BranchType::VecBool => BranchColumn::VecBool(read_remote_vector_window(
                 tree,
                 branch,
                 &count_branch,
@@ -370,7 +688,7 @@ pub mod reader {
                 count_cache,
                 |i| be_u8(i).map(|(i, value)| (i, value != 0)),
             )?),
-            BranchType::VecI8 => BranchColumn::VecI8(read_vector_window(
+            BranchType::VecI8 => BranchColumn::VecI8(read_remote_vector_window(
                 tree,
                 branch,
                 &count_branch,
@@ -379,7 +697,7 @@ pub mod reader {
                 count_cache,
                 |i| be_i8(i),
             )?),
-            BranchType::VecU8 => BranchColumn::VecU8(read_vector_window(
+            BranchType::VecU8 => BranchColumn::VecU8(read_remote_vector_window(
                 tree,
                 branch,
                 &count_branch,
@@ -388,7 +706,7 @@ pub mod reader {
                 count_cache,
                 |i| be_u8(i),
             )?),
-            BranchType::VecI16 => BranchColumn::VecI16(read_vector_window(
+            BranchType::VecI16 => BranchColumn::VecI16(read_remote_vector_window(
                 tree,
                 branch,
                 &count_branch,
@@ -397,7 +715,7 @@ pub mod reader {
                 count_cache,
                 |i| be_i16(i),
             )?),
-            BranchType::VecU16 => BranchColumn::VecU16(read_vector_window(
+            BranchType::VecU16 => BranchColumn::VecU16(read_remote_vector_window(
                 tree,
                 branch,
                 &count_branch,
@@ -406,7 +724,7 @@ pub mod reader {
                 count_cache,
                 |i| be_u16(i),
             )?),
-            BranchType::VecI32 => BranchColumn::VecI32(read_vector_window(
+            BranchType::VecI32 => BranchColumn::VecI32(read_remote_vector_window(
                 tree,
                 branch,
                 &count_branch,
@@ -415,7 +733,7 @@ pub mod reader {
                 count_cache,
                 |i| be_i32(i),
             )?),
-            BranchType::VecU32 => BranchColumn::VecU32(read_vector_window(
+            BranchType::VecU32 => BranchColumn::VecU32(read_remote_vector_window(
                 tree,
                 branch,
                 &count_branch,
@@ -424,7 +742,7 @@ pub mod reader {
                 count_cache,
                 |i| be_u32(i),
             )?),
-            BranchType::VecI64 => BranchColumn::VecI64(read_vector_window(
+            BranchType::VecI64 => BranchColumn::VecI64(read_remote_vector_window(
                 tree,
                 branch,
                 &count_branch,
@@ -433,7 +751,7 @@ pub mod reader {
                 count_cache,
                 |i| be_i64(i),
             )?),
-            BranchType::VecU64 => BranchColumn::VecU64(read_vector_window(
+            BranchType::VecU64 => BranchColumn::VecU64(read_remote_vector_window(
                 tree,
                 branch,
                 &count_branch,
@@ -442,7 +760,7 @@ pub mod reader {
                 count_cache,
                 |i| be_u64(i),
             )?),
-            BranchType::VecF32 => BranchColumn::VecF32(read_vector_window(
+            BranchType::VecF32 => BranchColumn::VecF32(read_remote_vector_window(
                 tree,
                 branch,
                 &count_branch,
@@ -461,8 +779,9 @@ pub mod reader {
         Ok(column)
     }
 
-    fn read_fixed_window<T, P>(
-        branch: &TBranch,
+    #[cfg(feature = "http")]
+    fn read_remote_fixed_window<T, P>(
+        branch: &RemoteBranch,
         start: usize,
         len: usize,
         parser: P,
@@ -472,8 +791,8 @@ pub mod reader {
     {
         let mut values = Vec::with_capacity(len);
         let end = start + len;
-        for basket_index in basket_indices_for_range(branch, start, end)? {
-            let basket_start = basket_first_entry(branch, basket_index)?;
+        for basket_index in remote_basket_indices_for_range(branch, start, end)? {
+            let basket_start = remote_basket_first_entry(branch, basket_index)?;
             let (n_entries, buffer) = block_on(branch.read_basket(basket_index))?;
             let basket_len = n_entries as usize;
             let basket_end = basket_start + basket_len;
@@ -490,9 +809,10 @@ pub mod reader {
         Ok(values)
     }
 
-    fn read_vector_window<T, P>(
-        tree: &Tree,
-        branch: &TBranch,
+    #[cfg(feature = "http")]
+    fn read_remote_vector_window<T, P>(
+        tree: &RemoteTree,
+        branch: &RemoteBranch,
         count_branch: &str,
         start: usize,
         len: usize,
@@ -504,8 +824,8 @@ pub mod reader {
     {
         let mut values = Vec::with_capacity(len);
         let end = start + len;
-        for basket_index in basket_indices_for_range(branch, start, end)? {
-            let basket_start = basket_first_entry(branch, basket_index)?;
+        for basket_index in remote_basket_indices_for_range(branch, start, end)? {
+            let basket_start = remote_basket_first_entry(branch, basket_index)?;
             let (n_entries, buffer) = block_on(branch.read_basket(basket_index))?;
             let basket_len = n_entries as usize;
             let basket_end = basket_start + basket_len;
@@ -524,8 +844,9 @@ pub mod reader {
         Ok(values)
     }
 
+    #[cfg(feature = "http")]
     fn read_count_range(
-        tree: &Tree,
+        tree: &RemoteTree,
         branch_name: &str,
         start: usize,
         len: usize,
@@ -536,11 +857,12 @@ pub mod reader {
             return Ok(values.clone());
         }
         let branch = tree.branch_by_name(branch_name)?;
-        let values = read_fixed_window(branch, start, len, |i| be_u32(i))?;
+        let values = read_remote_fixed_window(branch, start, len, |i| be_u32(i))?;
         count_cache.insert(key, values.clone());
         Ok(values)
     }
 
+    #[cfg(feature = "http")]
     fn parse_fixed_basket<T, P>(
         buffer: &[u8],
         n_entries: usize,
@@ -559,6 +881,7 @@ pub mod reader {
             })
     }
 
+    #[cfg(feature = "http")]
     fn parse_vector_basket<T, P>(
         buffer: &[u8],
         counts: &[u32],
@@ -582,14 +905,19 @@ pub mod reader {
         Ok(rows)
     }
 
-    fn basket_indices_for_range(branch: &TBranch, start: usize, end: usize) -> Result<Vec<usize>> {
+    #[cfg(feature = "http")]
+    fn remote_basket_indices_for_range(
+        branch: &RemoteBranch,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<usize>> {
         if start >= end {
             return Ok(Vec::new());
         }
 
         let mut indices = Vec::new();
         for index in 0..branch.basket_count() {
-            let basket_start = basket_first_entry(branch, index)?;
+            let basket_start = remote_basket_first_entry(branch, index)?;
             let basket_end = match branch.basket_first_entry(index + 1) {
                 Some(entry) => usize::try_from(entry).map_err(RootError::from)?,
                 None => usize::try_from(branch.total_entries()).map_err(RootError::from)?,
@@ -601,7 +929,8 @@ pub mod reader {
         Ok(indices)
     }
 
-    fn basket_first_entry(branch: &TBranch, index: usize) -> Result<usize> {
+    #[cfg(feature = "http")]
+    fn remote_basket_first_entry(branch: &RemoteBranch, index: usize) -> Result<usize> {
         branch
             .basket_first_entry(index)
             .ok_or_else(|| RootError::other(format!("basket {index} has no first-entry marker")))
@@ -621,7 +950,7 @@ pub mod reader {
 pub mod writer {
     use std::path::Path;
 
-    use root_io::write::{write_tree, Branch};
+    use nano_rootio::write::{write_tree, Branch};
 
     use crate::Result;
 
@@ -679,41 +1008,33 @@ pub mod writer {
             .iter()
             .map(OutputBranch::to_root_branch)
             .collect::<Vec<_>>();
-        write_tree(path, "Events", &root_branches)
+        Ok(write_tree(path, "Events", &root_branches)?)
     }
 }
 
 pub mod read {
     use std::path::Path;
 
-    use futures::executor::block_on;
-    use futures::StreamExt;
-    use nom::number::complete::be_i32;
-    use root_io::RootFile;
+    use nano_rootio::RootFile;
 
     use crate::{Result, RootError};
 
     /// Read an `i32` branch from the first TTree in a local ROOT file.
     pub fn read_i32_branch(path: &Path, branch_name: &str) -> Result<Vec<i32>> {
-        block_on(read_i32_branch_async(path, branch_name))
+        let file = RootFile::open(path)?;
+        let tree_name = file
+            .objects()
+            .into_iter()
+            .find(|item| item.class() == "TTree")
+            .map(|item| item.name().to_string())
+            .ok_or_else(|| RootError::other(format!("No TTree found in {}", path.display())))?;
+        let tree = file.tree(&tree_name)?;
+        Ok(tree.read_scalar(branch_name)?)
     }
 
-    /// Asynchronously read an `i32` branch from the first TTree in a local ROOT file.
+    /// Read an `i32` branch from the first TTree in a local ROOT file.
     pub async fn read_i32_branch_async(path: &Path, branch_name: &str) -> Result<Vec<i32>> {
-        let file = RootFile::new(path).await?;
-        let tree = file
-            .items()
-            .iter()
-            .find(|item| item.verbose_info().contains("TTree"))
-            .ok_or_else(|| RootError::other(format!("No TTree found in {}", path.display())))?
-            .as_tree()
-            .await?;
-        let values = tree
-            .branch_by_name(branch_name)?
-            .as_fixed_size_iterator(|i| be_i32(i))
-            .collect::<Vec<_>>()
-            .await;
-        Ok(values)
+        read_i32_branch(path, branch_name)
     }
 }
 

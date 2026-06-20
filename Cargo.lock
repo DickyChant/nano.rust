@@ -483,6 +483,7 @@ dependencies = [
  "futures",
  "nano-core",
  "nano-producers",
+ "nano-rootio",
  "nom",
  "root-io",
 ]
