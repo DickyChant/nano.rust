@@ -1,0 +1,18 @@
+[package]
+name = "nano-rootio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Owned synchronous NanoAOD-focused ROOT reader"
+
+[dependencies]
+flate2 = "1"
+lz4-compress = "0.1.1"
+lzma-rs = "0.1.1"
+ruzstd = "0.7"
+
+[dev-dependencies]
+futures = "0.3"
+nom = "7"
+root-io.workspace = true

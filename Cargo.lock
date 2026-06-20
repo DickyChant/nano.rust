@@ -495,6 +495,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-rootio"
+version = "0.0.0"
+dependencies = [
+ "flate2",
+ "futures",
+ "lz4-compress",
+ "lzma-rs",
+ "nom",
+ "root-io",
+ "ruzstd",
+]
+
+[[package]]
 name = "nano-spec"
 version = "0.0.0"
 dependencies = [
