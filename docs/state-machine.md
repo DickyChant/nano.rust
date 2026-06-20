@@ -1,7 +1,7 @@
 # Analysis state-machine model (design)
 
 The implementation plan for the typed analysis state machine argued for in
-`paper/main.tex` and `docs/vision.md`. Goal: encode the *event life cycle* in
+`notes/main.tex` and `docs/vision.md`. Goal: encode the *event life cycle* in
 Rust types so the compiler rejects out-of-order or incomplete analyses, while
 keeping the ergonomic dynamic event access we already have.
 
@@ -60,7 +60,7 @@ fn fill<R: Region>(h: &mut Hist, e: &Weighted<R>, value: f64);
 ## Quantities, weights, systematics
 
 - **Units**: newtype wrappers (`GeV`, `Fb`, `Pb`); mixing requires explicit
-  conversion (mirrors `paper/main.tex`).
+  conversion (mirrors `notes/main.tex`).
 - **Weights**: `EventWeight` accumulates typed factors (pileup, SF, ...). A
   `Weighted<R>` is the proof that weighting happened before filling.
 - **Systematics**: an exhaustive `enum Systematic`; the event loop is

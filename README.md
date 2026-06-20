@@ -25,7 +25,7 @@ enforcer:
 So the analysis is modelled as a typed **state machine** the compiler checks
 (make invalid analysis states unrepresentable), with Rust's strengths layered on:
 performance, FFI to legacy libraries, SIMD per-event execution, and TUI-friendly
-orchestration. Full rationale: [`paper`/`docs/vision.md`](docs/vision.md).
+orchestration. Full rationale: [`docs/vision.md`](docs/vision.md).
 
 ## What works today
 
@@ -101,8 +101,26 @@ kernel, a workflow IR, and golden tests against the original references. See
 nano.rust began as a C++ port (`nano.cpp` / NanoAODToolsCpp) of selected
 [NanoAOD-tools](https://github.com/cms-nanoAOD/nanoAOD-tools) /
 [NanoHRT-tools](https://github.com/hqucms/NanoHRT-tools) workflows; that snapshot
-is preserved on the `cpp-snapshot` branch. The Rust rewrite is the active line of
+is preserved on the `cpp-snapshot` branch. The Rust rewrite then vendored the
+pure-Rust [`root-io`](https://github.com/cbourjau/alice-rs) reader and grew the
+owned `nano-rootio` I/O core (read + write) from it; that is the active line of
 development.
+
+## Acknowledgments
+
+This project stands on, and is inspired by, prior work:
+
+- **[root-io](https://github.com/cbourjau/alice-rs)** (cbourjau / alice-rs) — the
+  pure-Rust ROOT reader we vendored and grew `nano-rootio` from, and which still
+  serves as a differential A/B oracle in tests (MPL-2.0).
+- **[uproot](https://github.com/scikit-hep/uproot5)** (with awkward-array) — for
+  showing that ROOT can be treated as a *storage format* readable outside ROOT;
+  it is also our independent read/write oracle in CI.
+- **[ROOT](https://root.cern/)** — the on-disk format and reference
+  implementation; our correctness and performance baseline.
+- **[correctionlib](https://github.com/cms-nanoAOD/correctionlib)** — the
+  corrections JSON schema and evaluation model that `nano-corrections`
+  re-implements natively in Rust.
 
 ## License
 
