@@ -480,12 +480,9 @@ version = "0.0.0"
 name = "nano-io"
 version = "0.0.0"
 dependencies = [
- "futures",
  "nano-core",
  "nano-producers",
  "nano-rootio",
- "nom",
- "root-io",
 ]
 
 [[package]]
@@ -505,7 +502,11 @@ dependencies = [
  "lzma-rs",
  "nom",
  "root-io",
+ "rustls",
+ "rustls-pemfile",
  "ruzstd",
+ "ureq",
+ "url",
 ]
 
 [[package]]

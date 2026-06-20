@@ -17,7 +17,7 @@ fn streams_first_10_events_from_https_byte_ranges() {
         BranchSpec::new("Muon_pt", BranchType::VecF32),
         BranchSpec::new("Muon_eta", BranchType::VecF32),
         BranchSpec::new("MET_pt", BranchType::F32),
-        BranchSpec::new("run", BranchType::I32),
+        BranchSpec::new("run", BranchType::U32),
         BranchSpec::new("event", BranchType::U64),
     ])
     .unwrap();
@@ -46,7 +46,7 @@ fn streams_first_10_events_from_https_byte_ranges() {
         let muon_pt = event.vector::<f32>("Muon_pt").unwrap();
         let muon_eta = event.vector::<f32>("Muon_eta").unwrap();
         let met_pt = event.scalar::<f32>("MET_pt").unwrap();
-        let run = event.scalar::<i32>("run").unwrap();
+        let run = event.scalar::<u32>("run").unwrap();
         let event_number = event.scalar::<u64>("event").unwrap();
 
         assert_eq!(muon_pt.len(), n_muon as usize);

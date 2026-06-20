@@ -11,8 +11,16 @@ flate2 = "1"
 lz4-compress = "0.1.1"
 lzma-rs = "0.1.1"
 ruzstd = "0.7"
+rustls = { version = "0.21", features = ["dangerous_configuration"], optional = true }
+rustls-pemfile = { version = "1", optional = true }
+ureq = { version = "~2.8", default-features = false, features = ["tls"], optional = true }
+url = { version = "2", optional = true }
+
+[features]
+default = []
+http = ["dep:rustls", "dep:rustls-pemfile", "dep:ureq", "dep:url"]
 
 [dev-dependencies]
 futures = "0.3"
 nom = "7"
-root-io.workspace = true
+root-io = { path = "../root-io" }

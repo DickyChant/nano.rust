@@ -1,7 +1,23 @@
+use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+#[cfg(feature = "http")]
+use std::io::BufReader;
+#[cfg(feature = "http")]
+use std::time::{Duration, SystemTime};
+
+#[cfg(feature = "http")]
+use rustls::client::{ServerCertVerified, ServerCertVerifier};
+#[cfg(feature = "http")]
+use rustls::{Certificate, ClientConfig, RootCertStore, ServerName};
+#[cfg(feature = "http")]
+use ureq::{Agent, AgentBuilder, Response};
+#[cfg(feature = "http")]
+use url::Url;
 
 use crate::decompress::decompress_root_blocks;
 use crate::error::{Error, Result};
@@ -10,28 +26,340 @@ use crate::tree::{parse_tree, Tree};
 
 const FILE_HEADER_SIZE: usize = 75;
 const TDIRECTORY_MAX_SIZE: usize = 42;
+#[cfg(feature = "http")]
+const USER_AGENT: &str = "nano.rust nano-rootio/0.0";
+#[cfg(feature = "http")]
+const MAX_REDIRECTS: usize = 10;
 
-#[derive(Debug, Clone)]
-pub(crate) struct Source {
-    path: Arc<PathBuf>,
+/// Byte-range source for ROOT reads.
+#[derive(Clone)]
+pub struct Source {
+    inner: SourceInner,
+    bytes_fetched: Arc<AtomicU64>,
 }
 
-impl Source {
-    fn new(path: PathBuf) -> Self {
+#[derive(Clone)]
+enum SourceInner {
+    Local(Arc<PathBuf>),
+    #[cfg(feature = "http")]
+    Http {
+        agent: Agent,
+        url: Url,
+    },
+}
+
+impl fmt::Debug for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Source")
+            .field("inner", &self.inner)
+            .field("bytes_fetched", &self.bytes_fetched())
+            .finish()
+    }
+}
+
+impl fmt::Debug for SourceInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(path) => f.debug_tuple("Local").field(path).finish(),
+            #[cfg(feature = "http")]
+            Self::Http { url, .. } => f.debug_struct("Http").field("url", url).finish(),
+        }
+    }
+}
+
+/// Configuration for an HTTP(S) byte-range source.
+#[cfg(feature = "http")]
+#[derive(Debug, Clone, Default)]
+pub struct HttpSourceOptions {
+    /// PEM certificate bundle used for TLS verification. When unset, ureq's
+    /// default rustls root store is used. [`HttpSourceOptions::from_env`]
+    /// populates this from `SSL_CERT_FILE`.
+    pub ca_bundle: Option<PathBuf>,
+    /// Accept invalid TLS certificates. Use only for public, read-only data.
+    pub insecure: bool,
+}
+
+#[cfg(feature = "http")]
+impl HttpSourceOptions {
+    /// Build options from process environment.
+    ///
+    /// `SSL_CERT_FILE` points to a PEM CA bundle. `NANO_HTTP_INSECURE=1`
+    /// (also `true` or `yes`) disables TLS certificate verification.
+    pub fn from_env() -> Self {
         Self {
-            path: Arc::new(path),
+            ca_bundle: std::env::var_os("SSL_CERT_FILE").map(PathBuf::from),
+            insecure: env_flag("NANO_HTTP_INSECURE"),
         }
     }
 
-    pub(crate) fn fetch(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+    pub fn with_ca_bundle(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ca_bundle = Some(path.into());
+        self
+    }
+
+    pub fn insecure(mut self, insecure: bool) -> Self {
+        self.insecure = insecure;
+        self
+    }
+}
+
+impl Source {
+    pub fn new<T: Into<Self>>(thing: T) -> Self {
+        thing.into()
+    }
+
+    /// Build an HTTP(S) byte-range source using `SSL_CERT_FILE` and
+    /// `NANO_HTTP_INSECURE` from the environment.
+    #[cfg(feature = "http")]
+    pub fn http(url: &str) -> Result<Self> {
+        Self::http_with_options(url, HttpSourceOptions::from_env())
+    }
+
+    /// Build an HTTP(S) byte-range source with explicit TLS options.
+    #[cfg(feature = "http")]
+    pub fn http_with_options(url: &str, options: HttpSourceOptions) -> Result<Self> {
+        let url = Url::parse(url).map_err(|err| {
+            Error::unsupported("HTTP ROOT source", format!("invalid URL `{url}`: {err}"))
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(Error::unsupported(
+                "HTTP ROOT source",
+                format!("requires http:// or https:// URL, got `{}`", url.scheme()),
+            ));
+        }
+        Ok(Self {
+            inner: SourceInner::Http {
+                agent: http_agent(options)?,
+                url,
+            },
+            bytes_fetched: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// Bytes returned by this source's fetches. Clones share the same counter.
+    pub fn bytes_fetched(&self) -> u64 {
+        self.bytes_fetched.load(Ordering::Relaxed)
+    }
+
+    pub fn fetch(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
         let len = usize::try_from(len)
             .map_err(|_| Error::parse(0, format!("read length {len} overflows usize")))?;
-        let mut file = File::open(&*self.path)?;
-        file.seek(SeekFrom::Start(offset))?;
-        let mut out = vec![0; len];
-        file.read_exact(&mut out)?;
+        let out = match &self.inner {
+            SourceInner::Local(path) => {
+                let mut file = File::open(&**path)?;
+                file.seek(SeekFrom::Start(offset))?;
+                let mut out = vec![0; len];
+                file.read_exact(&mut out)?;
+                out
+            }
+            #[cfg(feature = "http")]
+            SourceInner::Http { agent, url } => fetch_http(agent, url, offset, len as u64)?,
+        };
+        self.bytes_fetched
+            .fetch_add(out.len() as u64, Ordering::Relaxed);
         Ok(out)
     }
+}
+
+impl From<&Path> for Source {
+    fn from(path: &Path) -> Self {
+        path.to_path_buf().into()
+    }
+}
+
+impl From<PathBuf> for Source {
+    fn from(path: PathBuf) -> Self {
+        Self {
+            inner: SourceInner::Local(Arc::new(path)),
+            bytes_fetched: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+#[cfg(feature = "http")]
+fn http_agent(options: HttpSourceOptions) -> Result<Agent> {
+    let mut builder = AgentBuilder::new()
+        .redirects(0)
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(120));
+
+    if options.insecure || options.ca_bundle.is_some() {
+        let config = if options.insecure {
+            insecure_tls_config()
+        } else {
+            ca_bundle_tls_config(
+                options
+                    .ca_bundle
+                    .as_ref()
+                    .expect("checked ca_bundle presence"),
+            )?
+        };
+        builder = builder.tls_config(Arc::new(config));
+    }
+
+    Ok(builder.build())
+}
+
+#[cfg(feature = "http")]
+fn ca_bundle_tls_config(path: &Path) -> Result<ClientConfig> {
+    let file = File::open(path).map_err(|err| {
+        Error::unsupported(
+            "HTTP ROOT source",
+            format!("failed to open TLS CA bundle `{}`: {err}", path.display()),
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader).map_err(|err| {
+        Error::unsupported(
+            "HTTP ROOT source",
+            format!("failed to read TLS CA bundle `{}`: {err}", path.display()),
+        )
+    })?;
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots.add(&Certificate(cert)).map_err(|err| {
+            Error::unsupported(
+                "HTTP ROOT source",
+                format!(
+                    "failed to add certificate from TLS CA bundle `{}`: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+    }
+
+    Ok(ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
+#[cfg(feature = "http")]
+fn insecure_tls_config() -> ClientConfig {
+    let mut config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    config
+        .dangerous()
+        .set_certificate_verifier(Arc::new(NoCertificateVerification));
+    config
+}
+
+#[cfg(feature = "http")]
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+#[cfg(feature = "http")]
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &Certificate,
+        _intermediates: &[Certificate],
+        _server_name: &ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: SystemTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+}
+
+#[cfg(feature = "http")]
+fn fetch_http(agent: &Agent, original_url: &Url, start: u64, len: u64) -> Result<Vec<u8>> {
+    let end = start
+        .checked_add(len)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or_else(|| Error::unsupported("HTTP ROOT source", "range overflow"))?;
+    let range = format!("bytes={start}-{end}");
+    let mut url = original_url.clone();
+
+    for _ in 0..=MAX_REDIRECTS {
+        let response = match agent
+            .get(url.as_str())
+            .set("User-Agent", USER_AGENT)
+            .set("Range", &range)
+            .call()
+        {
+            Ok(response) => response,
+            Err(ureq::Error::Status(_, response)) => response,
+            Err(err) => {
+                return Err(Error::unsupported(
+                    "HTTP ROOT source",
+                    format!("HTTP range request failed for `{url}` ({range}): {err}"),
+                ));
+            }
+        };
+
+        if is_redirect(response.status()) {
+            let location = response.header("Location").ok_or_else(|| {
+                Error::unsupported(
+                    "HTTP ROOT source",
+                    format!("HTTP redirect from `{url}` did not include a Location header"),
+                )
+            })?;
+            url = url.join(location).map_err(|err| {
+                Error::unsupported(
+                    "HTTP ROOT source",
+                    format!("invalid HTTP redirect Location `{location}` from `{url}`: {err}"),
+                )
+            })?;
+            continue;
+        }
+
+        return read_partial_response(response, &url, &range, len);
+    }
+
+    Err(Error::unsupported(
+        "HTTP ROOT source",
+        format!("too many HTTP redirects while fetching `{original_url}`"),
+    ))
+}
+
+#[cfg(feature = "http")]
+fn read_partial_response(
+    response: Response,
+    url: &Url,
+    range: &str,
+    expected_len: u64,
+) -> Result<Vec<u8>> {
+    if response.status() != 206 {
+        return Err(Error::unsupported(
+            "HTTP ROOT source",
+            format!(
+                "HTTP range request for `{url}` ({range}) returned status {}, expected 206 Partial Content",
+                response.status()
+            ),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(expected_len as usize);
+    response.into_reader().read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != expected_len {
+        return Err(Error::unsupported(
+            "HTTP ROOT source",
+            format!(
+                "HTTP range request for `{url}` ({range}) returned {} bytes, expected {expected_len}",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "http")]
+fn is_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+#[cfg(feature = "http")]
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +415,7 @@ struct FileItem {
 
 #[derive(Debug)]
 pub struct RootFile {
+    source: Source,
     header: FileHeader,
     items: Vec<FileItem>,
     streamer_infos: Vec<StreamerInfo>,
@@ -94,7 +423,23 @@ pub struct RootFile {
 
 impl RootFile {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let source = Source::new(path.as_ref().to_path_buf());
+        Self::from_source(Source::new(path.as_ref().to_path_buf()))
+    }
+
+    /// Open a ROOT file from an HTTP(S) URL using environment-driven TLS options.
+    #[cfg(feature = "http")]
+    pub fn open_url(url: &str) -> Result<Self> {
+        Self::from_source(Source::http(url)?)
+    }
+
+    /// Open a ROOT file from an HTTP(S) URL using explicit TLS options.
+    #[cfg(feature = "http")]
+    pub fn open_url_with_options(url: &str, options: HttpSourceOptions) -> Result<Self> {
+        Self::from_source(Source::http_with_options(url, options)?)
+    }
+
+    /// Open a ROOT file from an existing byte-range source.
+    pub fn from_source(source: Source) -> Result<Self> {
         let header = parse_file_header(&source.fetch(0, FILE_HEADER_SIZE as u64)?)?;
         let directory =
             parse_directory(&source.fetch(header.seek_dir, TDIRECTORY_MAX_SIZE as u64)?)?;
@@ -111,6 +456,7 @@ impl RootFile {
             .collect::<Vec<_>>();
         let streamer_infos = parse_streamer_infos(&source, &header).unwrap_or_default();
         Ok(Self {
+            source,
             header,
             items,
             streamer_infos,
@@ -145,6 +491,10 @@ impl RootFile {
 
     pub fn file_size(&self) -> u64 {
         self.header.end
+    }
+
+    pub fn bytes_fetched(&self) -> u64 {
+        self.source.bytes_fetched()
     }
 }
 
