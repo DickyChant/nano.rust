@@ -1,0 +1,11 @@
+{"version": 2, "width": 100, "height": 30, "timestamp": 1781998162, "env": {"SHELL": "/usr/bin/bash"}}
+[0.004, "o", "\u001b[1;36m# a ~2 GB CMS Open Data NanoAOD file on the CERN open-data server:\u001b[0m\r\n"]
+[1.305, "o", "\u001b[1;32m$\u001b[0m echo '/eos/opendata/cms/Run2016H/DoubleMuon/.../127C2975-....root'\r\n"]
+[2.006, "o", "/eos/opendata/cms/Run2016H/DoubleMuon/.../127C2975-....root\r\n\r\n"]
+[3.407, "o", "\u001b[1;36m# read its first 5 events over HTTPS -- pure Rust, no ROOT, no download:\u001b[0m\r\n"]
+[4.709, "o", "\u001b[1;32m$\u001b[0m target/debug/examples/read_url_json \"$URL\" 5 --insecure | python3 scripts/fmt_opendata.py\r\n"]
+[6.4, "o", "  run=281616 event=59740 nMuon=0 Muon_pt=[]\r\n  run=281616 event=172857 nMuon=1 Muon_pt=[16.022537]\r\n  run=281616 event=386901 nMuon=2 Muon_pt=[38.26443, 37.793114]\r\n  run=281616 event=409010 nMuon=2 Muon_pt=[42.871166, 27.264332]\r\n\r\n  fetched 1,323,577 bytes of 2,016,828,178  =  0.066% of the file\r\n"]
+[6.403, "o", "\r\n"]
+[7.804, "o", "\u001b[1;36m# only the baskets we touched were fetched (see _meta): ~1.3 MB of ~2 GB,\u001b[0m\r\n"]
+[9.106, "o", "\u001b[1;36m# ~0.07% of the file. on-demand remote read, validated against uproot in CI.\u001b[0m\r\n"]
+[11.909, "x", "0"]
