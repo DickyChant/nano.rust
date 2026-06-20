@@ -23,6 +23,114 @@ type AnyMap = HashMap<String, Box<dyn Any>>;
 type ObjectExtraMap = HashMap<String, HashMap<usize, AnyMap>>;
 pub type BranchColumns = HashMap<String, BranchColumn>;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct JaggedColumn<T> {
+    offsets: Vec<usize>,
+    values: Vec<T>,
+}
+
+impl<T> JaggedColumn<T> {
+    pub fn new(offsets: Vec<usize>, values: Vec<T>) -> Self {
+        Self { offsets, values }
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn row(&self, entry: usize) -> Option<&[T]> {
+        let start = *self.offsets.get(entry)?;
+        let end = *self.offsets.get(entry + 1)?;
+        self.values.get(start..end)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchHandle {
+    name: String,
+    index: usize,
+}
+
+/// Branch columns indexed both by physical branch name and by stable position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventColumns {
+    names: Vec<String>,
+    columns: Vec<BranchColumn>,
+    by_name: HashMap<String, usize>,
+}
+
+impl EventColumns {
+    pub fn from_ordered(
+        columns: impl IntoIterator<Item = (impl Into<String>, BranchColumn)>,
+    ) -> Self {
+        let mut values = Vec::new();
+        let mut names = Vec::new();
+        let mut by_name = HashMap::new();
+        for (name, column) in columns {
+            let name = name.into();
+            by_name.insert(name.clone(), values.len());
+            names.push(name);
+            values.push(column);
+        }
+        Self {
+            names,
+            columns: values,
+            by_name,
+        }
+    }
+
+    pub fn from_branch_columns(columns: &BranchColumns) -> Self {
+        Self::from_ordered(
+            columns
+                .iter()
+                .map(|(name, column)| (name.clone(), column.clone())),
+        )
+    }
+
+    pub fn contains_key(&self, branch_name: &str) -> bool {
+        if self.columns.len() <= 16 {
+            return self.names.iter().any(|name| name == branch_name);
+        }
+        self.by_name.contains_key(branch_name)
+    }
+
+    pub fn get(&self, branch_name: &str) -> Option<&BranchColumn> {
+        if self.columns.len() <= 16 {
+            return self
+                .names
+                .iter()
+                .position(|name| name == branch_name)
+                .and_then(|index| self.columns.get(index));
+        }
+        self.by_name
+            .get(branch_name)
+            .and_then(|&index| self.columns.get(index))
+    }
+
+    pub fn handle(&self, branch_name: &str) -> Option<BranchHandle> {
+        let index = if self.columns.len() <= 16 {
+            self.names.iter().position(|name| name == branch_name)?
+        } else {
+            *self.by_name.get(branch_name)?
+        };
+        Some(BranchHandle {
+            name: branch_name.to_string(),
+            index,
+        })
+    }
+
+    pub fn get_by_handle(&self, handle: &BranchHandle) -> Option<&BranchColumn> {
+        match (self.names.get(handle.index), self.columns.get(handle.index)) {
+            (Some(name), Some(column)) if name == &handle.name => Some(column),
+            _ => self.get(&handle.name),
+        }
+    }
+}
+
 /// Split a NanoAOD branch name into `(object, attribute)` per the grouping rule.
 ///
 /// Vector branches named `Prefix_attr` map to object `Prefix` with attribute
@@ -156,6 +264,8 @@ pub struct BranchSchema {
     specs: Vec<BranchSpec>,
     branches: HashMap<String, BranchInfo>,
     object_attributes: HashMap<String, Vec<String>>,
+    object_branches: HashMap<String, Vec<String>>,
+    object_attribute_branches: HashMap<String, HashMap<String, String>>,
     aliases: HashMap<String, String>,
 }
 
@@ -166,6 +276,9 @@ impl BranchSchema {
         let mut seen = HashSet::new();
         let mut branches = HashMap::new();
         let mut object_attributes: HashMap<String, Vec<String>> = HashMap::new();
+        let mut object_branches: HashMap<String, Vec<String>> = HashMap::new();
+        let mut object_attribute_branches: HashMap<String, HashMap<String, String>> =
+            HashMap::new();
         let mut aliases = HashMap::new();
 
         for spec in &specs {
@@ -186,6 +299,14 @@ impl BranchSchema {
                             .entry(object_name.clone())
                             .or_default()
                             .push(attribute_name.clone());
+                        object_branches
+                            .entry(object_name.clone())
+                            .or_default()
+                            .push(spec.name.clone());
+                        object_attribute_branches
+                            .entry(object_name.clone())
+                            .or_default()
+                            .insert(attribute_name.clone(), spec.name.clone());
                         aliases.insert(object_name.clone(), object_name.clone());
                         aliases.insert(Self::singularize(&object_name), object_name.clone());
                         aliases.insert(format!("{object_name}s"), object_name.clone());
@@ -215,6 +336,8 @@ impl BranchSchema {
             specs,
             branches,
             object_attributes,
+            object_branches,
+            object_attribute_branches,
             aliases,
         })
     }
@@ -257,6 +380,17 @@ impl BranchSchema {
             .strip_suffix('s')
             .map_or_else(|| value.to_string(), ToString::to_string)
     }
+
+    fn branch_names_for_object(&self, object_name: &str) -> Option<&[String]> {
+        self.object_branches.get(object_name).map(Vec::as_slice)
+    }
+
+    fn object_attribute_branch_name(&self, object_name: &str, attr: &str) -> Option<&str> {
+        self.object_attribute_branches
+            .get(object_name)
+            .and_then(|attrs| attrs.get(attr))
+            .map(String::as_str)
+    }
 }
 
 /// Owned in-memory column buffers, one row per event.
@@ -285,6 +419,7 @@ pub enum BranchColumn {
     VecI64(Vec<Vec<i64>>),
     VecU64(Vec<Vec<u64>>),
     VecF32(Vec<Vec<f32>>),
+    FlatVecF32(JaggedColumn<f32>),
 }
 
 impl BranchColumn {
@@ -310,6 +445,7 @@ impl BranchColumn {
             Self::VecI64(_) => BranchType::VecI64,
             Self::VecU64(_) => BranchType::VecU64,
             Self::VecF32(_) => BranchType::VecF32,
+            Self::FlatVecF32(_) => BranchType::VecF32,
         }
     }
 
@@ -335,6 +471,7 @@ impl BranchColumn {
             Self::VecI64(v) => v.len(),
             Self::VecU64(v) => v.len(),
             Self::VecF32(v) => v.len(),
+            Self::FlatVecF32(v) => v.len(),
         }
     }
 
@@ -354,6 +491,7 @@ impl BranchColumn {
             Self::VecI64(v) => v.get(entry).map(Vec::len),
             Self::VecU64(v) => v.get(entry).map(Vec::len),
             Self::VecF32(v) => v.get(entry).map(Vec::len),
+            Self::FlatVecF32(v) => v.row(entry).map(<[f32]>::len),
             _ => None,
         }
     }
@@ -362,7 +500,7 @@ impl BranchColumn {
 /// Per-entry context, branch-backed values, and dynamic event/object extras.
 pub struct Event {
     schema: Rc<BranchSchema>,
-    columns: Rc<BranchColumns>,
+    columns: Rc<EventColumns>,
     entry: usize,
     row_index: usize,
     attachments: RefCell<AnyMap>,
@@ -376,12 +514,8 @@ impl Event {
         columns: impl IntoIterator<Item = (impl Into<String>, BranchColumn)>,
         entry: usize,
     ) -> Result<Self> {
-        let columns = columns
-            .into_iter()
-            .map(|(name, column)| (name.into(), column))
-            .collect::<BranchColumns>();
-
-        Self::from_shared_columns(Rc::new(schema), Rc::new(columns), entry)
+        let columns = EventColumns::from_ordered(columns);
+        Self::from_shared_event_columns_at(Rc::new(schema), Rc::new(columns), entry, entry)
     }
 
     /// Construct one event view over shared in-memory column buffers.
@@ -390,7 +524,8 @@ impl Event {
         columns: Rc<BranchColumns>,
         entry: usize,
     ) -> Result<Self> {
-        Self::from_shared_columns_at(schema, columns, entry, entry)
+        let columns = EventColumns::from_branch_columns(&columns);
+        Self::from_shared_event_columns_at(schema, Rc::new(columns), entry, entry)
     }
 
     /// Construct one event view over shared column buffers using a separate
@@ -402,6 +537,29 @@ impl Event {
         entry: usize,
         row_index: usize,
     ) -> Result<Self> {
+        let columns = EventColumns::from_branch_columns(&columns);
+        Self::from_shared_event_columns_at(schema, Rc::new(columns), entry, row_index)
+    }
+
+    /// Construct one event view over shared indexed column buffers.
+    pub fn from_shared_event_columns_at(
+        schema: Rc<BranchSchema>,
+        columns: Rc<EventColumns>,
+        entry: usize,
+        row_index: usize,
+    ) -> Result<Self> {
+        Self::validate_event_columns(&schema, &columns, row_index)?;
+        Ok(Self::from_validated_event_columns_at(
+            schema, columns, entry, row_index,
+        ))
+    }
+
+    /// Validate that a row exists with the declared schema in indexed columns.
+    pub fn validate_event_columns(
+        schema: &BranchSchema,
+        columns: &EventColumns,
+        row_index: usize,
+    ) -> Result<()> {
         for spec in schema.specs() {
             match columns.get(&spec.name) {
                 Some(column) if column.branch_type() != spec.branch_type => {
@@ -427,15 +585,25 @@ impl Event {
                 }
             }
         }
+        Ok(())
+    }
 
-        Ok(Self {
+    /// Construct an event view after [`Event::validate_event_columns`] has
+    /// already been applied to the same columns and row range.
+    pub fn from_validated_event_columns_at(
+        schema: Rc<BranchSchema>,
+        columns: Rc<EventColumns>,
+        entry: usize,
+        row_index: usize,
+    ) -> Self {
+        Self {
             schema,
             columns,
             entry,
             row_index,
             attachments: RefCell::new(HashMap::new()),
             object_attachments: RefCell::new(HashMap::new()),
-        })
+        }
     }
 
     pub fn entry(&self) -> usize {
@@ -454,6 +622,16 @@ impl Event {
         self.has_physical_branch("genWeight")
     }
 
+    /// Resolve a physical branch name once for repeated typed access.
+    pub fn branch_handle(&self, branch_name: impl AsRef<str>) -> Result<BranchHandle> {
+        let branch_name = branch_name.as_ref();
+        self.columns
+            .handle(branch_name)
+            .ok_or_else(|| NanoError::MissingBranch {
+                branch: branch_name.to_string(),
+            })
+    }
+
     /// Read a scalar physical branch for the current entry.
     pub fn scalar<T: ScalarValue>(&self, branch_name: impl AsRef<str>) -> Result<T> {
         let branch_name = branch_name.as_ref();
@@ -464,12 +642,30 @@ impl Event {
         })
     }
 
+    /// Read a scalar physical branch through a pre-resolved branch handle.
+    pub fn scalar_with<T: ScalarValue>(&self, handle: &BranchHandle) -> Result<T> {
+        let column = self.column_by_handle(handle)?;
+        T::get_scalar(column, self.row_index).ok_or_else(|| NanoError::TypeMismatch {
+            name: handle.name.clone(),
+            expected: T::TYPE_NAME,
+        })
+    }
+
     /// Copy out a vector physical branch for the current entry.
     pub fn vector<T: ObjectValue>(&self, branch_name: impl AsRef<str>) -> Result<Vec<T>> {
         let branch_name = branch_name.as_ref();
         let column = self.column(branch_name)?;
         T::get_vector(column, self.row_index).ok_or_else(|| NanoError::TypeMismatch {
             name: branch_name.to_string(),
+            expected: T::VECTOR_TYPE_NAME,
+        })
+    }
+
+    /// Copy out a vector physical branch through a pre-resolved branch handle.
+    pub fn vector_with<T: ObjectValue>(&self, handle: &BranchHandle) -> Result<Vec<T>> {
+        let column = self.column_by_handle(handle)?;
+        T::get_vector(column, self.row_index).ok_or_else(|| NanoError::TypeMismatch {
+            name: handle.name.clone(),
             expected: T::VECTOR_TYPE_NAME,
         })
     }
@@ -487,6 +683,15 @@ impl Event {
         })
     }
 
+    /// Borrow a numeric vector branch row through a pre-resolved branch handle.
+    pub fn vector_ref_with<T: VectorSliceValue>(&self, handle: &BranchHandle) -> Result<&[T]> {
+        let column = self.column_by_handle(handle)?;
+        T::get_vector_slice(column, self.row_index).ok_or_else(|| NanoError::TypeMismatch {
+            name: handle.name.clone(),
+            expected: T::VECTOR_TYPE_NAME,
+        })
+    }
+
     /// Access an object collection such as `FatJet`.
     pub fn collection(&self, object_name: impl AsRef<str>) -> Result<Collection<'_>> {
         let canonical = self.schema.canonical_object_name(object_name.as_ref());
@@ -496,10 +701,10 @@ impl Event {
 
         let size = self
             .schema
-            .attributes_for_object(&canonical)
+            .branch_names_for_object(&canonical)
             .into_iter()
-            .filter_map(|attr| self.schema.find(format!("{canonical}_{attr}")))
-            .filter_map(|info| self.columns.get(&info.full_name))
+            .flatten()
+            .filter_map(|branch_name| self.columns.get(branch_name))
             .filter_map(|column| column.vector_len_at(self.row_index))
             .max()
             .unwrap_or(0);
@@ -543,16 +748,25 @@ impl Event {
                 branch: branch_name.to_string(),
             })
     }
+
+    fn column_by_handle(&self, handle: &BranchHandle) -> Result<&BranchColumn> {
+        self.columns
+            .get_by_handle(handle)
+            .ok_or_else(|| NanoError::MissingBranch {
+                branch: handle.name.clone(),
+            })
+    }
 }
 
 /// A light view over one NanoAOD object family.
 pub struct Collection<'a> {
-    object_name: String,
+    object_name: Rc<str>,
     objects: Vec<ObjectView<'a>>,
 }
 
 impl<'a> Collection<'a> {
     fn new(event: &'a Event, object_name: String, size: usize) -> Self {
+        let object_name = Rc::<str>::from(object_name);
         let objects = (0..size)
             .map(|index| ObjectView {
                 event,
@@ -567,7 +781,7 @@ impl<'a> Collection<'a> {
     }
 
     pub fn object_name(&self) -> &str {
-        &self.object_name
+        self.object_name.as_ref()
     }
 
     pub fn len(&self) -> usize {
@@ -611,7 +825,7 @@ impl<'a> IntoIterator for &'a Collection<'a> {
 /// Indexed view of one object in a [`Collection`].
 pub struct ObjectView<'a> {
     event: &'a Event,
-    object_name: String,
+    object_name: Rc<str>,
     index: usize,
 }
 
@@ -621,7 +835,7 @@ impl<'a> ObjectView<'a> {
     }
 
     pub fn object_name(&self) -> &str {
-        &self.object_name
+        self.object_name.as_ref()
     }
 
     /// Read an object attribute. Per-object dynamic attachments override raw
@@ -635,11 +849,17 @@ impl<'a> ObjectView<'a> {
             return Ok(value);
         }
 
-        let branch_name = format!("{}_{}", self.object_name, attr);
-        let column = self.event.column(&branch_name)?;
+        let branch_name = self
+            .event
+            .schema
+            .object_attribute_branch_name(self.object_name.as_ref(), attr)
+            .ok_or_else(|| NanoError::MissingBranch {
+                branch: format!("{}_{}", self.object_name.as_ref(), attr),
+            })?;
+        let column = self.event.column(branch_name)?;
         T::get_object(column, self.event.row_index, self.index).ok_or_else(|| {
             NanoError::TypeMismatch {
-                name: branch_name,
+                name: branch_name.to_string(),
                 expected: T::TYPE_NAME,
             }
         })
@@ -666,7 +886,7 @@ impl<'a> ObjectView<'a> {
         self.event
             .object_attachments
             .borrow_mut()
-            .entry(self.object_name.clone())
+            .entry(self.object_name.to_string())
             .or_default()
             .entry(self.index)
             .or_default()
@@ -676,7 +896,7 @@ impl<'a> ObjectView<'a> {
     /// Read a typed per-object attachment.
     pub fn extra<T: 'static>(&self, attr: impl AsRef<str>) -> Result<Ref<'_, T>> {
         let attr = attr.as_ref().to_string();
-        let object_name = self.object_name.clone();
+        let object_name = self.object_name.to_string();
         let index = self.index;
         let extras = self.event.object_attachments.borrow();
         let exists = extras
@@ -699,7 +919,7 @@ impl<'a> ObjectView<'a> {
                 .and_then(|value| value.downcast_ref::<T>())
         })
         .map_err(|_| NanoError::TypeMismatch {
-            name: format!("{}[{}].{}", self.object_name, self.index, attr),
+            name: format!("{}[{}].{}", self.object_name.as_ref(), self.index, attr),
             expected: std::any::type_name::<T>(),
         })
     }
@@ -707,7 +927,7 @@ impl<'a> ObjectView<'a> {
     fn extra_cloned<T: Clone + 'static>(&self, attr: &str) -> Result<Option<T>> {
         let extras = self.event.object_attachments.borrow();
         let Some(values) = extras
-            .get(&self.object_name)
+            .get(self.object_name.as_ref())
             .and_then(|by_index| by_index.get(&self.index))
         else {
             return Ok(None);
@@ -720,7 +940,7 @@ impl<'a> ObjectView<'a> {
             .cloned()
             .map(Some)
             .ok_or_else(|| NanoError::TypeMismatch {
-                name: format!("{}[{}].{}", self.object_name, self.index, attr),
+                name: format!("{}[{}].{}", self.object_name.as_ref(), self.index, attr),
                 expected: std::any::type_name::<T>(),
             })
     }
@@ -806,7 +1026,41 @@ impl_values!(i32, "i32", I32, VecI32);
 impl_values!(u32, "u32", U32, VecU32);
 impl_values!(i64, "i64", I64, VecI64);
 impl_values!(u64, "u64", U64, VecU64);
-impl_values!(f32, "f32", F32, VecF32);
+impl ScalarValue for f32 {
+    const TYPE_NAME: &'static str = "f32";
+
+    fn get_scalar(column: &BranchColumn, entry: usize) -> Option<Self> {
+        match column {
+            BranchColumn::F32(values) => values.get(entry).copied(),
+            _ => None,
+        }
+    }
+}
+
+impl ObjectValue for f32 {
+    const TYPE_NAME: &'static str = "f32";
+    const VECTOR_TYPE_NAME: &'static str = "Vec<f32>";
+
+    fn get_object(column: &BranchColumn, entry: usize, index: usize) -> Option<Self> {
+        match column {
+            BranchColumn::VecF32(values) => {
+                values.get(entry).and_then(|row| row.get(index)).copied()
+            }
+            BranchColumn::FlatVecF32(values) => {
+                values.row(entry).and_then(|row| row.get(index)).copied()
+            }
+            _ => None,
+        }
+    }
+
+    fn get_vector(column: &BranchColumn, entry: usize) -> Option<Vec<Self>> {
+        match column {
+            BranchColumn::VecF32(values) => values.get(entry).cloned(),
+            BranchColumn::FlatVecF32(values) => values.row(entry).map(<[f32]>::to_vec),
+            _ => None,
+        }
+    }
+}
 
 impl_vector_slice!(i8, "i8", VecI8);
 impl_vector_slice!(u8, "u8", VecU8);
@@ -816,7 +1070,17 @@ impl_vector_slice!(i32, "i32", VecI32);
 impl_vector_slice!(u32, "u32", VecU32);
 impl_vector_slice!(i64, "i64", VecI64);
 impl_vector_slice!(u64, "u64", VecU64);
-impl_vector_slice!(f32, "f32", VecF32);
+impl VectorSliceValue for f32 {
+    const VECTOR_TYPE_NAME: &'static str = "Vec<f32>";
+
+    fn get_vector_slice(column: &BranchColumn, entry: usize) -> Option<&[Self]> {
+        match column {
+            BranchColumn::VecF32(values) => values.get(entry).map(Vec::as_slice),
+            BranchColumn::FlatVecF32(values) => values.row(entry),
+            _ => None,
+        }
+    }
+}
 
 /// Errors returned by schema construction and typed event/object access.
 #[derive(Debug, Clone, PartialEq, Eq)]

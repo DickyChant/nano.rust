@@ -18,6 +18,6 @@ pub use error::{Error, Result};
 pub use root_file::HttpSourceOptions;
 pub use root_file::{FileObject, RootFile, Source};
 pub use tree::{
-    BranchInfo, ChunkedReader, ColumnChunk, ColumnData, ColumnRequest, LeafInfo, Scalar, Tree,
-    TreeChunk,
+    BasketPayloadCache, BranchInfo, ChunkedReader, ColumnChunk, ColumnData, ColumnRequest,
+    JaggedArray, LeafInfo, Scalar, Tree, TreeChunk,
 };

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Range;
 
@@ -97,6 +98,27 @@ pub struct TreeChunk {
     pub start: i64,
     pub len: usize,
     pub columns: Vec<ColumnChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JaggedArray<T> {
+    pub offsets: Vec<usize>,
+    pub values: Vec<T>,
+}
+
+#[derive(Debug, Default)]
+pub struct BasketPayloadCache {
+    payloads: HashMap<(String, usize), (u32, Vec<u8>)>,
+}
+
+impl BasketPayloadCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.payloads.clear();
+    }
 }
 
 pub struct ChunkedReader<'a> {
@@ -208,6 +230,26 @@ impl Tree {
         start: i64,
         len: usize,
     ) -> Result<Vec<T>> {
+        self.read_scalar_range_inner(branch_name, start, len, None)
+    }
+
+    pub fn read_scalar_range_cached<T: Scalar>(
+        &self,
+        branch_name: &str,
+        start: i64,
+        len: usize,
+        cache: &mut BasketPayloadCache,
+    ) -> Result<Vec<T>> {
+        self.read_scalar_range_inner(branch_name, start, len, Some(cache))
+    }
+
+    fn read_scalar_range_inner<T: Scalar>(
+        &self,
+        branch_name: &str,
+        start: i64,
+        len: usize,
+        mut cache: Option<&mut BasketPayloadCache>,
+    ) -> Result<Vec<T>> {
         let branch = self.find_branch(branch_name)?;
         let leaf = branch.scalar_leaf()?;
         if leaf.type_name != T::TYPE_NAME {
@@ -227,7 +269,8 @@ impl Tree {
             let local_start = usize::try_from(overlap_start - basket_start).unwrap();
             let local_len = usize::try_from(overlap_end - overlap_start).unwrap();
             let basket = &branch.baskets[basket_index];
-            let (entries, payload) = read_basket_payload(basket)?;
+            let (entries, payload) =
+                read_basket_payload_for(&branch.name, basket_index, basket, cache.as_deref_mut())?;
             let need = entries as usize * T::WIDTH;
             if payload.len() < need {
                 return Err(Error::parse(
@@ -288,6 +331,28 @@ impl Tree {
         start: i64,
         len: usize,
     ) -> Result<Vec<Vec<T>>> {
+        self.read_jagged_range_inner(branch_name, counter_branch_name, start, len, None)
+    }
+
+    pub fn read_jagged_range_cached<T: Scalar>(
+        &self,
+        branch_name: &str,
+        counter_branch_name: &str,
+        start: i64,
+        len: usize,
+        cache: &mut BasketPayloadCache,
+    ) -> Result<Vec<Vec<T>>> {
+        self.read_jagged_range_inner(branch_name, counter_branch_name, start, len, Some(cache))
+    }
+
+    fn read_jagged_range_inner<T: Scalar>(
+        &self,
+        branch_name: &str,
+        counter_branch_name: &str,
+        start: i64,
+        len: usize,
+        mut cache: Option<&mut BasketPayloadCache>,
+    ) -> Result<Vec<Vec<T>>> {
         let branch = self.find_branch(branch_name)?;
         let _leaf = branch.jagged_leaf::<T>()?;
         let counter = self.find_branch(counter_branch_name)?;
@@ -317,15 +382,24 @@ impl Tree {
             let overlap_start = range.start.max(basket_start);
             let overlap_end = range.end.min(basket_end);
             let counts_len = usize::try_from(overlap_end - basket_start).unwrap();
-            let counts =
-                self.read_scalar_range::<u32>(counter_branch_name, basket_start, counts_len)?;
+            let counts = self.read_scalar_range_inner::<u32>(
+                counter_branch_name,
+                basket_start,
+                counts_len,
+                cache.as_deref_mut(),
+            )?;
             let local_start = usize::try_from(overlap_start - basket_start).unwrap();
             let overlap_len = usize::try_from(overlap_end - overlap_start).unwrap();
             let prefix_elems = sum_counts(branch_name, &counts[..local_start])?;
             let requested_counts = &counts[local_start..local_start + overlap_len];
             let requested_elems = sum_counts(branch_name, requested_counts)?;
 
-            let (_, payload) = read_basket_payload(&branch.baskets[basket_index])?;
+            let (_, payload) = read_basket_payload_for(
+                &branch.name,
+                basket_index,
+                &branch.baskets[basket_index],
+                cache.as_deref_mut(),
+            )?;
             let byte_start = prefix_elems
                 .checked_mul(T::WIDTH)
                 .ok_or_else(|| Error::parse(0, "jagged basket byte offset overflow"))?;
@@ -355,6 +429,116 @@ impl Tree {
             }
         }
         Ok(out)
+    }
+
+    pub fn read_jagged_flat_range<T: Scalar>(
+        &self,
+        branch_name: &str,
+        counter_branch_name: &str,
+        start: i64,
+        len: usize,
+    ) -> Result<JaggedArray<T>> {
+        self.read_jagged_flat_range_inner(branch_name, counter_branch_name, start, len, None)
+    }
+
+    pub fn read_jagged_flat_range_cached<T: Scalar>(
+        &self,
+        branch_name: &str,
+        counter_branch_name: &str,
+        start: i64,
+        len: usize,
+        cache: &mut BasketPayloadCache,
+    ) -> Result<JaggedArray<T>> {
+        self.read_jagged_flat_range_inner(branch_name, counter_branch_name, start, len, Some(cache))
+    }
+
+    fn read_jagged_flat_range_inner<T: Scalar>(
+        &self,
+        branch_name: &str,
+        counter_branch_name: &str,
+        start: i64,
+        len: usize,
+        mut cache: Option<&mut BasketPayloadCache>,
+    ) -> Result<JaggedArray<T>> {
+        let branch = self.find_branch(branch_name)?;
+        let _leaf = branch.jagged_leaf::<T>()?;
+        let counter = self.find_branch(counter_branch_name)?;
+        let counter_leaf = counter.scalar_leaf()?;
+        if counter_leaf.type_name != u32::TYPE_NAME {
+            return Err(Error::TypeMismatch {
+                branch: counter_branch_name.to_string(),
+                root_type: counter_leaf.type_name.clone(),
+                requested: u32::TYPE_NAME,
+            });
+        }
+        if branch.entries != counter.entries {
+            return Err(Error::unsupported(
+                branch_name,
+                format!(
+                    "jagged branch has {} entries but counter {counter_branch_name} has {}",
+                    branch.entries, counter.entries
+                ),
+            ));
+        }
+
+        let range = checked_window(branch.entries, start, len)?;
+        let mut offsets = Vec::with_capacity(range_len(&range) + 1);
+        let mut values = Vec::new();
+        offsets.push(0);
+
+        for basket_index in branch.overlapping_basket_indices(&range) {
+            let basket_start = branch.basket_start(basket_index)?;
+            let basket_end = branch.basket_end(basket_index)?;
+            let overlap_start = range.start.max(basket_start);
+            let overlap_end = range.end.min(basket_end);
+            let counts_len = usize::try_from(overlap_end - basket_start).unwrap();
+            let counts = self.read_scalar_range_inner::<u32>(
+                counter_branch_name,
+                basket_start,
+                counts_len,
+                cache.as_deref_mut(),
+            )?;
+            let local_start = usize::try_from(overlap_start - basket_start).unwrap();
+            let overlap_len = usize::try_from(overlap_end - overlap_start).unwrap();
+            let prefix_elems = sum_counts(branch_name, &counts[..local_start])?;
+            let requested_counts = &counts[local_start..local_start + overlap_len];
+            let requested_elems = sum_counts(branch_name, requested_counts)?;
+
+            let (_, payload) = read_basket_payload_for(
+                &branch.name,
+                basket_index,
+                &branch.baskets[basket_index],
+                cache.as_deref_mut(),
+            )?;
+            let byte_start = prefix_elems
+                .checked_mul(T::WIDTH)
+                .ok_or_else(|| Error::parse(0, "jagged basket byte offset overflow"))?;
+            let byte_len = requested_elems
+                .checked_mul(T::WIDTH)
+                .ok_or_else(|| Error::parse(0, "jagged basket byte length overflow"))?;
+            let byte_end = byte_start
+                .checked_add(byte_len)
+                .ok_or_else(|| Error::parse(0, "jagged basket byte range overflow"))?;
+            if byte_end > payload.len() {
+                return Err(Error::parse(
+                    payload.len(),
+                    format!("basket for {branch_name} lacks requested jagged byte range"),
+                ));
+            }
+
+            let mut pos = byte_start;
+            for &count in requested_counts {
+                let row_len = usize::try_from(count)
+                    .map_err(|_| Error::parse(0, "jagged counter overflows usize"))?;
+                for _ in 0..row_len {
+                    let next = pos + T::WIDTH;
+                    values.push(T::decode(&payload[pos..next]));
+                    pos = next;
+                }
+                offsets.push(values.len());
+            }
+        }
+        Ok(JaggedArray { offsets, values })
     }
 
     pub fn read_jagged_range_auto<T: Scalar>(
@@ -1029,4 +1213,22 @@ fn read_basket_payload(storage: &BasketStorage) -> Result<(u32, Vec<u8>)> {
         ));
     }
     Ok((entries, payload[..useful_len].to_vec()))
+}
+
+fn read_basket_payload_for(
+    branch_name: &str,
+    basket_index: usize,
+    storage: &BasketStorage,
+    cache: Option<&mut BasketPayloadCache>,
+) -> Result<(u32, Vec<u8>)> {
+    let Some(cache) = cache else {
+        return read_basket_payload(storage);
+    };
+    let key = (branch_name.to_string(), basket_index);
+    if let Some((entries, payload)) = cache.payloads.get(&key) {
+        return Ok((*entries, payload.clone()));
+    }
+    let payload = read_basket_payload(storage)?;
+    cache.payloads.insert(key, payload.clone());
+    Ok(payload)
 }

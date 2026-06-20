@@ -229,8 +229,10 @@ pub mod reader {
     use std::path::Path;
     use std::rc::Rc;
 
-    use nano_core::{BranchColumn, BranchColumns, BranchSchema, BranchSpec, BranchType, Event};
-    use nano_rootio::{RootFile, Tree};
+    use nano_core::{
+        BranchColumn, BranchSchema, BranchSpec, BranchType, Event, EventColumns, JaggedColumn,
+    };
+    use nano_rootio::{BasketPayloadCache, RootFile, Tree};
 
     use crate::{Result, RootError};
 
@@ -257,7 +259,7 @@ pub mod reader {
         chunk_start: usize,
         chunk_len: usize,
         chunk_row: usize,
-        columns: Option<Rc<BranchColumns>>,
+        columns: Option<Rc<EventColumns>>,
     }
 
     impl EventIterator {
@@ -341,6 +343,8 @@ pub mod reader {
                     read_columns_window(tree, self.schema.specs(), start, len)?
                 }
             };
+            Event::validate_event_columns(&self.schema, &columns, len - 1)
+                .map_err(|err| RootError::other(err.to_string()))?;
             self.columns = Some(Rc::new(columns));
             self.chunk_start = start;
             self.chunk_len = len;
@@ -367,10 +371,12 @@ pub mod reader {
             let entry = self.chunk_start + row_index;
             self.chunk_row += 1;
 
-            Some(
-                Event::from_shared_columns_at(self.schema.clone(), columns, entry, row_index)
-                    .map_err(|err| RootError::other(err.to_string())),
-            )
+            Some(Ok(Event::from_validated_event_columns_at(
+                self.schema.clone(),
+                columns,
+                entry,
+                row_index,
+            )))
         }
     }
 
@@ -396,13 +402,19 @@ pub mod reader {
         specs: &[BranchSpec],
         start: usize,
         len: usize,
-    ) -> Result<BranchColumns> {
-        let mut columns = BranchColumns::new();
+    ) -> Result<EventColumns> {
+        let mut columns = Vec::with_capacity(specs.len());
+        let mut cache = BasketPayloadCache::new();
 
-        for spec in specs.iter().filter(|spec| !spec.branch_type.is_vector()) {
-            match read_scalar_column_window(tree, spec, start, len) {
+        for spec in specs {
+            let read_result = if spec.branch_type.is_vector() {
+                read_vector_column_window(tree, spec, start, len, &mut cache)
+            } else {
+                read_scalar_column_window(tree, spec, start, len, &mut cache)
+            };
+            match read_result {
                 Ok(column) => {
-                    columns.insert(spec.name.clone(), column);
+                    columns.push((spec.name.clone(), column));
                 }
                 Err(err) if spec.optional => {
                     let _ = err;
@@ -411,19 +423,7 @@ pub mod reader {
             }
         }
 
-        for spec in specs.iter().filter(|spec| spec.branch_type.is_vector()) {
-            match read_vector_column_window(tree, spec, start, len) {
-                Ok(column) => {
-                    columns.insert(spec.name.clone(), column);
-                }
-                Err(err) if spec.optional => {
-                    let _ = err;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        Ok(columns)
+        Ok(EventColumns::from_ordered(columns))
     }
 
     fn read_scalar_column_window(
@@ -431,19 +431,40 @@ pub mod reader {
         spec: &BranchSpec,
         start: usize,
         len: usize,
+        cache: &mut BasketPayloadCache,
     ) -> Result<BranchColumn> {
         let start = i64::try_from(start)?;
         let column = match spec.branch_type {
-            BranchType::Bool => BranchColumn::Bool(tree.read_scalar_range(&spec.name, start, len)?),
-            BranchType::I8 => BranchColumn::I8(tree.read_scalar_range(&spec.name, start, len)?),
-            BranchType::U8 => BranchColumn::U8(tree.read_scalar_range(&spec.name, start, len)?),
-            BranchType::I16 => BranchColumn::I16(tree.read_scalar_range(&spec.name, start, len)?),
-            BranchType::U16 => BranchColumn::U16(tree.read_scalar_range(&spec.name, start, len)?),
-            BranchType::I32 => BranchColumn::I32(tree.read_scalar_range(&spec.name, start, len)?),
-            BranchType::U32 => BranchColumn::U32(tree.read_scalar_range(&spec.name, start, len)?),
-            BranchType::I64 => BranchColumn::I64(tree.read_scalar_range(&spec.name, start, len)?),
-            BranchType::U64 => BranchColumn::U64(tree.read_scalar_range(&spec.name, start, len)?),
-            BranchType::F32 => BranchColumn::F32(tree.read_scalar_range(&spec.name, start, len)?),
+            BranchType::Bool => {
+                BranchColumn::Bool(tree.read_scalar_range_cached(&spec.name, start, len, cache)?)
+            }
+            BranchType::I8 => {
+                BranchColumn::I8(tree.read_scalar_range_cached(&spec.name, start, len, cache)?)
+            }
+            BranchType::U8 => {
+                BranchColumn::U8(tree.read_scalar_range_cached(&spec.name, start, len, cache)?)
+            }
+            BranchType::I16 => {
+                BranchColumn::I16(tree.read_scalar_range_cached(&spec.name, start, len, cache)?)
+            }
+            BranchType::U16 => {
+                BranchColumn::U16(tree.read_scalar_range_cached(&spec.name, start, len, cache)?)
+            }
+            BranchType::I32 => {
+                BranchColumn::I32(tree.read_scalar_range_cached(&spec.name, start, len, cache)?)
+            }
+            BranchType::U32 => {
+                BranchColumn::U32(tree.read_scalar_range_cached(&spec.name, start, len, cache)?)
+            }
+            BranchType::I64 => {
+                BranchColumn::I64(tree.read_scalar_range_cached(&spec.name, start, len, cache)?)
+            }
+            BranchType::U64 => {
+                BranchColumn::U64(tree.read_scalar_range_cached(&spec.name, start, len, cache)?)
+            }
+            BranchType::F32 => {
+                BranchColumn::F32(tree.read_scalar_range_cached(&spec.name, start, len, cache)?)
+            }
             branch_type => {
                 return Err(RootError::other(format!(
                     "branch `{}` has non-scalar type {:?}",
@@ -459,71 +480,85 @@ pub mod reader {
         spec: &BranchSpec,
         start: usize,
         len: usize,
+        cache: &mut BasketPayloadCache,
     ) -> Result<BranchColumn> {
         let count_branch = count_branch_name(&spec.name)?;
         let start = i64::try_from(start)?;
 
         let column = match spec.branch_type {
-            BranchType::VecBool => BranchColumn::VecBool(tree.read_jagged_range(
+            BranchType::VecBool => BranchColumn::VecBool(tree.read_jagged_range_cached(
                 &spec.name,
                 &count_branch,
                 start,
                 len,
+                cache,
             )?),
-            BranchType::VecI8 => BranchColumn::VecI8(tree.read_jagged_range(
+            BranchType::VecI8 => BranchColumn::VecI8(tree.read_jagged_range_cached(
                 &spec.name,
                 &count_branch,
                 start,
                 len,
+                cache,
             )?),
-            BranchType::VecU8 => BranchColumn::VecU8(tree.read_jagged_range(
+            BranchType::VecU8 => BranchColumn::VecU8(tree.read_jagged_range_cached(
                 &spec.name,
                 &count_branch,
                 start,
                 len,
+                cache,
             )?),
-            BranchType::VecI16 => BranchColumn::VecI16(tree.read_jagged_range(
+            BranchType::VecI16 => BranchColumn::VecI16(tree.read_jagged_range_cached(
                 &spec.name,
                 &count_branch,
                 start,
                 len,
+                cache,
             )?),
-            BranchType::VecU16 => BranchColumn::VecU16(tree.read_jagged_range(
+            BranchType::VecU16 => BranchColumn::VecU16(tree.read_jagged_range_cached(
                 &spec.name,
                 &count_branch,
                 start,
                 len,
+                cache,
             )?),
-            BranchType::VecI32 => BranchColumn::VecI32(tree.read_jagged_range(
+            BranchType::VecI32 => BranchColumn::VecI32(tree.read_jagged_range_cached(
                 &spec.name,
                 &count_branch,
                 start,
                 len,
+                cache,
             )?),
-            BranchType::VecU32 => BranchColumn::VecU32(tree.read_jagged_range(
+            BranchType::VecU32 => BranchColumn::VecU32(tree.read_jagged_range_cached(
                 &spec.name,
                 &count_branch,
                 start,
                 len,
+                cache,
             )?),
-            BranchType::VecI64 => BranchColumn::VecI64(tree.read_jagged_range(
+            BranchType::VecI64 => BranchColumn::VecI64(tree.read_jagged_range_cached(
                 &spec.name,
                 &count_branch,
                 start,
                 len,
+                cache,
             )?),
-            BranchType::VecU64 => BranchColumn::VecU64(tree.read_jagged_range(
+            BranchType::VecU64 => BranchColumn::VecU64(tree.read_jagged_range_cached(
                 &spec.name,
                 &count_branch,
                 start,
                 len,
+                cache,
             )?),
-            BranchType::VecF32 => BranchColumn::VecF32(tree.read_jagged_range(
-                &spec.name,
-                &count_branch,
-                start,
-                len,
-            )?),
+            BranchType::VecF32 => {
+                let values = tree.read_jagged_flat_range_cached(
+                    &spec.name,
+                    &count_branch,
+                    start,
+                    len,
+                    cache,
+                )?;
+                BranchColumn::FlatVecF32(JaggedColumn::new(values.offsets, values.values))
+            }
             branch_type => {
                 return Err(RootError::other(format!(
                     "branch `{}` has non-vector type {:?}",
