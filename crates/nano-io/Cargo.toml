@@ -16,3 +16,4 @@ http = ["nano-rootio/http"]
 
 [dev-dependencies]
 nano-producers = { workspace = true }
+rayon = "1"

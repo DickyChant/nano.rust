@@ -227,7 +227,7 @@ pub fn events_url_chunked_from_tree_with_options(
 
 pub mod reader {
     use std::path::Path;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use nano_core::{
         BranchColumn, BranchSchema, BranchSpec, BranchType, Event, EventColumns, JaggedColumn,
@@ -252,14 +252,14 @@ pub mod reader {
     pub struct EventIterator {
         file_size: u64,
         backend: EventIteratorBackend,
-        schema: Rc<BranchSchema>,
+        schema: Arc<BranchSchema>,
         chunk_size: usize,
         total_entries: usize,
         next_entry: usize,
         chunk_start: usize,
         chunk_len: usize,
         chunk_row: usize,
-        columns: Option<Rc<EventColumns>>,
+        columns: Option<Arc<EventColumns>>,
     }
 
     impl EventIterator {
@@ -276,7 +276,7 @@ pub mod reader {
             Ok(Self {
                 file_size,
                 backend: EventIteratorBackend::Local { tree },
-                schema: Rc::new(schema.clone()),
+                schema: Arc::new(schema.clone()),
                 chunk_size: chunk_size.max(1),
                 total_entries,
                 next_entry: 0,
@@ -301,7 +301,7 @@ pub mod reader {
             Ok(Self {
                 file_size,
                 backend: EventIteratorBackend::Remote { file, tree },
-                schema: Rc::new(schema.clone()),
+                schema: Arc::new(schema.clone()),
                 chunk_size: chunk_size.max(1),
                 total_entries,
                 next_entry: 0,
@@ -345,7 +345,7 @@ pub mod reader {
             };
             Event::validate_event_columns(&self.schema, &columns, len - 1)
                 .map_err(|err| RootError::other(err.to_string()))?;
-            self.columns = Some(Rc::new(columns));
+            self.columns = Some(Arc::new(columns));
             self.chunk_start = start;
             self.chunk_len = len;
             self.chunk_row = 0;

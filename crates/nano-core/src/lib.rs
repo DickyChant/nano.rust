@@ -9,17 +9,18 @@
 //!   the `Prefix_attr` grouping rule.
 
 use std::any::Any;
-use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
+use std::marker::PhantomData;
+use std::ops::Deref;
 use std::ops::Index;
-use std::rc::Rc;
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 /// Convenient result alias for the core event model.
 pub type Result<T> = std::result::Result<T, NanoError>;
 
-type AnyMap = HashMap<String, Box<dyn Any>>;
+type AnyMap = HashMap<String, Box<dyn Any + Send + Sync>>;
 type ObjectExtraMap = HashMap<String, HashMap<usize, AnyMap>>;
 pub type BranchColumns = HashMap<String, BranchColumn>;
 
@@ -497,14 +498,74 @@ impl BranchColumn {
     }
 }
 
+/// Borrowed event-level attachment value.
+pub struct EventAttachmentRef<'a, T: 'static> {
+    guard: RwLockReadGuard<'a, AnyMap>,
+    name: String,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<T: 'static> Deref for EventAttachmentRef<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .get(&self.name)
+            .and_then(|value| value.downcast_ref::<T>())
+            .expect("validated event attachment type changed while read lock was held")
+    }
+}
+
+impl<T: 'static> fmt::Debug for EventAttachmentRef<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EventAttachmentRef")
+            .field("name", &self.name)
+            .field("type", &std::any::type_name::<T>())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Borrowed object-level attachment value.
+pub struct ObjectAttachmentRef<'a, T: 'static> {
+    guard: RwLockReadGuard<'a, ObjectExtraMap>,
+    object_name: String,
+    index: usize,
+    attr: String,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<T: 'static> Deref for ObjectAttachmentRef<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .get(&self.object_name)
+            .and_then(|by_index| by_index.get(&self.index))
+            .and_then(|values| values.get(&self.attr))
+            .and_then(|value| value.downcast_ref::<T>())
+            .expect("validated object attachment type changed while read lock was held")
+    }
+}
+
+impl<T: 'static> fmt::Debug for ObjectAttachmentRef<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ObjectAttachmentRef")
+            .field("object_name", &self.object_name)
+            .field("index", &self.index)
+            .field("attr", &self.attr)
+            .field("type", &std::any::type_name::<T>())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Per-entry context, branch-backed values, and dynamic event/object extras.
 pub struct Event {
-    schema: Rc<BranchSchema>,
-    columns: Rc<EventColumns>,
+    schema: Arc<BranchSchema>,
+    columns: Arc<EventColumns>,
     entry: usize,
     row_index: usize,
-    attachments: RefCell<AnyMap>,
-    object_attachments: RefCell<ObjectExtraMap>,
+    attachments: RwLock<AnyMap>,
+    object_attachments: RwLock<ObjectExtraMap>,
 }
 
 impl Event {
@@ -515,36 +576,36 @@ impl Event {
         entry: usize,
     ) -> Result<Self> {
         let columns = EventColumns::from_ordered(columns);
-        Self::from_shared_event_columns_at(Rc::new(schema), Rc::new(columns), entry, entry)
+        Self::from_shared_event_columns_at(Arc::new(schema), Arc::new(columns), entry, entry)
     }
 
     /// Construct one event view over shared in-memory column buffers.
     pub fn from_shared_columns(
-        schema: Rc<BranchSchema>,
-        columns: Rc<BranchColumns>,
+        schema: Arc<BranchSchema>,
+        columns: Arc<BranchColumns>,
         entry: usize,
     ) -> Result<Self> {
         let columns = EventColumns::from_branch_columns(&columns);
-        Self::from_shared_event_columns_at(schema, Rc::new(columns), entry, entry)
+        Self::from_shared_event_columns_at(schema, Arc::new(columns), entry, entry)
     }
 
     /// Construct one event view over shared column buffers using a separate
     /// row index into those buffers. Streaming readers use this when a chunk's
     /// first row corresponds to a non-zero global tree entry.
     pub fn from_shared_columns_at(
-        schema: Rc<BranchSchema>,
-        columns: Rc<BranchColumns>,
+        schema: Arc<BranchSchema>,
+        columns: Arc<BranchColumns>,
         entry: usize,
         row_index: usize,
     ) -> Result<Self> {
         let columns = EventColumns::from_branch_columns(&columns);
-        Self::from_shared_event_columns_at(schema, Rc::new(columns), entry, row_index)
+        Self::from_shared_event_columns_at(schema, Arc::new(columns), entry, row_index)
     }
 
     /// Construct one event view over shared indexed column buffers.
     pub fn from_shared_event_columns_at(
-        schema: Rc<BranchSchema>,
-        columns: Rc<EventColumns>,
+        schema: Arc<BranchSchema>,
+        columns: Arc<EventColumns>,
         entry: usize,
         row_index: usize,
     ) -> Result<Self> {
@@ -591,8 +652,8 @@ impl Event {
     /// Construct an event view after [`Event::validate_event_columns`] has
     /// already been applied to the same columns and row range.
     pub fn from_validated_event_columns_at(
-        schema: Rc<BranchSchema>,
-        columns: Rc<EventColumns>,
+        schema: Arc<BranchSchema>,
+        columns: Arc<EventColumns>,
         entry: usize,
         row_index: usize,
     ) -> Self {
@@ -601,8 +662,8 @@ impl Event {
             columns,
             entry,
             row_index,
-            attachments: RefCell::new(HashMap::new()),
-            object_attachments: RefCell::new(HashMap::new()),
+            attachments: RwLock::new(HashMap::new()),
+            object_attachments: RwLock::new(HashMap::new()),
         }
     }
 
@@ -713,31 +774,44 @@ impl Event {
     }
 
     /// Attach derived event-level data.
-    pub fn set<T: 'static>(&self, name: impl Into<String>, value: T) {
+    pub fn set<T: Send + Sync + 'static>(&self, name: impl Into<String>, value: T) {
         self.attachments
-            .borrow_mut()
+            .write()
+            .expect("event attachment lock poisoned")
             .insert(name.into(), Box::new(value));
     }
 
     pub fn has(&self, name: impl AsRef<str>) -> bool {
-        self.attachments.borrow().contains_key(name.as_ref())
+        self.attachments
+            .read()
+            .expect("event attachment lock poisoned")
+            .contains_key(name.as_ref())
     }
 
     /// Read a typed event-level attachment.
-    pub fn get<T: 'static>(&self, name: impl AsRef<str>) -> Result<Ref<'_, T>> {
+    pub fn get<T: 'static>(&self, name: impl AsRef<str>) -> Result<EventAttachmentRef<'_, T>> {
         let name = name.as_ref().to_string();
-        let attachments = self.attachments.borrow();
+        let attachments = self
+            .attachments
+            .read()
+            .expect("event attachment lock poisoned");
         if !attachments.contains_key(&name) {
             return Err(NanoError::MissingAttachment { name });
         }
-        Ref::filter_map(attachments, |attachments| {
-            attachments
-                .get(&name)
-                .and_then(|value| value.downcast_ref::<T>())
-        })
-        .map_err(|_| NanoError::TypeMismatch {
+        if attachments
+            .get(&name)
+            .and_then(|value| value.downcast_ref::<T>())
+            .is_none()
+        {
+            return Err(NanoError::TypeMismatch {
+                name,
+                expected: std::any::type_name::<T>(),
+            });
+        }
+        Ok(EventAttachmentRef {
+            guard: attachments,
             name,
-            expected: std::any::type_name::<T>(),
+            _marker: PhantomData,
         })
     }
 
@@ -760,13 +834,13 @@ impl Event {
 
 /// A light view over one NanoAOD object family.
 pub struct Collection<'a> {
-    object_name: Rc<str>,
+    object_name: Arc<str>,
     objects: Vec<ObjectView<'a>>,
 }
 
 impl<'a> Collection<'a> {
     fn new(event: &'a Event, object_name: String, size: usize) -> Self {
-        let object_name = Rc::<str>::from(object_name);
+        let object_name = Arc::<str>::from(object_name);
         let objects = (0..size)
             .map(|index| ObjectView {
                 event,
@@ -825,7 +899,7 @@ impl<'a> IntoIterator for &'a Collection<'a> {
 /// Indexed view of one object in a [`Collection`].
 pub struct ObjectView<'a> {
     event: &'a Event,
-    object_name: Rc<str>,
+    object_name: Arc<str>,
     index: usize,
 }
 
@@ -882,10 +956,11 @@ impl<'a> ObjectView<'a> {
     }
 
     /// Attach derived data to this object index.
-    pub fn set<T: 'static>(&self, attr: impl Into<String>, value: T) {
+    pub fn set<T: Send + Sync + 'static>(&self, attr: impl Into<String>, value: T) {
         self.event
             .object_attachments
-            .borrow_mut()
+            .write()
+            .expect("object attachment lock poisoned")
             .entry(self.object_name.to_string())
             .or_default()
             .entry(self.index)
@@ -894,11 +969,15 @@ impl<'a> ObjectView<'a> {
     }
 
     /// Read a typed per-object attachment.
-    pub fn extra<T: 'static>(&self, attr: impl AsRef<str>) -> Result<Ref<'_, T>> {
+    pub fn extra<T: 'static>(&self, attr: impl AsRef<str>) -> Result<ObjectAttachmentRef<'_, T>> {
         let attr = attr.as_ref().to_string();
         let object_name = self.object_name.to_string();
         let index = self.index;
-        let extras = self.event.object_attachments.borrow();
+        let extras = self
+            .event
+            .object_attachments
+            .read()
+            .expect("object attachment lock poisoned");
         let exists = extras
             .get(&object_name)
             .and_then(|by_index| by_index.get(&index))
@@ -911,21 +990,34 @@ impl<'a> ObjectView<'a> {
             });
         }
 
-        Ref::filter_map(extras, |extras| {
-            extras
-                .get(&object_name)
-                .and_then(|by_index| by_index.get(&index))
-                .and_then(|values| values.get(&attr))
-                .and_then(|value| value.downcast_ref::<T>())
-        })
-        .map_err(|_| NanoError::TypeMismatch {
-            name: format!("{}[{}].{}", self.object_name.as_ref(), self.index, attr),
-            expected: std::any::type_name::<T>(),
+        if extras
+            .get(&object_name)
+            .and_then(|by_index| by_index.get(&index))
+            .and_then(|values| values.get(&attr))
+            .and_then(|value| value.downcast_ref::<T>())
+            .is_none()
+        {
+            return Err(NanoError::TypeMismatch {
+                name: format!("{}[{}].{}", self.object_name.as_ref(), self.index, attr),
+                expected: std::any::type_name::<T>(),
+            });
+        }
+
+        Ok(ObjectAttachmentRef {
+            guard: extras,
+            object_name,
+            index,
+            attr,
+            _marker: PhantomData,
         })
     }
 
     fn extra_cloned<T: Clone + 'static>(&self, attr: &str) -> Result<Option<T>> {
-        let extras = self.event.object_attachments.borrow();
+        let extras = self
+            .event
+            .object_attachments
+            .read()
+            .expect("object attachment lock poisoned");
         let Some(values) = extras
             .get(self.object_name.as_ref())
             .and_then(|by_index| by_index.get(&self.index))
@@ -1167,6 +1259,12 @@ mod tests {
             BranchSpec::new("genWeight", BranchType::F32).optional(),
         ])
         .unwrap()
+    }
+
+    #[test]
+    fn event_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Event>();
     }
 
     fn columns() -> Vec<(String, BranchColumn)> {
