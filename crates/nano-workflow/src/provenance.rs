@@ -52,6 +52,17 @@ pub(crate) fn read_branch_signature(schema: &BranchSchema) -> Vec<String> {
 }
 
 pub(crate) fn map_key(chunk: &ChunkSpec, schema: &BranchSchema) -> Result<String> {
+    if chunk.source.starts_with("http://") || chunk.source.starts_with("https://") {
+        return Ok(hash_parts(&[
+            CODE_SPEC_VERSION.to_string(),
+            "map".to_string(),
+            chunk.source.clone(),
+            chunk.entry_range.start.to_string(),
+            chunk.entry_range.end.to_string(),
+            read_branch_signature(schema).join("|"),
+        ]));
+    }
+
     let metadata = fs::metadata(&chunk.source)?;
     let modified = metadata
         .modified()

@@ -6,7 +6,10 @@ use nano_core::{BranchSchema, BranchSpec, BranchType};
 use nano_io::read_events;
 use nano_io::writer::{write_events, OutputBranch};
 use nano_producers::{MuonProducer, MuonSkimRow};
-use nano_workflow::{plan_muon_workflow, ExecutionMode, Executor, RunStats};
+use nano_workflow::{
+    export_portable_graph, import_portable_graph, merge_partials, plan_muon_workflow, run_chunk,
+    ExecutionMode, Executor, KernelRegistry, PortableGraph, RunChunkRequest, RunStats,
+};
 
 #[test]
 fn serial_and_parallel_outputs_match_single_pass() {
@@ -148,6 +151,138 @@ fn changed_input_recomputes_only_affected_maps_then_reduce_and_sink() {
     assert_eq!(changed.reduce, executed_one());
     assert_eq!(changed.sink, executed_one());
     assert_eq!(changed.merged.rows, expected_rows);
+}
+
+#[test]
+fn portable_export_import_round_trip_runs_like_in_memory_plan() {
+    let fixture = Fixture::new("portable_round_trip");
+    let input = fixture.path("input.root");
+    write_synthetic_input(
+        &input,
+        vec![
+            vec![(35.0, 0.1)],
+            vec![(12.0, 0.2)],
+            vec![(50.0, -1.1), (40.0, 2.0)],
+            vec![],
+        ],
+    );
+
+    let schema = input_schema();
+    let in_memory_plan = plan_muon_workflow(
+        [&input],
+        schema.clone(),
+        2,
+        fixture.path("cache-memory"),
+        fixture.path("memory.root"),
+    )
+    .unwrap();
+    let portable_plan = plan_muon_workflow(
+        [&input],
+        schema,
+        2,
+        fixture.path("cache-portable"),
+        fixture.path("portable.root"),
+    )
+    .unwrap();
+
+    let graph = export_portable_graph(&portable_plan);
+    let imported_plan = import_portable_graph(&graph).unwrap();
+    assert_eq!(export_portable_graph(&imported_plan), graph);
+
+    let executor = Executor::new();
+    let expected = executor
+        .run(&in_memory_plan, ExecutionMode::Serial)
+        .unwrap()
+        .merged;
+    let imported = executor
+        .run(&imported_plan, ExecutionMode::Serial)
+        .unwrap()
+        .merged;
+    assert_eq!(imported, expected);
+}
+
+#[test]
+fn task_atoms_match_single_pass_and_local_executor() {
+    let fixture = Fixture::new("task_atoms");
+    let input = fixture.path("input.root");
+    write_synthetic_input(
+        &input,
+        vec![
+            vec![(31.0, 0.1), (29.0, 0.1)],
+            vec![(60.0, 2.5)],
+            vec![(45.0, -0.3)],
+            vec![(10.0, 0.1)],
+            vec![(70.0, 1.1), (33.0, -2.0)],
+        ],
+    );
+
+    let schema = input_schema();
+    let plan = plan_muon_workflow(
+        [&input],
+        schema.clone(),
+        2,
+        fixture.path("cache"),
+        fixture.path("skim.root"),
+    )
+    .unwrap();
+    let registry = KernelRegistry::with_muon();
+    let partials = plan
+        .maps
+        .iter()
+        .map(|map| {
+            run_chunk(
+                &RunChunkRequest {
+                    source: map.chunk.source.clone(),
+                    entry_range: map.chunk.entry_range.clone(),
+                    kernel_id: "muon".to_string(),
+                },
+                &registry,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let atom_merged = merge_partials(partials);
+    let local_merged = Executor::new()
+        .run(&plan, ExecutionMode::Serial)
+        .unwrap()
+        .merged;
+    let single_pass = single_pass_rows(&input, schema);
+
+    assert_eq!(atom_merged, local_merged);
+    assert_eq!(atom_merged.rows, single_pass);
+    assert_eq!(
+        atom_merged.cutflow,
+        nano_workflow::Cutflow {
+            events_seen: 5,
+            events_selected: 3,
+        }
+    );
+}
+
+#[test]
+fn portable_graph_json_serializes_deserializes_stably() {
+    let fixture = Fixture::new("portable_json");
+    let input = fixture.path("input.root");
+    write_synthetic_input(&input, vec![vec![(31.0, 0.1)], vec![(20.0, 0.1)]]);
+
+    let plan = plan_muon_workflow(
+        [&input],
+        input_schema(),
+        1,
+        fixture.path("cache"),
+        fixture.path("skim.root"),
+    )
+    .unwrap();
+    let graph = export_portable_graph(&plan);
+    let json = serde_json::to_string_pretty(&graph).unwrap();
+    let decoded = serde_json::from_str::<PortableGraph>(&json).unwrap();
+    let encoded_again = serde_json::to_string_pretty(&decoded).unwrap();
+
+    assert_eq!(decoded, graph);
+    assert_eq!(encoded_again, json);
+    assert!(json.contains("\"schema_version\": 1"));
+    assert!(json.contains("\"kind\": \"map\""));
+    assert!(json.contains("\"kernel_id\": \"muon\""));
 }
 
 fn skipped_one() -> RunStats {

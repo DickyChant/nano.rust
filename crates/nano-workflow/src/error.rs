@@ -10,6 +10,9 @@ pub enum WorkflowError {
     Core(nano_core::NanoError),
     Root(nano_io::RootError),
     InvalidCache(String),
+    InvalidGraph(String),
+    UnknownKernel(String),
+    UnsupportedSource(String),
     Assertion(String),
 }
 
@@ -21,6 +24,9 @@ impl fmt::Display for WorkflowError {
             Self::Core(error) => write!(f, "{error}"),
             Self::Root(error) => write!(f, "{error}"),
             Self::InvalidCache(message) => write!(f, "{message}"),
+            Self::InvalidGraph(message) => write!(f, "{message}"),
+            Self::UnknownKernel(kernel) => write!(f, "unknown workflow kernel `{kernel}`"),
+            Self::UnsupportedSource(message) => write!(f, "{message}"),
             Self::Assertion(message) => write!(f, "{message}"),
         }
     }
@@ -33,7 +39,11 @@ impl StdError for WorkflowError {
             Self::Json(error) => Some(error),
             Self::Core(error) => Some(error),
             Self::Root(error) => Some(error),
-            Self::InvalidCache(_) | Self::Assertion(_) => None,
+            Self::InvalidCache(_)
+            | Self::InvalidGraph(_)
+            | Self::UnknownKernel(_)
+            | Self::UnsupportedSource(_)
+            | Self::Assertion(_) => None,
         }
     }
 }

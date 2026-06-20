@@ -1,12 +1,7 @@
-use std::fs;
-use std::path::Path;
-
 use nano_core::BranchSchema;
 use rayon::prelude::*;
 
-use crate::artifacts::{
-    Cutflow, MergedOutput, MergedOutputCache, PartialOutput, PartialOutputCache,
-};
+use crate::artifacts::{MergedOutput, PartialOutput};
 use crate::error::{Result, WorkflowError};
 use crate::planner::{Kernel, MapDone, MapNode, ReduceDone, ReduceNode, SinkNode, WorkflowPlan};
 use crate::provenance::{
@@ -14,6 +9,10 @@ use crate::provenance::{
     Manifest,
 };
 use crate::sink::write_muon_skim;
+use crate::tasks::{
+    read_merged_output, read_partial_output, run_chunk_with_kernel, write_merged_output,
+    write_partial_output,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -166,24 +165,7 @@ fn run_map(
         ));
     }
 
-    let mut output = PartialOutput {
-        rows: Vec::new(),
-        cutflow: Cutflow::default(),
-        hists: Vec::new(),
-    };
-    let iterator = nano_io::events_chunked(Path::new(&node.chunk.source), schema, chunk_size)?;
-    for event in iterator
-        .skip(node.chunk.entry_range.start)
-        .take(node.chunk.entry_range.len())
-    {
-        let event = event?;
-        output.cutflow.events_seen += 1;
-        if let Some(row) = kernel(&event)? {
-            output.cutflow.events_selected += 1;
-            output.rows.push(row);
-        }
-    }
-
+    let output = run_chunk_with_kernel(&node.chunk, schema, chunk_size, kernel)?;
     write_partial_output(&node.artifact_path, &output)?;
     write_manifest(
         &node.manifest_path,
@@ -307,34 +289,4 @@ fn run_sink(
         ),
     )?;
     Ok((reduce.output.clone(), false))
-}
-
-fn write_partial_output(path: &Path, output: &PartialOutput) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let cache = PartialOutputCache::from(output.clone());
-    fs::write(path, serde_json::to_vec_pretty(&cache)?)?;
-    Ok(())
-}
-
-fn read_partial_output(path: &Path) -> Result<PartialOutput> {
-    let bytes = fs::read(path)?;
-    let cache = serde_json::from_slice::<PartialOutputCache>(&bytes)?;
-    Ok(cache.into())
-}
-
-fn write_merged_output(path: &Path, output: &MergedOutput) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let cache = MergedOutputCache::from(output.clone());
-    fs::write(path, serde_json::to_vec_pretty(&cache)?)?;
-    Ok(())
-}
-
-fn read_merged_output(path: &Path) -> Result<MergedOutput> {
-    let bytes = fs::read(path)?;
-    let cache = serde_json::from_slice::<MergedOutputCache>(&bytes)?;
-    Ok(cache.into())
 }

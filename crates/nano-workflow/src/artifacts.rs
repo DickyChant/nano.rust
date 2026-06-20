@@ -1,5 +1,5 @@
 use nano_producers::MuonSkimRow;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EntryRange {
@@ -74,6 +74,24 @@ impl PartialOutput {
     }
 }
 
+impl Serialize for PartialOutput {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        PartialOutputCache::from(self.clone()).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PartialOutput {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(PartialOutputCache::deserialize(deserializer)?.into())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MergedOutput {
     pub rows: Vec<MuonSkimRow>,
@@ -88,6 +106,24 @@ impl From<PartialOutput> for MergedOutput {
             cutflow: value.cutflow,
             hists: value.hists,
         }
+    }
+}
+
+impl Serialize for MergedOutput {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        MergedOutputCache::from(self.clone()).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MergedOutput {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(MergedOutputCache::deserialize(deserializer)?.into())
     }
 }
 

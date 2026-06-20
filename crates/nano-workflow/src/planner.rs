@@ -60,6 +60,7 @@ pub struct WorkflowPlan {
     pub schema: BranchSchema,
     pub chunk_size: usize,
     pub kernel: Kernel,
+    pub kernel_id: String,
 }
 
 pub fn plan_muon_workflow(
@@ -69,13 +70,14 @@ pub fn plan_muon_workflow(
     cache_dir: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
 ) -> Result<WorkflowPlan> {
-    plan_workflow(
+    plan_workflow_with_kernel_id(
         inputs,
         schema,
         chunk_size,
         cache_dir,
         output_path,
         MuonProducer::analyze,
+        "muon",
     )
 }
 
@@ -86,6 +88,29 @@ pub fn plan_workflow<K>(
     cache_dir: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     kernel: K,
+) -> Result<WorkflowPlan>
+where
+    K: Fn(&Event) -> nano_core::Result<Option<MuonSkimRow>> + Send + Sync + 'static,
+{
+    plan_workflow_with_kernel_id(
+        inputs,
+        schema,
+        chunk_size,
+        cache_dir,
+        output_path,
+        kernel,
+        "custom",
+    )
+}
+
+pub fn plan_workflow_with_kernel_id<K>(
+    inputs: impl IntoIterator<Item = impl AsRef<Path>>,
+    schema: BranchSchema,
+    chunk_size: usize,
+    cache_dir: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    kernel: K,
+    kernel_id: impl Into<String>,
 ) -> Result<WorkflowPlan>
 where
     K: Fn(&Event) -> nano_core::Result<Option<MuonSkimRow>> + Send + Sync + 'static,
@@ -155,6 +180,7 @@ where
         schema,
         chunk_size,
         kernel: Arc::new(kernel),
+        kernel_id: kernel_id.into(),
     })
 }
 
