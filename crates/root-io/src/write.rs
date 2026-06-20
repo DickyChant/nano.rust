@@ -130,7 +130,7 @@ impl BranchData {
         }
     }
 
-    fn leaf_title(&self, name: &str) -> String {
+    fn branch_title(&self, name: &str, counter_name: Option<&str>) -> String {
         let code = match self {
             Self::F32(_) | Self::VecF32(_) => "F",
             Self::I32(_) => "I",
@@ -138,7 +138,17 @@ impl BranchData {
             Self::U64(_) => "l",
             Self::Bool(_) => "O",
         };
-        format!("{name}/{code}")
+        match counter_name {
+            Some(counter_name) => format!("{name}[{counter_name}]/{code}"),
+            None => format!("{name}/{code}"),
+        }
+    }
+
+    fn leaf_title(&self, name: &str, counter_name: Option<&str>) -> String {
+        match counter_name {
+            Some(counter_name) => format!("{name}[{counter_name}]"),
+            None => name.to_string(),
+        }
     }
 
     fn element_size(&self) -> i32 {
@@ -151,6 +161,21 @@ impl BranchData {
 
     fn is_unsigned(&self) -> bool {
         matches!(self, Self::U32(_) | Self::U64(_))
+    }
+
+    fn entry_offset_len(&self, entries: usize) -> i32 {
+        match self {
+            Self::VecF32(_) => 4 * entries as i32,
+            _ => 0,
+        }
+    }
+
+    fn basket_uncompressed_len(&self) -> usize {
+        let payload_len = self.payload().len();
+        match self {
+            Self::VecF32(rows) => payload_len + 4 * (rows.len() + 2),
+            _ => payload_len,
+        }
     }
 
     fn write_min_max(&self, out: &mut Vec<u8>) {
@@ -211,8 +236,14 @@ impl BranchData {
 #[derive(Debug, Clone)]
 struct BasketInfo {
     bytes: Vec<u8>,
-    payload_len: usize,
+    uncompressed_len: usize,
     seek: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BranchMeta {
+    counter: Option<usize>,
+    is_counter: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +259,62 @@ struct TKeySpec {
     class_name: String,
     obj_name: String,
     obj_title: String,
+}
+
+fn build_branch_meta(branches: &[Branch]) -> Result<Vec<BranchMeta>> {
+    let mut meta = vec![
+        BranchMeta {
+            counter: None,
+            is_counter: false,
+        };
+        branches.len()
+    ];
+
+    for (branch_index, branch) in branches.iter().enumerate() {
+        let BranchData::VecF32(rows) = &branch.data else {
+            continue;
+        };
+        let counter_name = counter_name_for(&branch.name).ok_or_else(|| {
+            RootError::other(format!(
+                "jagged branch `{}` needs a NanoAOD-style `Prefix_attr` name",
+                branch.name
+            ))
+        })?;
+        let counter_index = branches[..branch_index]
+            .iter()
+            .position(|candidate| candidate.name == counter_name)
+            .ok_or_else(|| {
+                RootError::other(format!(
+                    "jagged branch `{}` needs earlier counter branch `{counter_name}`",
+                    branch.name
+                ))
+            })?;
+        let BranchData::U32(counts) = &branches[counter_index].data else {
+            return Err(RootError::other(format!(
+                "counter branch `{counter_name}` for `{}` must be UInt_t/U32",
+                branch.name
+            )));
+        };
+        for (entry, (row, count)) in rows.iter().zip(counts).enumerate() {
+            if row.len() != *count as usize {
+                return Err(RootError::other(format!(
+                    "jagged branch `{}` entry {entry} has {} values but `{counter_name}` is {count}",
+                    branch.name,
+                    row.len()
+                )));
+            }
+        }
+        meta[branch_index].counter = Some(counter_index);
+        meta[counter_index].is_counter = true;
+    }
+
+    Ok(meta)
+}
+
+fn counter_name_for(branch_name: &str) -> Option<String> {
+    branch_name
+        .split_once('_')
+        .and_then(|(prefix, _)| (!prefix.is_empty()).then(|| format!("n{prefix}")))
 }
 
 /// Write an uncompressed ROOT file containing one `TTree`.
@@ -255,20 +342,23 @@ pub fn write_tree<P: AsRef<Path>>(path: P, tree_name: &str, branches: &[Branch])
         }
     }
 
+    let branch_meta = build_branch_meta(branches)?;
+
     let mut baskets: Vec<BasketInfo> = branches
         .iter()
         .map(|branch| {
             let payload = branch.data.payload();
-            let bytes = build_basket(&branch.name, tree_name, 0, &payload, entries);
+            let bytes = build_basket(branch, tree_name, 0, &payload, entries);
             BasketInfo {
                 bytes,
-                payload_len: payload.len(),
+                uncompressed_len: branch.data.basket_uncompressed_len(),
                 seek: 0,
             }
         })
         .collect();
 
-    let provisional_tree_obj = build_tree_object(tree_name, branches, &baskets, entries);
+    let provisional_tree_obj =
+        build_tree_object(tree_name, branches, &branch_meta, &baskets, entries);
     let provisional_tree_key = build_key(
         "TTree",
         tree_name,
@@ -281,7 +371,7 @@ pub fn write_tree<P: AsRef<Path>>(path: P, tree_name: &str, branches: &[Branch])
     for (branch, basket) in branches.iter().zip(baskets.iter_mut()) {
         basket.seek = next_seek;
         basket.bytes = build_basket(
-            &branch.name,
+            branch,
             tree_name,
             basket.seek,
             &branch.data.payload(),
@@ -290,7 +380,7 @@ pub fn write_tree<P: AsRef<Path>>(path: P, tree_name: &str, branches: &[Branch])
         next_seek += basket.bytes.len() as u64;
     }
 
-    let tree_obj = build_tree_object(tree_name, branches, &baskets, entries);
+    let tree_obj = build_tree_object(tree_name, branches, &branch_meta, &baskets, entries);
     let tree_key = build_key("TTree", tree_name, tree_name, TREE_OFFSET, &tree_obj);
     let tree_key_header = key_spec(
         "TTree",
@@ -392,9 +482,11 @@ fn build_key_list(headers: &[TKeySpec]) -> Vec<u8> {
 fn build_tree_object(
     tree_name: &str,
     branches: &[Branch],
+    branch_meta: &[BranchMeta],
     baskets: &[BasketInfo],
     entries: usize,
 ) -> Vec<u8> {
+    let tree_key_len = key_header_len("TTree", tree_name, tree_name);
     let mut tree = Vec::new();
     put_u16(&mut tree, 18);
     tree.extend(checked(tnamed(tree_name, tree_name)));
@@ -402,7 +494,10 @@ fn build_tree_object(
     tree.extend(checked(tattfill_v1()));
     tree.extend(checked(tattmarker_v2()));
     put_i64(&mut tree, entries as i64);
-    let total_payload = baskets.iter().map(|b| b.payload_len as i64).sum::<i64>();
+    let total_payload = baskets
+        .iter()
+        .map(|b| b.uncompressed_len as i64)
+        .sum::<i64>();
     let total_basket = baskets.iter().map(|b| b.bytes.len() as i64).sum::<i64>();
     put_i64(&mut tree, total_payload);
     put_i64(&mut tree, total_basket);
@@ -420,18 +515,30 @@ fn build_tree_object(
     put_i64(&mut tree, 0);
     put_i64(&mut tree, entries as i64);
 
-    let branch_objs = branches
-        .iter()
-        .zip(baskets)
-        .map(|(branch, basket)| raw_object("TBranch", build_branch(branch, basket, entries)))
-        .collect();
-    tree.extend(checked(tobjarray("", branch_objs)));
+    let branches_checked_start = tree.len();
+    let mut branch_array = tobjarray_header("", branches.len());
+    let mut leaf_refs = Vec::with_capacity(branches.len());
+    for (branch_index, ((branch, meta), basket)) in
+        branches.iter().zip(branch_meta).zip(baskets).enumerate()
+    {
+        let counter_ref = meta.counter.map(|counter_index| leaf_refs[counter_index]);
+        let branch_raw_start = branches_checked_start + 4 + branch_array.len();
+        let built = build_branch_raw_object(
+            branch,
+            meta,
+            basket,
+            entries,
+            tree_key_len,
+            branch_raw_start,
+            counter_ref,
+        );
+        leaf_refs.push(built.leaf_ref);
+        debug_assert_eq!(leaf_refs.len(), branch_index + 1);
+        branch_array.extend(built.raw_object);
+    }
+    tree.extend(checked(branch_array));
 
-    let leaf_objs = branches
-        .iter()
-        .map(|branch| raw_object(branch.data.leaf_class(), build_leaf(branch)))
-        .collect();
-    tree.extend(checked(tobjarray("", leaf_objs)));
+    tree.extend(checked(tobjarray_refs("", &leaf_refs)));
 
     put_u32(&mut tree, 0);
     put_i32(&mut tree, 0);
@@ -443,17 +550,63 @@ fn build_tree_object(
     checked(tree)
 }
 
-fn build_branch(branch: &Branch, basket: &BasketInfo, entries: usize) -> Vec<u8> {
+struct BuiltBranch {
+    raw_object: Vec<u8>,
+    leaf_ref: u32,
+}
+
+fn build_branch_raw_object(
+    branch: &Branch,
+    meta: &BranchMeta,
+    basket: &BasketInfo,
+    entries: usize,
+    tree_key_len: usize,
+    branch_raw_start: usize,
+    counter_ref: Option<u32>,
+) -> BuiltBranch {
+    let branch_body = build_branch(
+        branch,
+        meta,
+        basket,
+        entries,
+        tree_key_len,
+        branch_raw_start,
+        counter_ref,
+    );
+    let leaf_ref = branch_body.leaf_ref;
+    BuiltBranch {
+        raw_object: raw_object("TBranch", branch_body.bytes),
+        leaf_ref,
+    }
+}
+
+struct BuiltBranchBody {
+    bytes: Vec<u8>,
+    leaf_ref: u32,
+}
+
+fn build_branch(
+    branch: &Branch,
+    meta: &BranchMeta,
+    basket: &BasketInfo,
+    entries: usize,
+    tree_key_len: usize,
+    branch_raw_start: usize,
+    counter_ref: Option<u32>,
+) -> BuiltBranchBody {
     let mut out = Vec::new();
+    let counter_name = meta.counter.map(|_| leaf_count_name(branch));
     put_u16(&mut out, 12);
     out.extend(checked(tnamed(
         &branch.name,
-        &branch.data.leaf_title(&branch.name),
+        &branch
+            .data
+            .branch_title(&branch.name, counter_name.as_deref()),
     )));
     out.extend(checked(tattfill_v1()));
     put_i32(&mut out, 0);
     put_i32(&mut out, 32000);
-    put_i32(&mut out, 0);
+    put_i32(&mut out, branch.data.entry_offset_len(entries));
     put_i32(&mut out, 1);
     put_i64(&mut out, entries as i64);
     put_i32(&mut out, 0);
@@ -461,13 +614,23 @@ fn build_branch(branch: &Branch, basket: &BasketInfo, entries: usize) -> Vec<u8>
     put_i32(&mut out, 0);
     put_i64(&mut out, entries as i64);
     put_i64(&mut out, 0);
-    put_i64(&mut out, basket.payload_len as i64);
+    put_i64(&mut out, basket.uncompressed_len as i64);
     put_i64(&mut out, basket.bytes.len() as i64);
     out.extend(checked(tobjarray("", Vec::new())));
-    out.extend(checked(tobjarray(
-        "",
-        vec![raw_object(branch.data.leaf_class(), build_leaf(branch))],
-    )));
+    let leaf_array_checked_start = out.len();
+    let mut leaf_array = tobjarray_header("", 1);
+    let leaf_raw_start = branch_raw_start
+        + raw_object_prefix_len("TBranch")
+        + 4
+        + leaf_array_checked_start
+        + 4
+        + leaf_array.len();
+    let leaf_ref = (tree_key_len + leaf_raw_start + 6) as u32;
+    leaf_array.extend(raw_object(
+        branch.data.leaf_class(),
+        build_leaf(branch, meta, counter_ref),
+    ));
+    out.extend(checked(leaf_array));
     out.extend(checked(tobjarray("", Vec::new())));
     put_u8(&mut out, 1);
     put_i32(&mut out, basket.bytes.len() as i32);
@@ -476,25 +639,35 @@ fn build_branch(branch: &Branch, basket: &BasketInfo, entries: usize) -> Vec<u8>
     put_u8(&mut out, 2);
     put_u64(&mut out, basket.seek);
     put_string(&mut out, "");
-    out
+    BuiltBranchBody {
+        bytes: out,
+        leaf_ref,
+    }
 }
 
-fn build_leaf(branch: &Branch) -> Vec<u8> {
+fn leaf_count_name(branch: &Branch) -> String {
+    counter_name_for(&branch.name).unwrap_or_default()
+}
+
+fn build_leaf(branch: &Branch, meta: &BranchMeta, counter_ref: Option<u32>) -> Vec<u8> {
     let mut out = Vec::new();
+    let counter_name = meta.counter.map(|_| leaf_count_name(branch));
     put_u16(&mut out, 1);
 
     let mut base = Vec::new();
     put_u16(&mut base, 2);
     base.extend(checked(tnamed(
         &branch.name,
-        &branch.data.leaf_title(&branch.name),
+        &branch
+            .data
+            .leaf_title(&branch.name, counter_name.as_deref()),
     )));
     put_i32(&mut base, 1);
     put_i32(&mut base, branch.data.element_size());
     put_i32(&mut base, 0);
-    put_u8(&mut base, 0);
+    put_u8(&mut base, u8::from(meta.is_counter));
     put_u8(&mut base, u8::from(branch.data.is_unsigned()));
-    put_u32(&mut base, 0);
+    put_u32(&mut base, counter_ref.unwrap_or(0));
     out.extend(checked(base));
 
     branch.data.write_min_max(&mut out);
@@ -502,19 +675,37 @@ fn build_leaf(branch: &Branch) -> Vec<u8> {
 }
 
 fn build_basket(
-    branch_name: &str,
+    branch: &Branch,
     tree_name: &str,
     seek: u64,
     payload: &[u8],
     entries: usize,
 ) -> Vec<u8> {
+    let branch_name = &branch.name;
     let title = format!("{tree_name} basket for {branch_name}");
     let header_len = key_header_len("TBasket", branch_name, &title) + 19;
-    let total_size = header_len + payload.len();
+    let offset_table_len = match &branch.data {
+        BranchData::VecF32(rows) => 4 * (rows.len() + 2),
+        _ => 0,
+    };
+    let obj_len = payload.len() + offset_table_len;
+    let total_size = header_len + obj_len;
+    let last = match branch.data {
+        BranchData::VecF32(_) => header_len + payload.len(),
+        _ => total_size,
+    };
+    let version = match branch.data {
+        BranchData::VecF32(_) => 3,
+        _ => 2,
+    };
+    let nev_buf_size = match branch.data {
+        BranchData::VecF32(_) => 1000,
+        _ => branch_element_size(payload, entries),
+    };
     let spec = TKeySpec {
         total_size: total_size as u32,
         version: 1004,
-        uncomp_len: payload.len() as u32,
+        uncomp_len: obj_len as u32,
         datime: 0,
         key_len: header_len as i16,
         cycle: 0,
@@ -527,14 +718,27 @@ fn build_basket(
 
     let mut out = Vec::new();
     write_key_header(&mut out, &spec);
-    put_u16(&mut out, 2);
+    put_u16(&mut out, version);
     put_u32(&mut out, 32000);
-    put_u32(&mut out, branch_element_size(payload, entries));
+    put_u32(&mut out, nev_buf_size);
     put_u32(&mut out, entries as u32);
-    put_u32(&mut out, total_size as u32);
+    put_u32(&mut out, last as u32);
     put_i8(&mut out, 0);
     out.extend(payload);
+    if let BranchData::VecF32(rows) = &branch.data {
+        write_jagged_entry_offsets(&mut out, rows, header_len);
+    }
     out
+}
+
+fn write_jagged_entry_offsets(out: &mut Vec<u8>, rows: &[Vec<f32>], key_len: usize) {
+    put_u32(out, rows.len() as u32 + 1);
+    let mut offset = key_len;
+    for row in rows {
+        put_i32(out, offset as i32);
+        offset += row.len() * std::mem::size_of::<f32>();
+    }
+    put_i32(out, 0);
 }
 
 fn branch_element_size(payload: &[u8], entries: usize) -> u32 {
@@ -643,16 +847,29 @@ fn tattmarker_v2() -> Vec<u8> {
 }
 
 fn tobjarray(name: &str, objects: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut out = tobjarray_header(name, objects.len());
+    for object in objects {
+        out.extend(object);
+    }
+    out
+}
+
+fn tobjarray_header(name: &str, size: usize) -> Vec<u8> {
     let mut out = Vec::new();
     put_u16(&mut out, 3);
     put_u16(&mut out, 1);
     put_u32(&mut out, 0);
     put_u32(&mut out, 0);
     put_c_string(&mut out, name);
-    put_i32(&mut out, objects.len() as i32);
+    put_i32(&mut out, size as i32);
     put_i32(&mut out, 0);
-    for object in objects {
-        out.extend(object);
+    out
+}
+
+fn tobjarray_refs(name: &str, refs: &[u32]) -> Vec<u8> {
+    let mut out = tobjarray_header(name, refs.len());
+    for reference in refs {
+        put_u32(&mut out, *reference);
     }
     out
 }
@@ -674,6 +891,10 @@ fn raw_object(class_name: &str, obj: Vec<u8>) -> Vec<u8> {
     put_c_string(&mut out, class_name);
     out.extend(checked(obj));
     out
+}
+
+fn raw_object_prefix_len(class_name: &str) -> usize {
+    4 + class_name.len() + 1
 }
 
 fn checked(obj: Vec<u8>) -> Vec<u8> {
