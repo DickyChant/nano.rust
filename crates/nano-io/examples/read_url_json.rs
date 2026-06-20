@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         BranchSpec::new("Muon_pt", BranchType::VecF32),
         BranchSpec::new("Muon_eta", BranchType::VecF32),
         BranchSpec::new("MET_pt", BranchType::F32),
-        BranchSpec::new("run", BranchType::I32),
+        BranchSpec::new("run", BranchType::U32),
         BranchSpec::new("event", BranchType::U64),
     ])?;
     let mut events = events_url_chunked(&url, &schema, n.max(1))?;
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             f32_array_json(&event.vector::<f32>("Muon_pt")?),
             f32_array_json(&event.vector::<f32>("Muon_eta")?),
             finite_f32_json(event.scalar::<f32>("MET_pt")?),
-            event.scalar::<i32>("run")?,
+            event.scalar::<u32>("run")?,
             event.scalar::<u64>("event")?,
         );
     }
