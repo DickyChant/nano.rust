@@ -130,14 +130,25 @@ def uproot_remote_read(n_events: int, insecure: bool):
     raise RuntimeError("; ".join(errors))
 
 
+def f32_close(a, b) -> bool:
+    # Both sides come from the same on-disk float32. Compare at f32 precision:
+    # the Rust side is serialized via JSON (shortest round-trip of the f32) while
+    # uproot promotes to f64, so a raw f64 atol diverges by ~1 f32 ULP at large
+    # magnitudes (e.g. ~2e-5 at pt ~ 2772 GeV). Casting both back to float32
+    # checks the values are bit-identical.
+    return np.allclose(
+        np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32), rtol=1e-6, atol=0
+    )
+
+
 def cross_check_remote(rust_events, uproot_events) -> None:
     for index, rust in enumerate(rust_events):
         assert rust["nMuon"] == int(uproot_events["nMuon"][index])
         assert rust["run"] == int(uproot_events["run"][index])
         assert rust["event"] == int(uproot_events["event"][index])
-        assert np.isclose(rust["MET_pt"], float(uproot_events["MET_pt"][index]), rtol=0, atol=1e-5)
-        assert np.allclose(rust["Muon_pt"], ak.to_list(uproot_events["Muon_pt"][index]), rtol=0, atol=1e-5)
-        assert np.allclose(rust["Muon_eta"], ak.to_list(uproot_events["Muon_eta"][index]), rtol=0, atol=1e-5)
+        assert f32_close(rust["MET_pt"], float(uproot_events["MET_pt"][index]))
+        assert f32_close(rust["Muon_pt"], ak.to_list(uproot_events["Muon_pt"][index]))
+        assert f32_close(rust["Muon_eta"], ak.to_list(uproot_events["Muon_eta"][index]))
 
 
 def nano_write_synthetic(repo: Path, output: Path, n_events: int, env: dict[str, str]) -> None:
