@@ -19,18 +19,19 @@
 
 <main>
   <section class="lede">
-    <p><strong>The thesis:</strong> soft guardrails (prompts, skills, harnesses, review) can <em>steer</em> agent-generated analysis code but cannot <em>guarantee</em> its correctness. A hard guarantee needs a mechanical enforcer — so we model the analysis as a typed <strong>state machine</strong> and let the Rust compiler make invalid analysis states unrepresentable, then add Rust's strengths: performance, FFI to legacy libraries, SIMD per-event execution, and a TUI for orchestration and agentic execution.</p>
+    <p><strong>The thesis:</strong> agents now write analysis code faster than anyone can review it, so correctness has to move out of soft guidance and into a hard, mechanical gate. The division of labour: physicists review the <em>physics semantics</em>; agents generate the <em>implementation</em>; the Rust compiler and a validation layer <em>reject any inconsistent state</em> — a branch that doesn't exist for the era, a histogram filled before selection, a cross-section added to a luminosity (fb vs&nbsp;fb⁻¹), an incomplete set of systematics. The analysis is modelled as a typed <strong>state machine</strong> that makes invalid states unrepresentable.</p>
+    <p>This doesn't reinvent the agent harness — it <strong>confines</strong> one: the action space is gated by the compiler and the validator, so <em>the orchestrator proposes and the compiler disposes</em> (over a CLI and an MCP server). And the guarantee pays a dividend — a per-event kernel that compiles has no hidden shared state, which is exactly the condition for safe parallelism: <strong>if it compiles, it's safe to parallelize</strong>. On top sit Rust's systems strengths — performance, FFI to legacy libraries, SIMD per-event execution, and TUI-friendly orchestration.</p>
   </section>
 
   <section class="cards">
     <a class="card" href="api/nano_io/index.html">
       <h3>API docs →</h3>
       <p>rustdoc for the workspace crates.</p>
-      <p class="crates"><code>nano_io</code> · <code>nano_core</code> · <code>root_io</code> · <code>nano_producers</code></p>
+      <p class="crates"><code>nano_spec</code> · <code>nano_analysis</code> · <code>nano_inference</code> · <code>nano_io</code> · <code>nano_core</code></p>
     </a>
     <a class="card" href="blog/index.html">
       <h3>Notes / blog →</h3>
-      <p>Design notes and essays — the working drafts of our arXiv note.</p>
+      <p>Design notes, screencasts, and essays — including a spec→code walkthrough and the "compiler rejects a data race" demo.</p>
     </a>
     <a class="card" href="https://github.com/DickyChant/nano.rust">
       <h3>Source →</h3>
@@ -41,11 +42,12 @@
   <section class="status">
     <h2>What works today</h2>
     <ul>
-      <li><strong>Pure-Rust ROOT I/O</strong> — reads &amp; writes <code>TTree</code> (zlib/LZMA/lz4/zstd), no ROOT/C++ dependency.</li>
-      <li><strong>Real CMS NanoAODv9</strong> — reads it locally and <strong>remotely on-demand</strong> over HTTPS byte-range (10 events ≈ 1.3&nbsp;MB of a 2&nbsp;GB file).</li>
-      <li><strong>Bounded streaming</strong> — real NanoAOD → skim at ~72&nbsp;MB resident, any file size.</li>
-      <li><strong>uproot-validated</strong> — the reader is value-correct against uproot on real data; CI cross-checks every push.</li>
-      <li><strong>Typed event model</strong> — collections, attributes, and a compile-time analysis state machine (in design).</li>
+      <li><strong>Semantic compiler</strong> — a physics spec (TOML/YAML) is statically validated against a NanoAOD catalogue (missing branch, wrong type, missing unit, undefined object are rejected) and <strong>generates</strong> the typed event loop; codegen is proven equal to the hand-written reference in CI.</li>
+      <li><strong>Compile-enforced state machine</strong> — <code>Raw → Baseline → Scored&lt;M&gt; → InRegion&lt;R&gt; → Weighted&lt;R&gt;</code>; wrong-stage fills, score-before-inference, and unit mismatches are <em>compile errors</em> (proven by compile-fail tests).</li>
+      <li><strong>Pure-Rust ROOT I/O</strong> — reads &amp; writes <code>TTree</code> (zlib/LZMA/lz4/zstd), reads real CMS NanoAODv9 locally and <strong>remotely on-demand</strong> over HTTPS byte-range; bounded-memory streaming; value-validated against uproot in CI.</li>
+      <li><strong>Inference protocol</strong> — call external ML behind one <code>Predictor</code> trait: mock, in-process ONNX, a remote endpoint, or a server the framework launches itself; declared in the spec as <code>[[model]]</code> and woven into the typed loop.</li>
+      <li><strong>Agent action space</strong> — the same verified operations exposed over a <code>nano</code> CLI and an MCP server, so an orchestrating agent drives validate / derive / inspect / codegen through typed, compiler-gated tools.</li>
+      <li><strong>Parallelism for free</strong> — the verified per-event kernel runs serial or chunk-parallel from one source; ~8× on 16 cores, bit-identical results.</li>
     </ul>
   </section>
 </main>
