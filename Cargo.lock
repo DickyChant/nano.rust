@@ -642,6 +642,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-workflow"
+version = "0.0.0"
+dependencies = [
+ "nano-analysis",
+ "nano-core",
+ "nano-io",
+ "nano-producers",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

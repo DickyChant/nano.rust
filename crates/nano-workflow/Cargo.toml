@@ -1,0 +1,20 @@
+[package]
+name = "nano-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust-native typed workflow orchestration for nano.rust"
+
+[dependencies]
+nano-analysis = { workspace = true }
+nano-core = { workspace = true }
+nano-io = { workspace = true }
+nano-producers = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = []
+http = ["nano-core/http", "nano-io/http", "nano-producers/http"]

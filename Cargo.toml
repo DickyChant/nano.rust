@@ -21,7 +21,11 @@ nano-producers = { path = "crates/nano-producers" }
 nano-rootio = { path = "crates/nano-rootio" }
 nano-corrections = { path = "crates/nano-corrections" }
 nano-spec = { path = "crates/nano-spec" }
+nano-workflow = { path = "crates/nano-workflow" }
 nano-gen-demo = { path = "crates/nano-gen-demo" }
 nano-gen-tagger-demo = { path = "crates/nano-gen-tagger-demo" }
 nano-cli = { path = "crates/nano-cli" }
 nano-mcp = { path = "crates/nano-mcp" }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
