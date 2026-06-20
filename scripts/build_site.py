@@ -11,8 +11,11 @@ Requires the `markdown` package for blog rendering.
 """
 from __future__ import annotations
 
+import datetime
+import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 import markdown
@@ -22,6 +25,34 @@ PUBLIC = ROOT / "public"
 RUSTDOC = ROOT / "target" / "doc"
 BLOG_SRC = ROOT / "docs" / "blog"
 SITE_SRC = ROOT / "docs" / "site"
+
+
+def build_stamp() -> str:
+    """A short, deterministic identifier for this deploy: <ref> · <short-sha> · <date>.
+
+    Reads CI env (GITHUB_SHA / GITHUB_REF_NAME) when present, else falls back to
+    git. This is the lightweight precursor to full tag-based versioning: when
+    releases are tagged, GITHUB_REF_NAME becomes the version and this same string
+    labels each built version.
+    """
+    sha = os.environ.get("GITHUB_SHA", "")
+    if not sha:
+        try:
+            sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                cwd=ROOT,
+            ).stdout.strip()
+        except Exception:
+            sha = ""
+    short = sha[:7] if sha else "dev"
+    ref = os.environ.get("GITHUB_REF_NAME", "main")
+    date = os.environ.get("BUILD_DATE") or datetime.date.today().isoformat()
+    return f"{ref} · {short} · {date}"
+
+
+BUILD_STAMP = build_stamp()
 
 NAV = (
     '<nav class="nav"><a href="{up}index.html">nano.rust</a> · '
@@ -39,7 +70,8 @@ def page(title: str, body: str, depth: int) -> str:
         f"<title>{title}</title>"
         f'<link rel="stylesheet" href="{up}style.css"></head><body>'
         + NAV.format(up=up)
-        + f'<main class="post">{body}</main></body></html>'
+        + f'<main class="post">{body}</main>'
+        + f'<footer class="build">build {BUILD_STAMP}</footer></body></html>'
     )
 
 
@@ -48,8 +80,13 @@ def build() -> None:
         shutil.rmtree(PUBLIC)
     PUBLIC.mkdir(parents=True)
 
-    # landing + style
-    shutil.copy(SITE_SRC / "index.html", PUBLIC / "index.html")
+    # landing (stamped) + style
+    landing = (SITE_SRC / "index.html").read_text()
+    landing = landing.replace(
+        "loop.</p>",
+        f'loop. · <span class="build">{BUILD_STAMP}</span></p>',
+    )
+    (PUBLIC / "index.html").write_text(landing)
     shutil.copy(SITE_SRC / "style.css", PUBLIC / "style.css")
 
     # static assets (asciinema casts, etc.) -> /

@@ -33,6 +33,7 @@ main { max-width: 900px; margin: 0 auto; padding: 2rem 1.5rem; }
 .status h2 { border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
 .status li { margin: 0.4rem 0; }
 footer { max-width: 900px; margin: 2rem auto; padding: 1.5rem; color: var(--muted); border-top: 1px solid var(--border); font-size: 0.9rem; }
+.build, footer.build { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.8rem; color: var(--muted); }
 .post { max-width: 760px; }
 .post h1 { letter-spacing: -0.01em; }
 .post pre { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 0.9rem 1rem; overflow-x: auto; }
