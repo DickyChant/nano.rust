@@ -7,6 +7,7 @@
 //! the exact region token they need.
 
 use std::marker::PhantomData;
+use std::ops::Mul;
 
 use nano_core::{Event, ObjectView};
 use nano_inference::{InferError, InferRequest, Predictor, Tensor, TensorData};
@@ -406,13 +407,86 @@ pub fn fill<R: Region>(hist: &mut Hist1D, event: &Weighted<R>, value: f64) {
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct GeV(pub f64);
 
-/// Integrated luminosity unit newtype.
+/// Cross-section unit newtype: femtobarn (fb).
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Fb(pub f64);
 
-/// Cross-section unit newtype.
+/// Cross-section unit newtype: picobarn (pb). `1 pb = 1000 fb`.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Pb(pub f64);
+
+/// Integrated-luminosity unit newtype: inverse femtobarn (fb⁻¹).
+///
+/// Luminosity is an *inverse* cross-section, so it is deliberately a distinct
+/// type from [`Fb`]: `fb` and `fb⁻¹` cannot be confused or added, and the only
+/// thing you can multiply a cross-section by is a luminosity — see [`Fb::mul`].
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct FbInv(pub f64);
+
+/// Integrated-luminosity unit newtype: inverse picobarn (pb⁻¹). `1 fb⁻¹ = 1000 pb⁻¹`.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct PbInv(pub f64);
+
+impl Pb {
+    /// Convert a picobarn cross-section to femtobarns (`1 pb = 1000 fb`).
+    pub fn to_fb(self) -> Fb {
+        Fb(self.0 * 1000.0)
+    }
+}
+
+impl Fb {
+    /// Convert a femtobarn cross-section to picobarns.
+    pub fn to_pb(self) -> Pb {
+        Pb(self.0 / 1000.0)
+    }
+}
+
+impl FbInv {
+    /// Convert an inverse-femtobarn luminosity to inverse picobarns (`1 fb⁻¹ = 1000 pb⁻¹`).
+    pub fn to_pb_inv(self) -> PbInv {
+        PbInv(self.0 * 1000.0)
+    }
+}
+
+impl PbInv {
+    /// Convert an inverse-picobarn luminosity to inverse femtobarns.
+    pub fn to_fb_inv(self) -> FbInv {
+        FbInv(self.0 / 1000.0)
+    }
+}
+
+/// Expected event yield from cross-section × integrated luminosity:
+/// `N = σ · L`. The barn units cancel, so the result is a dimensionless count.
+///
+/// The type system enforces the physics: you can only multiply a cross-section
+/// by a luminosity of the *matching* unit, and the product is unitless. Mixing
+/// `fb` with `pb⁻¹` (or adding `fb` to `fb⁻¹`) does not compile.
+///
+/// ```
+/// use nano_analysis::{Fb, FbInv};
+/// // 1 pb cross-section over 1 fb⁻¹: N = 1000 fb · 1 fb⁻¹ = 1000 events.
+/// let yield_events: f64 = Fb(1000.0) * FbInv(1.0);
+/// assert_eq!(yield_events, 1000.0);
+/// ```
+///
+/// ```compile_fail
+/// use nano_analysis::{Fb, PbInv};
+/// // fb cross-section times pb⁻¹ luminosity: unit mismatch -> does not compile.
+/// let _bad: f64 = Fb(1000.0) * PbInv(1.0);
+/// ```
+impl Mul<FbInv> for Fb {
+    type Output = f64;
+    fn mul(self, lumi: FbInv) -> f64 {
+        self.0 * lumi.0
+    }
+}
+
+impl Mul<PbInv> for Pb {
+    type Output = f64;
+    fn mul(self, lumi: PbInv) -> f64 {
+        self.0 * lumi.0
+    }
+}
 
 /// Exhaustive list of systematic variations handled by this first slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

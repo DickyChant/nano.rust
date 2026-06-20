@@ -59,8 +59,10 @@ fn fill<R: Region>(h: &mut Hist, e: &Weighted<R>, value: f64);
 
 ## Quantities, weights, systematics
 
-- **Units**: newtype wrappers (`GeV`, `Fb`, `Pb`); mixing requires explicit
-  conversion (mirrors `notes/main.tex`).
+- **Units**: newtype wrappers — energy `GeV`, cross-section `Fb`/`Pb`,
+  integrated luminosity `FbInv`/`PbInv` (fb⁻¹, an *inverse* cross-section so it
+  is a distinct type). Mixing requires explicit conversion; the one legal
+  cross-section × luminosity product typechecks to a dimensionless event yield.
 - **Weights**: `EventWeight` accumulates typed factors (pileup, SF, ...). A
   `Weighted<R>` is the proof that weighting happened before filling.
 - **Systematics**: an exhaustive `enum Systematic`; the event loop is

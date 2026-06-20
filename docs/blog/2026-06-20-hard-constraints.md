@@ -53,7 +53,10 @@ fn fill<R: Region>(h: &mut Hist, e: &Weighted<R>, value: f64);
 
 The only way to obtain an `Ev<SignalRegion>` is to pass the selection; the only
 way to get a `Weighted<R>` is to weight it; and `fill` demands both. Units
-become newtypes (`GeV`, `Fb`), so mixing them fails to compile. Systematics
+become newtypes — energy in `GeV`, *cross-section* in `Fb`/`Pb`, *integrated
+luminosity* in `FbInv`/`PbInv` (fb⁻¹) — so confusing a femtobarn with an inverse
+femtobarn, or adding a cross-section to a luminosity, fails to compile; the one
+legal product, σ × L, typechecks to a dimensionless event count. Systematics
 become an exhaustive `enum`, so adding a variation makes incomplete code fail to
 build. Above this sits a physics-facing spec that lowers to a typed IR and is
 *statically validated* — every branch exists with the right type for the era,

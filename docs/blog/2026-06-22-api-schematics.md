@@ -98,8 +98,10 @@ fn fill<R: Region>(hist: &mut Hist1D, event: &Weighted<R>, value: f64)
 ```
 
 `fill` *demands* a `Weighted<R>`, so a raw, unweighted, or wrong-region fill is a
-compile error (proven by `compile_fail` doctests). Units are newtypes (`GeV`,
-`Fb`, `Pb`); systematics are an exhaustive `enum Systematic` with
+compile error (proven by `compile_fail` doctests). Units are newtypes — energy
+`GeV`, cross-section `Fb`/`Pb`, integrated luminosity `FbInv`/`PbInv` (fb⁻¹),
+with the one legal product `σ × L` typechecking to a dimensionless yield;
+systematics are an exhaustive `enum Systematic` with
 `Systematic::all()`, so adding a variation forces every consumer to handle it.
 
 ## Layer 3 — the semantic compiler (`nano-spec`)
