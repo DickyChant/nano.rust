@@ -118,6 +118,29 @@ fn codegen_muon_toml_emits_generated_producer_source() {
 }
 
 #[test]
+fn codegen_muon_tagger_toml_emits_inference_producer_source() {
+    let spec = repo_path("crates/nano-spec/examples/muon_tagger.toml");
+    let output = run(["codegen", spec.to_str().unwrap()]).expect("codegen command");
+
+    let Output::Codegen(report) = output else {
+        panic!("expected codegen report");
+    };
+
+    assert!(report
+        .source
+        .contains("impl nano_analysis::ModelTag for MuonTagger"));
+    assert!(report
+        .source
+        .contains("predictor: &impl nano_inference::Predictor"));
+    assert!(report
+        .source
+        .contains("muon_tagger_baseline.infer::<MuonTagger>"));
+    assert!(report
+        .source
+        .contains("if !(leading_good_muon_topscore > 0.5_f32)"));
+}
+
+#[test]
 fn inspect_bundled_root_file_lists_ttrees() {
     let root_file = repo_path("crates/root-io/src/test_data/simple.root");
     let output = run(["inspect", root_file.to_str().unwrap()]).expect("inspect command");

@@ -1,0 +1,19 @@
+[package]
+name = "nano-gen-tagger-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build-time generated inference producer demo for nano.rust semantic specs"
+build = "build.rs"
+
+[dependencies]
+nano-analysis = { workspace = true }
+nano-core = { workspace = true }
+nano-inference = { workspace = true }
+
+[build-dependencies]
+nano-spec = { workspace = true }
+
+[features]
+default = []

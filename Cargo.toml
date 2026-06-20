@@ -22,5 +22,6 @@ nano-rootio = { path = "crates/nano-rootio" }
 nano-corrections = { path = "crates/nano-corrections" }
 nano-spec = { path = "crates/nano-spec" }
 nano-gen-demo = { path = "crates/nano-gen-demo" }
+nano-gen-tagger-demo = { path = "crates/nano-gen-tagger-demo" }
 nano-cli = { path = "crates/nano-cli" }
 nano-mcp = { path = "crates/nano-mcp" }
