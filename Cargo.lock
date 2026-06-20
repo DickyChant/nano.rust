@@ -533,6 +533,7 @@ dependencies = [
  "nano-core",
  "nano-io",
  "nano-producers",
+ "nano-review",
  "nano-rootio",
  "nano-spec",
  "nano-workflow",
@@ -604,6 +605,7 @@ dependencies = [
  "nano-cli",
  "nano-core",
  "nano-io",
+ "nano-review",
  "nano-rootio",
  "nano-spec",
  "serde",
@@ -617,6 +619,15 @@ dependencies = [
  "nano-analysis",
  "nano-core",
  "nano-corrections",
+]
+
+[[package]]
+name = "nano-review"
+version = "0.0.0"
+dependencies = [
+ "nano-core",
+ "nano-spec",
+ "serde",
 ]
 
 [[package]]

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 nano-core = { workspace = true }
 nano-io = { workspace = true }
+nano-review = { workspace = true }
 nano-rootio = { workspace = true }
 nano-spec = { workspace = true }
 nano-workflow = { workspace = true }

@@ -254,6 +254,11 @@ impl Catalogue {
     pub fn branch(&self, name: &str) -> Option<&CatalogueBranch> {
         self.branches.get(name)
     }
+
+    /// Return branch names known to the catalogue in stable sorted order.
+    pub fn branch_names(&self) -> impl Iterator<Item = &str> {
+        self.branches.keys().map(String::as_str)
+    }
 }
 
 /// Metadata for one catalogue branch.

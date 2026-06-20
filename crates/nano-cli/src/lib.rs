@@ -1,8 +1,12 @@
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use nano_core::BranchType;
 use nano_io::writer::{write_events, OutputBranch};
+use nano_review::{
+    repair_spec, semantic_diff, suggest_repairs, RepairOutcome, RepairSuggestion, SemanticDiff,
+};
 use nano_rootio::RootFile;
 use nano_spec::codegen;
 use nano_spec::interpret::{interpret, InterpretError, OutputRow, Value};
@@ -29,6 +33,8 @@ pub enum Output {
     Branches(BranchesReport),
     Inspect(InspectReport),
     Codegen(CodegenReport),
+    Diff(DiffReport),
+    Repair(RepairReport),
     Run(RunReport),
 }
 
@@ -106,6 +112,26 @@ pub struct RootBranchReport {
 pub struct CodegenReport {
     pub status: Status,
     pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DiffReport {
+    pub status: Status,
+    pub spec_a_path: PathBuf,
+    pub spec_b_path: PathBuf,
+    pub catalogue_version: String,
+    pub diff: SemanticDiff,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RepairReport {
+    pub status: Status,
+    pub spec_path: PathBuf,
+    pub catalogue_version: String,
+    pub applied: bool,
+    pub suggestions: Vec<RepairSuggestion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RepairOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +245,8 @@ where
         Command::Branches { spec } => branches_command(&spec),
         Command::Inspect { file } => inspect_command(&file),
         Command::Codegen { spec } => codegen_command(&spec),
+        Command::Diff { spec_a, spec_b } => diff_command(&spec_a, &spec_b),
+        Command::Repair { spec, apply } => repair_command(&spec, apply),
         Command::Run(options) => run_workflow(options).map(Output::Run),
     }
 }
@@ -273,6 +301,72 @@ pub fn render_text(output: &Output) -> String {
             lines.join("\n")
         }
         Output::Codegen(report) => report.source.clone(),
+        Output::Diff(report) => {
+            if !report.diff.ok {
+                return format!(
+                    "semantic diff unavailable\n{}: {}\n{}: {}",
+                    report.spec_a_path.display(),
+                    format_validation_state(&report.diff.validation.a),
+                    report.spec_b_path.display(),
+                    format_validation_state(&report.diff.validation.b)
+                );
+            }
+            let summary = if report.diff.summary.is_empty() {
+                "(no semantic changes)".to_string()
+            } else {
+                report.diff.summary.join("\n")
+            };
+            format!(
+                "OK diff {} {}\ncatalogue: {}\n{}",
+                report.spec_a_path.display(),
+                report.spec_b_path.display(),
+                report.catalogue_version,
+                summary
+            )
+        }
+        Output::Repair(report) => {
+            if let Some(outcome) = &report.outcome {
+                return format!(
+                    "OK repair {} converged={}\napplied: {}\nremaining_errors: {}",
+                    report.spec_path.display(),
+                    outcome.converged,
+                    outcome
+                        .applied
+                        .iter()
+                        .map(|repair| format!("{} -> {}", repair.error_message, repair.replacement))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if outcome.remaining_errors.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        outcome.remaining_errors.join("; ")
+                    }
+                );
+            }
+            let suggestions = if report.suggestions.is_empty() {
+                "(none)".to_string()
+            } else {
+                report
+                    .suggestions
+                    .iter()
+                    .map(|suggestion| {
+                        format!(
+                            "{}: {} replacement={} confidence={:.2}",
+                            suggestion.error_message,
+                            suggestion.suggestion,
+                            suggestion.replacement.as_deref().unwrap_or("(none)"),
+                            suggestion.confidence
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            format!(
+                "OK repair {} suggestions\n{}",
+                report.spec_path.display(),
+                suggestions
+            )
+        }
         Output::Run(report) => format!(
             "OK run {}\ninputs: {}\nmode: {}\nkernel: {}\nevents_seen: {}\nevents_selected: {}\noutput: {}\nmanifest: {}",
             report.spec.display(),
@@ -358,6 +452,56 @@ fn codegen_command(spec_path: &Path) -> Result<Output> {
         status: Status::Ok,
         source,
     }))
+}
+
+fn diff_command(spec_a_path: &Path, spec_b_path: &Path) -> Result<Output> {
+    let spec_a_text = read_spec_text(spec_a_path)?;
+    let spec_b_text = read_spec_text(spec_b_path)?;
+    let catalogue = load_default_catalogue(None)?;
+    Ok(Output::Diff(DiffReport {
+        status: Status::Ok,
+        spec_a_path: spec_a_path.to_path_buf(),
+        spec_b_path: spec_b_path.to_path_buf(),
+        catalogue_version: DEFAULT_CATALOGUE_VERSION.to_string(),
+        diff: semantic_diff(&spec_a_text, &spec_b_text, &catalogue),
+    }))
+}
+
+fn repair_command(spec_path: &Path, apply: bool) -> Result<Output> {
+    let spec_text = read_spec_text(spec_path)?;
+    let catalogue = load_default_catalogue(Some(spec_path))?;
+    if apply {
+        let outcome = repair_spec(&spec_text, &catalogue, true);
+        if outcome.final_spec_text != spec_text {
+            fs::write(spec_path, &outcome.final_spec_text).map_err(|source| CliError {
+                status: ErrorStatus::Error,
+                kind: ErrorKind::Workflow,
+                message: format!(
+                    "failed to write repaired spec `{}`: {source}",
+                    spec_path.display()
+                ),
+                spec_path: Some(spec_path.to_path_buf()),
+                validation_errors: Vec::new(),
+            })?;
+        }
+        Ok(Output::Repair(RepairReport {
+            status: Status::Ok,
+            spec_path: spec_path.to_path_buf(),
+            catalogue_version: DEFAULT_CATALOGUE_VERSION.to_string(),
+            applied: true,
+            suggestions: Vec::new(),
+            outcome: Some(outcome),
+        }))
+    } else {
+        Ok(Output::Repair(RepairReport {
+            status: Status::Ok,
+            spec_path: spec_path.to_path_buf(),
+            catalogue_version: DEFAULT_CATALOGUE_VERSION.to_string(),
+            applied: false,
+            suggestions: suggest_repairs(&spec_text, &catalogue),
+            outcome: None,
+        }))
+    }
 }
 
 pub fn run_workflow(options: WorkflowRunOptions) -> Result<RunReport> {
@@ -576,14 +720,7 @@ fn inspect_command(file: &Path) -> Result<Output> {
 fn load_validated_plan(spec_path: &Path) -> Result<(AnalysisSpec, nano_spec::ResolvedPlan)> {
     let spec =
         AnalysisSpec::from_path(spec_path).map_err(|error| parse_cli_error(spec_path, error))?;
-    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, DEFAULT_CATALOGUE_VERSION)
-        .map_err(|error| CliError {
-        status: ErrorStatus::Error,
-        kind: ErrorKind::Catalogue,
-        message: error.to_string(),
-        spec_path: Some(spec_path.to_path_buf()),
-        validation_errors: Vec::new(),
-    })?;
+    let catalogue = load_default_catalogue(Some(spec_path))?;
     let plan = nano_spec::validate(&spec, &catalogue).map_err(|errors| CliError {
         status: ErrorStatus::Error,
         kind: ErrorKind::Validation,
@@ -592,6 +729,28 @@ fn load_validated_plan(spec_path: &Path) -> Result<(AnalysisSpec, nano_spec::Res
         validation_errors: errors.iter().map(validation_error_report).collect(),
     })?;
     Ok((spec, plan))
+}
+
+fn load_default_catalogue(spec_path: Option<&Path>) -> Result<Catalogue> {
+    Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, DEFAULT_CATALOGUE_VERSION).map_err(|error| {
+        CliError {
+            status: ErrorStatus::Error,
+            kind: ErrorKind::Catalogue,
+            message: error.to_string(),
+            spec_path: spec_path.map(Path::to_path_buf),
+            validation_errors: Vec::new(),
+        }
+    })
+}
+
+fn read_spec_text(spec_path: &Path) -> Result<String> {
+    fs::read_to_string(spec_path).map_err(|source| CliError {
+        status: ErrorStatus::Error,
+        kind: ErrorKind::Parse,
+        message: format!("failed to read spec `{}`: {source}", spec_path.display()),
+        spec_path: Some(spec_path.to_path_buf()),
+        validation_errors: Vec::new(),
+    })
 }
 
 fn resolve_kernel_id(
@@ -1075,6 +1234,8 @@ enum Command {
     Branches { spec: PathBuf },
     Inspect { file: PathBuf },
     Codegen { spec: PathBuf },
+    Diff { spec_a: PathBuf, spec_b: PathBuf },
+    Repair { spec: PathBuf, apply: bool },
     Run(WorkflowRunOptions),
 }
 
@@ -1101,6 +1262,11 @@ impl ParsedArgs {
             "codegen" => Command::Codegen {
                 spec: one_operand(command, &positional[1..])?,
             },
+            "diff" => {
+                let (spec_a, spec_b) = two_operands(command, &positional[1..])?;
+                Command::Diff { spec_a, spec_b }
+            }
+            "repair" => parse_repair_args(&positional[1..])?,
             "run" => Command::Run(parse_run_args(&positional[1..])?),
             _ => return Err(usage_error(format!("unknown command `{command}`"))),
         };
@@ -1126,6 +1292,41 @@ fn one_operand(command: &str, args: &[String]) -> Result<PathBuf> {
             "`nano {command}` accepts exactly one path"
         ))),
     }
+}
+
+fn two_operands(command: &str, args: &[String]) -> Result<(PathBuf, PathBuf)> {
+    match args {
+        [left, right] => Ok((PathBuf::from(left), PathBuf::from(right))),
+        [] | [_] => Err(usage_error(format!("`nano {command}` needs two paths"))),
+        _ => Err(usage_error(format!(
+            "`nano {command}` accepts exactly two paths"
+        ))),
+    }
+}
+
+fn parse_repair_args(args: &[String]) -> Result<Command> {
+    let mut apply = false;
+    let mut spec = None;
+    for arg in args {
+        match arg.as_str() {
+            "--apply" => apply = true,
+            flag if flag.starts_with("--") => {
+                return Err(usage_error(format!("unknown `nano repair` flag `{flag}`")));
+            }
+            operand => {
+                if spec.is_some() {
+                    return Err(usage_error(format!(
+                        "unexpected `nano repair` argument `{operand}`"
+                    )));
+                }
+                spec = Some(PathBuf::from(operand));
+            }
+        }
+    }
+    let Some(spec) = spec else {
+        return Err(usage_error("`nano repair` needs one spec path"));
+    };
+    Ok(Command::Repair { spec, apply })
 }
 
 fn parse_run_args(args: &[String]) -> Result<WorkflowRunOptions> {
@@ -1231,4 +1432,14 @@ impl fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
     }
+}
+
+fn format_validation_state(state: &nano_review::ValidationState) -> String {
+    if state.valid {
+        return "valid".to_string();
+    }
+    if let Some(error) = &state.parse_error {
+        return error.clone();
+    }
+    state.validation_errors.join("; ")
 }

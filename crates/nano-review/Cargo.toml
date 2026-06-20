@@ -1,0 +1,13 @@
+[package]
+name = "nano-review"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Semantic review and validation repair helpers for nano.rust specs"
+
+[dependencies]
+nano-core = { workspace = true }
+nano-spec = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+

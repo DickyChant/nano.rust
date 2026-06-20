@@ -4,6 +4,12 @@
 /out/
 /dist/
 
+# Workflow run outputs (skims, provenance manifests, staleness cache) written
+# to CWD when `nano run` / tests omit an explicit output path.
+*.nano-cache/
+*.root.manifest.json
+/muon_demo.root
+
 # Rust / Cargo
 /target/
 target/

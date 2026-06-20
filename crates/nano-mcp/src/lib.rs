@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 
 use nano_cli::{RunReport, WorkflowRunOptions};
 use nano_core::BranchType;
+use nano_review::{
+    repair_spec as review_repair_spec, semantic_diff as review_semantic_diff,
+    suggest_repairs as review_suggest_repairs, RepairOutcome, RepairSuggestion, SemanticDiff,
+};
 use nano_rootio::RootFile;
 use nano_spec::codegen;
 use nano_spec::{AnalysisSpec, Catalogue, ParseError, SpecError, SpecFormat};
@@ -61,6 +65,23 @@ pub struct RunWorkflowInput {
     pub output: Option<PathBuf>,
     #[serde(default)]
     pub parallel: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticDiffInput {
+    pub spec_a: SpecInput,
+    pub spec_b: SpecInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepairSpecInput {
+    pub spec_path: Option<PathBuf>,
+    pub spec_text: Option<String>,
+    pub format: Option<InputFormat>,
+    #[serde(default)]
+    pub apply: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -128,6 +149,33 @@ pub struct RunWorkflowResult {
     pub output: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<PathBuf>,
+    #[serde(default)]
+    pub errors: Vec<ToolError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SemanticDiffResult {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<SemanticDiff>,
+    #[serde(default)]
+    pub errors: Vec<ToolError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SuggestRepairsResult {
+    pub ok: bool,
+    #[serde(default)]
+    pub suggestions: Vec<RepairSuggestion>,
+    #[serde(default)]
+    pub errors: Vec<ToolError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RepairSpecResult {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RepairOutcome>,
     #[serde(default)]
     pub errors: Vec<ToolError>,
 }
@@ -403,6 +451,109 @@ pub fn run_workflow(input: RunWorkflowInput) -> RunWorkflowResult {
     }
 }
 
+pub fn semantic_diff(input: SemanticDiffInput) -> SemanticDiffResult {
+    let spec_a = match load_spec_text(&input.spec_a) {
+        Ok(text) => text,
+        Err(error) => {
+            return SemanticDiffResult {
+                ok: false,
+                diff: None,
+                errors: vec![error],
+            }
+        }
+    };
+    let spec_b = match load_spec_text(&input.spec_b) {
+        Ok(text) => text,
+        Err(error) => {
+            return SemanticDiffResult {
+                ok: false,
+                diff: None,
+                errors: vec![error],
+            }
+        }
+    };
+    let catalogue = match load_default_catalogue(None) {
+        Ok(catalogue) => catalogue,
+        Err(error) => {
+            return SemanticDiffResult {
+                ok: false,
+                diff: None,
+                errors: vec![error],
+            }
+        }
+    };
+    let diff = review_semantic_diff(&spec_a, &spec_b, &catalogue);
+    SemanticDiffResult {
+        ok: diff.ok,
+        diff: Some(diff),
+        errors: Vec::new(),
+    }
+}
+
+pub fn suggest_repairs(input: SpecInput) -> SuggestRepairsResult {
+    let spec_text = match load_spec_text(&input) {
+        Ok(text) => text,
+        Err(error) => {
+            return SuggestRepairsResult {
+                ok: false,
+                suggestions: Vec::new(),
+                errors: vec![error],
+            }
+        }
+    };
+    let catalogue = match load_default_catalogue(None) {
+        Ok(catalogue) => catalogue,
+        Err(error) => {
+            return SuggestRepairsResult {
+                ok: false,
+                suggestions: Vec::new(),
+                errors: vec![error],
+            }
+        }
+    };
+
+    SuggestRepairsResult {
+        ok: true,
+        suggestions: review_suggest_repairs(&spec_text, &catalogue),
+        errors: Vec::new(),
+    }
+}
+
+pub fn repair_spec(input: RepairSpecInput) -> RepairSpecResult {
+    let spec_input = SpecInput {
+        spec_path: input.spec_path,
+        spec_text: input.spec_text,
+        format: input.format,
+    };
+    let spec_text = match load_spec_text(&spec_input) {
+        Ok(text) => text,
+        Err(error) => {
+            return RepairSpecResult {
+                ok: false,
+                outcome: None,
+                errors: vec![error],
+            }
+        }
+    };
+    let catalogue = match load_default_catalogue(spec_input.spec_path.as_deref()) {
+        Ok(catalogue) => catalogue,
+        Err(error) => {
+            return RepairSpecResult {
+                ok: false,
+                outcome: None,
+                errors: vec![error],
+            }
+        }
+    };
+
+    let outcome = review_repair_spec(&spec_text, &catalogue, input.apply);
+    RepairSpecResult {
+        ok: outcome.converged || !input.apply,
+        outcome: Some(outcome),
+        errors: Vec::new(),
+    }
+}
+
 pub fn handle_json_rpc_line(line: &str) -> Option<Value> {
     match serde_json::from_str::<Value>(line) {
         Ok(request) => handle_json_rpc(request),
@@ -473,6 +624,9 @@ fn handle_tools_call(id: Value, params: Option<Value>) -> Value {
         "inspect_file" => decode_and_call(id, arguments, inspect_file),
         "generate_kernel" => decode_and_call(id, arguments, generate_kernel),
         "run_workflow" => decode_and_call(id, arguments, run_workflow),
+        "semantic_diff" => decode_and_call(id, arguments, semantic_diff),
+        "suggest_repairs" => decode_and_call(id, arguments, suggest_repairs),
+        "repair_spec" => decode_and_call(id, arguments, repair_spec),
         _ => json_rpc_error(
             id,
             -32602,
@@ -569,6 +723,35 @@ fn load_validated_plan(input: &SpecInput) -> Result<ValidatedPlan, ToolError> {
         plan,
         spec_path: loaded.spec_path,
     })
+}
+
+fn load_default_catalogue(spec_path: Option<&Path>) -> Result<Catalogue, ToolError> {
+    Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, DEFAULT_CATALOGUE_VERSION).map_err(|error| {
+        ToolError {
+            kind: ToolErrorKind::Catalogue,
+            message: error.to_string(),
+            spec_path: spec_path.map(Path::to_path_buf),
+            path: None,
+            validation_errors: Vec::new(),
+        }
+    })
+}
+
+fn load_spec_text(input: &SpecInput) -> Result<String, ToolError> {
+    match (&input.spec_path, &input.spec_text) {
+        (Some(_), Some(_)) => Err(usage_error(
+            "provide exactly one of `spec_path` or `spec_text`, not both",
+        )),
+        (None, None) => Err(usage_error("provide one of `spec_path` or `spec_text`")),
+        (Some(path), None) => fs::read_to_string(path).map_err(|source| ToolError {
+            kind: ToolErrorKind::Parse,
+            message: format!("failed to read spec `{}`: {source}", path.display()),
+            spec_path: Some(path.clone()),
+            path: None,
+            validation_errors: Vec::new(),
+        }),
+        (None, Some(text)) => Ok(text.clone()),
+    }
 }
 
 fn load_spec(input: &SpecInput) -> Result<LoadedSpec, ToolError> {
@@ -923,6 +1106,57 @@ fn validation_error_info(error: &SpecError) -> ValidationErrorInfo {
 fn tool_descriptions() -> Vec<Value> {
     vec![
         json!({
+            "name": "semantic_diff",
+            "description": "Parse, validate, and semantically diff two nano.rust analysis specs, including object cuts, regions, outputs, models, and read-branch deltas.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["spec_a", "spec_b"],
+                "additionalProperties": false,
+                "properties": {
+                    "spec_a": spec_input_schema(),
+                    "spec_b": spec_input_schema()
+                }
+            },
+            "outputSchema": review_output_schema("diff")
+        }),
+        json!({
+            "name": "suggest_repairs",
+            "description": "Validate a nano.rust analysis spec and return typed repair suggestions for compiler-gated validation errors.",
+            "inputSchema": spec_input_schema(),
+            "outputSchema": {
+                "type": "object",
+                "required": ["ok", "suggestions", "errors"],
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "suggestions": { "type": "array", "items": { "type": "object" } },
+                    "errors": errors_schema()
+                }
+            }
+        }),
+        json!({
+            "name": "repair_spec",
+            "description": "Run a bounded validation-repair loop over a nano.rust spec and return the repaired text plus remaining errors.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "oneOf": [
+                    { "required": ["spec_path"] },
+                    { "required": ["spec_text"] }
+                ],
+                "properties": {
+                    "spec_path": { "type": "string", "description": "Path to a TOML, YAML, or JSON analysis spec." },
+                    "spec_text": { "type": "string", "description": "Inline TOML, YAML, or JSON analysis spec text." },
+                    "format": {
+                        "type": "string",
+                        "enum": ["toml", "yaml", "json"],
+                        "description": "Optional explicit format."
+                    },
+                    "apply": { "type": "boolean", "description": "Apply high-confidence replacements in a bounded loop when true." }
+                }
+            },
+            "outputSchema": review_output_schema("outcome")
+        }),
+        json!({
             "name": "validate_spec",
             "description": "Parse and validate a nano.rust analysis spec against the NanoAOD branch catalogue.",
             "inputSchema": spec_input_schema(),
@@ -1036,6 +1270,18 @@ fn tool_descriptions() -> Vec<Value> {
             }
         }),
     ]
+}
+
+fn review_output_schema(payload_name: &str) -> Value {
+    json!({
+        "type": "object",
+        "required": ["ok", "errors"],
+        "properties": {
+            "ok": { "type": "boolean" },
+            payload_name: { "type": "object" },
+            "errors": errors_schema()
+        }
+    })
 }
 
 fn spec_input_schema() -> Value {

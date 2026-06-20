@@ -14,6 +14,7 @@ path = "src/main.rs"
 nano-cli = { workspace = true }
 nano-core = { workspace = true }
 nano-io = { workspace = true }
+nano-review = { workspace = true }
 nano-rootio = { workspace = true }
 nano-spec = { workspace = true }
 serde = { version = "1", features = ["derive"] }

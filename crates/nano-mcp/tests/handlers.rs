@@ -7,9 +7,9 @@ use nano_core::{BranchSchema, BranchSpec, BranchType};
 use nano_io::read_events;
 use nano_io::writer::{write_events, OutputBranch};
 use nano_mcp::{
-    derive_read_branches, generate_kernel, handle_json_rpc, inspect_file, run_workflow,
-    validate_spec, InspectFileInput, RunWorkflowInput, SpecInput, ToolErrorKind,
-    ValidationErrorKind,
+    derive_read_branches, generate_kernel, handle_json_rpc, inspect_file, repair_spec,
+    run_workflow, semantic_diff, suggest_repairs, validate_spec, InspectFileInput, RepairSpecInput,
+    RunWorkflowInput, SemanticDiffInput, SpecInput, ToolErrorKind, ValidationErrorKind,
 };
 use serde_json::{json, Value};
 
@@ -95,6 +95,71 @@ fn generate_kernel_muon_toml_returns_source() {
 }
 
 #[test]
+fn semantic_diff_tool_reports_cut_output_and_branch_delta() {
+    let muon = include_str!("../../nano-spec/examples/muon.toml");
+    let variant = muon.replace(
+        "cuts = [\"pt > 30 GeV\", \"abs(eta) < 2.4\"]",
+        "cuts = [\"pt > 35 GeV\", \"abs(eta) < 2.4\"]",
+    )
+        + "\n[[outputs]]\nname = \"lead_muon_phi\"\nexpr = \"leading(good_muon).phi\"\n";
+
+    let result = semantic_diff(SemanticDiffInput {
+        spec_a: SpecInput {
+            spec_path: None,
+            spec_text: Some(muon.to_string()),
+            format: None,
+        },
+        spec_b: SpecInput {
+            spec_path: None,
+            spec_text: Some(variant),
+            format: None,
+        },
+    });
+
+    assert!(result.ok);
+    let diff = result.diff.expect("diff");
+    assert_eq!(diff.outputs.added, vec!["lead_muon_phi"]);
+    assert_eq!(diff.read_branches.added, vec!["Muon_phi"]);
+    assert!(diff
+        .summary
+        .iter()
+        .any(|line| line == "cut good_muon.pt 30 GeV->35 GeV"));
+}
+
+#[test]
+fn suggest_repairs_tool_suggests_muon_eta_for_broken_spec() {
+    let result = suggest_repairs(SpecInput {
+        spec_path: None,
+        spec_text: Some(include_str!("../../nano-spec/examples/muon_broken.toml").to_string()),
+        format: None,
+    });
+
+    assert!(result.ok);
+    let branch = result
+        .suggestions
+        .iter()
+        .find(|suggestion| suggestion.kind == nano_review::RepairKind::MissingBranch)
+        .expect("branch suggestion");
+    assert_eq!(branch.suggestion, "Muon_eta");
+    assert_eq!(branch.replacement.as_deref(), Some("eta"));
+}
+
+#[test]
+fn repair_spec_tool_converges_for_broken_spec() {
+    let result = repair_spec(RepairSpecInput {
+        spec_path: None,
+        spec_text: Some(include_str!("../../nano-spec/examples/muon_broken.toml").to_string()),
+        format: None,
+        apply: true,
+    });
+
+    assert!(result.ok);
+    let outcome = result.outcome.expect("outcome");
+    assert!(outcome.converged, "{:?}", outcome.remaining_errors);
+    assert!(outcome.final_spec_text.contains("abs(eta) < 2.4"));
+}
+
+#[test]
 fn inspect_file_bundled_root_file_lists_trees() {
     let result = inspect_file(InspectFileInput {
         path: repo_path("crates/root-io/src/test_data/simple.root"),
@@ -160,6 +225,9 @@ fn json_rpc_tools_list_and_call_shape_match_mcp() {
     assert_eq!(
         names,
         vec![
+            "semantic_diff",
+            "suggest_repairs",
+            "repair_spec",
             "validate_spec",
             "derive_read_branches",
             "inspect_file",
