@@ -20,3 +20,4 @@ nano-producers = { path = "crates/nano-producers" }
 nano-rootio = { path = "crates/nano-rootio" }
 nano-corrections = { path = "crates/nano-corrections" }
 nano-spec = { path = "crates/nano-spec" }
+nano-gen-demo = { path = "crates/nano-gen-demo" }

@@ -1,0 +1,20 @@
+[package]
+name = "nano-gen-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build-time generated producer demo for nano.rust semantic specs"
+build = "build.rs"
+
+[dependencies]
+nano-core = { workspace = true }
+
+[dev-dependencies]
+nano-producers = { workspace = true }
+
+[build-dependencies]
+nano-spec = { workspace = true }
+
+[features]
+default = []
