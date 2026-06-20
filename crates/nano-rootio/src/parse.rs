@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 
@@ -238,45 +238,37 @@ pub(crate) struct RawObject<'a> {
 /// Parser context for ROOT object references.
 ///
 /// ROOT's `TBufferFile::ReadObjectAny` serializes objects with compact class
-/// tags and sometimes replaces an object occurrence with an absolute back
-/// reference into the same buffer.  The `map_offset` maps positions inside
-/// `bytes` to those absolute tags.  Readers and the future writer must agree on
-/// this scheme: a new class stores a C-string class name followed by a checked
-/// object payload, an existing class stores the prior class tag plus a payload,
-/// and an object reference stores only the prior object tag.
+/// tags and sometimes replaces an object occurrence with a back-reference into
+/// the buffer object map.  uproot keys that map by read order, not by byte
+/// offset: the first object read from the buffer gets `kMapOffset + 1`, the
+/// second gets `kMapOffset + 2`, and so on.
 pub(crate) struct ObjectContext<'a> {
     bytes: &'a [u8],
+    class_map_offset: u64,
     map_offset: u64,
+    next_object_index: Cell<u32>,
     refs: RefCell<HashMap<u32, RawObject<'a>>>,
 }
 
 impl<'a> ObjectContext<'a> {
-    pub(crate) fn new(bytes: &'a [u8], map_offset: u64) -> Self {
+    pub(crate) fn new(bytes: &'a [u8], class_map_offset: u64) -> Self {
         Self {
             bytes,
-            map_offset,
+            class_map_offset,
+            map_offset: TBUFFER_OBJECT_MAP_OFFSET,
+            next_object_index: Cell::new(1),
             refs: RefCell::new(HashMap::new()),
         }
     }
 
-    fn local_offset(&self, absolute: u32) -> Result<usize> {
-        let absolute = absolute as u64;
-        if absolute == 0 {
-            return Ok(0);
-        }
-        let local = absolute.checked_sub(self.map_offset).ok_or_else(|| {
-            Error::parse(
-                0,
-                format!(
-                    "object reference {absolute} precedes map offset {}",
-                    self.map_offset
-                ),
-            )
-        })?;
-        usize::try_from(local).map_err(|_| Error::parse(0, "object reference overflows usize"))
+    fn class_name_at(&self, absolute: u32) -> Result<&'a str> {
+        self.ref_at(absolute).map(|raw| raw.class_name).map_or_else(
+            || self.raw_at_class_tag(absolute).map(|raw| raw.class_name),
+            Ok,
+        )
     }
 
-    fn raw_at(&self, absolute: u32) -> Result<RawObject<'a>> {
+    fn raw_at_class_tag(&self, absolute: u32) -> Result<RawObject<'a>> {
         if absolute == 0 {
             return Ok(RawObject {
                 class_name: "",
@@ -284,20 +276,56 @@ impl<'a> ObjectContext<'a> {
                 payload_origin: 0,
             });
         }
-        let pos = self.local_offset(absolute)?;
+        let absolute = absolute as u64;
+        let local = absolute.checked_sub(self.class_map_offset).ok_or_else(|| {
+            Error::parse(
+                0,
+                format!(
+                    "class reference {absolute} precedes map offset {}",
+                    self.class_map_offset
+                ),
+            )
+        })?;
+        let pos = usize::try_from(local)
+            .map_err(|_| Error::parse(0, "class reference overflows usize"))?;
         let mut cur = Cursor::at(self.bytes, pos)?;
-        read_raw(&mut cur, self)
+        self.read_raw_class_lookup(&mut cur)
     }
 
-    fn class_name_at(&self, absolute: u32) -> Result<&'a str> {
-        self.raw_at(absolute).map(|raw| raw.class_name)
+    fn read_raw_class_lookup(&self, cur: &mut Cursor<'a>) -> Result<RawObject<'a>> {
+        match read_class_info(cur)? {
+            ClassInfo::New(class_name) => {
+                let mut payload_cur = cur.checked_sub()?;
+                let payload_origin = payload_cur.absolute_position();
+                let payload = payload_cur.rest();
+                Ok(RawObject {
+                    class_name,
+                    payload,
+                    payload_origin,
+                })
+            }
+            ClassInfo::Exists(tag) => {
+                let class_name = self.class_name_at(tag)?;
+                let mut payload_cur = cur.checked_sub()?;
+                let payload_origin = payload_cur.absolute_position();
+                let payload = payload_cur.rest();
+                Ok(RawObject {
+                    class_name,
+                    payload,
+                    payload_origin,
+                })
+            }
+            ClassInfo::References(tag) => self
+                .ref_at(tag)
+                .map_or_else(|| self.raw_at_class_tag(tag), Ok),
+        }
     }
 
-    fn register_ref(&self, object_start: usize, raw: RawObject<'a>) -> Result<()> {
-        let tag = object_reference_tag(self.map_offset, object_start)?;
+    fn register_ref(&self, raw: RawObject<'a>) -> Result<()> {
+        let tag = object_reference_tag(self.map_offset, self.next_object_index.get() as usize)?;
+        self.next_object_index
+            .set(self.next_object_index.get().saturating_add(1));
         self.refs.borrow_mut().insert(tag, raw);
-        let tree_buffer_tag = object_reference_tag(TBUFFER_OBJECT_MAP_OFFSET, object_start)?;
-        self.refs.borrow_mut().insert(tree_buffer_tag, raw);
         Ok(())
     }
 
@@ -306,15 +334,13 @@ impl<'a> ObjectContext<'a> {
     }
 }
 
-/// Return the absolute object-reference tag consumed by `read_raw`.
+/// Return the read-order object-reference tag consumed by `read_raw`.
 ///
-/// ROOT's object pointer references are not file offsets. They are offsets into
-/// the current `TBufferFile` payload plus the buffer's object-map offset. The
-/// reader subtracts `map_offset` before reparsing the referenced raw object; the
-/// writer uses this helper to emit the inverse tag.
-pub(crate) fn object_reference_tag(map_offset: u64, local_offset: usize) -> Result<u32> {
-    let local = u64::try_from(local_offset)
-        .map_err(|_| Error::parse(0, "object reference local offset overflows u64"))?;
+/// ROOT/uproot object pointer references in a TTree object buffer are keyed by
+/// read order plus the buffer object-map offset, not by byte position.
+pub(crate) fn object_reference_tag(map_offset: u64, read_order_index: usize) -> Result<u32> {
+    let local = u64::try_from(read_order_index)
+        .map_err(|_| Error::parse(0, "object reference read-order index overflows u64"))?;
     let tag = map_offset
         .checked_add(local)
         .ok_or_else(|| Error::parse(0, "object reference tag overflow"))?;
@@ -339,7 +365,6 @@ fn read_class_info<'a>(cur: &mut Cursor<'a>) -> Result<ClassInfo<'a>> {
 }
 
 pub(crate) fn read_raw<'a>(cur: &mut Cursor<'a>, ctx: &ObjectContext<'a>) -> Result<RawObject<'a>> {
-    let object_start = cur.absolute_position();
     match read_class_info(cur)? {
         ClassInfo::New(class_name) => {
             let mut payload_cur = cur.checked_sub()?;
@@ -350,7 +375,7 @@ pub(crate) fn read_raw<'a>(cur: &mut Cursor<'a>, ctx: &ObjectContext<'a>) -> Res
                 payload,
                 payload_origin,
             };
-            ctx.register_ref(object_start, raw)?;
+            ctx.register_ref(raw)?;
             Ok(raw)
         }
         ClassInfo::Exists(tag) => {
@@ -363,10 +388,17 @@ pub(crate) fn read_raw<'a>(cur: &mut Cursor<'a>, ctx: &ObjectContext<'a>) -> Res
                 payload,
                 payload_origin,
             };
-            ctx.register_ref(object_start, raw)?;
+            ctx.register_ref(raw)?;
             Ok(raw)
         }
-        ClassInfo::References(tag) => ctx.ref_at(tag).map_or_else(|| ctx.raw_at(tag), Ok),
+        ClassInfo::References(0) => Ok(RawObject {
+            class_name: "",
+            payload: &[],
+            payload_origin: 0,
+        }),
+        ClassInfo::References(tag) => ctx
+            .ref_at(tag)
+            .map_or_else(|| ctx.raw_at_class_tag(tag), Ok),
     }
 }
 
@@ -374,7 +406,6 @@ pub(crate) fn read_raw_optional<'a>(
     cur: &mut Cursor<'a>,
     ctx: &ObjectContext<'a>,
 ) -> Result<Option<RawObject<'a>>> {
-    let object_start = cur.absolute_position();
     match read_class_info(cur)? {
         ClassInfo::New(class_name) => {
             let mut payload_cur = cur.checked_sub()?;
@@ -385,7 +416,7 @@ pub(crate) fn read_raw_optional<'a>(
                 payload,
                 payload_origin,
             };
-            ctx.register_ref(object_start, raw)?;
+            ctx.register_ref(raw)?;
             Ok(Some(raw))
         }
         ClassInfo::Exists(tag) => {
@@ -398,11 +429,14 @@ pub(crate) fn read_raw_optional<'a>(
                 payload,
                 payload_origin,
             };
-            ctx.register_ref(object_start, raw)?;
+            ctx.register_ref(raw)?;
             Ok(Some(raw))
         }
         ClassInfo::References(0 | 1) => Ok(None),
-        ClassInfo::References(tag) => Ok(ctx.ref_at(tag)),
+        ClassInfo::References(tag) => ctx
+            .ref_at(tag)
+            .map(Some)
+            .map_or_else(|| ctx.raw_at_class_tag(tag).map(Some), Ok),
     }
 }
 

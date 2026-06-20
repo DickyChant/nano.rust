@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::error::{Error, Result};
-use crate::parse::{object_reference_tag, TBUFFER_OBJECT_MAP_OFFSET};
+use crate::parse::TBUFFER_OBJECT_MAP_OFFSET;
 
 const FILE_BEGIN: u32 = 100;
 const DIRECTORY_OFFSET: u64 = FILE_BEGIN as u64;
@@ -628,12 +628,17 @@ fn build_tree_object(
     let mut branch_array = tobjarray_header("", branches.len());
     let mut leaf_refs = Vec::with_capacity(branches.len());
     let mut leaf_count_refs = Vec::with_capacity(branches.len());
+    let mut next_object_index = 1_u32;
     for (branch_index, ((branch, meta), basket)) in
         branches.iter().zip(branch_meta).zip(baskets).enumerate()
     {
         let counter_ref = meta
             .counter
             .map(|counter_index| leaf_count_refs[counter_index]);
+        let _branch_ref = read_order_object_reference_tag(next_object_index)?;
+        next_object_index = next_object_index.saturating_add(1);
+        let leaf_count_ref = read_order_object_reference_tag(next_object_index)?;
+        next_object_index = next_object_index.saturating_add(1);
         let branch_raw_start = branches_checked_start + 4 + branch_array.len();
         let built = build_branch_raw_object(
             branch,
@@ -643,6 +648,7 @@ fn build_tree_object(
             tree_key_len,
             branch_raw_start,
             counter_ref,
+            leaf_count_ref,
         )?;
         leaf_refs.push(built.leaf_tree_ref);
         leaf_count_refs.push(built.leaf_count_ref);
@@ -678,6 +684,7 @@ fn build_branch_raw_object(
     tree_key_len: usize,
     branch_raw_start: usize,
     counter_ref: Option<u32>,
+    leaf_count_ref: u32,
 ) -> Result<BuiltBranch> {
     let branch_body = build_branch(
         branch,
@@ -687,6 +694,7 @@ fn build_branch_raw_object(
         tree_key_len,
         branch_raw_start,
         counter_ref,
+        leaf_count_ref,
     )?;
     Ok(BuiltBranch {
         raw_object: raw_object("TBranch", branch_body.bytes)?,
@@ -709,6 +717,7 @@ fn build_branch(
     tree_key_len: usize,
     branch_raw_start: usize,
     counter_ref: Option<u32>,
+    leaf_count_ref: u32,
 ) -> Result<BuiltBranchBody> {
     let mut out = Vec::new();
     let counter_name = meta.counter.map(|_| leaf_count_name(branch));
@@ -741,8 +750,7 @@ fn build_branch(
         + leaf_array_checked_start
         + 4
         + leaf_array.len();
-    let leaf_count_ref = tree_buffer_object_reference_tag(leaf_raw_start)?;
-    let leaf_tree_ref = key_framed_object_reference_tag(tree_key_len, leaf_raw_start)?;
+    let leaf_tree_ref = key_framed_byte_reference_tag(tree_key_len, leaf_raw_start)?;
     leaf_array.extend(raw_object(
         branch.data.leaf_class(),
         build_leaf(branch, meta, counter_ref)?,
@@ -763,14 +771,13 @@ fn build_branch(
     })
 }
 
-fn tree_buffer_object_reference_tag(tree_body_raw_object_start: usize) -> Result<u32> {
-    let local_offset = 4_usize
-        .checked_add(tree_body_raw_object_start)
-        .ok_or_else(|| Error::unsupported("object reference", "offset overflow"))?;
-    object_reference_tag(TBUFFER_OBJECT_MAP_OFFSET, local_offset)
+fn read_order_object_reference_tag(read_order_index: u32) -> Result<u32> {
+    read_order_index
+        .checked_add(TBUFFER_OBJECT_MAP_OFFSET as u32)
+        .ok_or_else(|| Error::unsupported("object reference", "read-order index overflow"))
 }
 
-fn key_framed_object_reference_tag(
+fn key_framed_byte_reference_tag(
     tree_key_len: usize,
     tree_body_raw_object_start: usize,
 ) -> Result<u32> {
@@ -778,7 +785,16 @@ fn key_framed_object_reference_tag(
     let local_offset = 4_usize
         .checked_add(tree_body_raw_object_start)
         .ok_or_else(|| Error::unsupported("object reference", "offset overflow"))?;
-    object_reference_tag(map_offset, local_offset)
+    byte_reference_tag(map_offset, local_offset)
+}
+
+fn byte_reference_tag(map_offset: u64, local_offset: usize) -> Result<u32> {
+    let local = u64::try_from(local_offset)
+        .map_err(|_| Error::parse(0, "object reference local offset overflows u64"))?;
+    let tag = map_offset
+        .checked_add(local)
+        .ok_or_else(|| Error::parse(0, "object reference tag overflow"))?;
+    u32::try_from(tag).map_err(|_| Error::parse(0, "object reference tag overflows u32"))
 }
 
 fn leaf_count_name(branch: &Branch) -> String {
@@ -805,10 +821,8 @@ fn build_leaf(branch: &Branch, meta: &BranchMeta, counter_ref: Option<u32>) -> R
     put_u8(&mut base, u8::from(branch.data.is_unsigned()));
 
     // ROOT stores `TLeaf::fLeafCount` with `TBufferFile::WriteObjectAny`.
-    // For an already-written counter leaf, write a plain object-reference tag:
-    // the counter leaf raw-object start within the TTree object buffer plus
-    // ROOT's object-map offset (2). The frame is the TTree key payload, not a
-    // file offset and not key-header-relative.
+    // For an already-written counter leaf, write the uproot-compatible
+    // read-order object-map index plus ROOT's object-map offset (2).
     put_u32(&mut base, counter_ref.unwrap_or(0));
     out.extend(checked(base)?);
 

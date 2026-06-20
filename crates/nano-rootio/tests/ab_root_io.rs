@@ -363,16 +363,17 @@ fn nano_rootio_writer_roundtrips_muon_jagged_via_leafcount_object_ref() {
     let path = temp_root_path("nano-rootio-muon-leafcount-ref-roundtrip.root");
     let _ = std::fs::remove_file(&path);
 
-    let counts = vec![0_u32, 1, 4, 0, 2, 9, 3];
+    let counts = vec![0_u32, 1, 2, 2, 1, 3, 9];
     let muon_pt = vec![
         Vec::new(),
         vec![25.0_f32],
-        vec![40.0, 30.0, 10.5, 5.25],
-        Vec::new(),
+        vec![40.0, 30.0],
         vec![55.0, 12.0],
-        (0..9).map(|index| 100.0 + index as f32).collect(),
+        vec![60.0],
         vec![70.0, 20.0, 11.0],
+        (0..9).map(|index| 100.0 + index as f32).collect(),
     ];
+    let met_pt = vec![10.0_f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0];
 
     write_tree(
         &path,
@@ -380,13 +381,20 @@ fn nano_rootio_writer_roundtrips_muon_jagged_via_leafcount_object_ref() {
         &[
             Branch::u32("nMuon", counts.clone()),
             Branch::vec_f32("Muon_pt", muon_pt.clone()),
+            Branch::f32("MET_pt", met_pt.clone()),
         ],
     )
     .expect("write Muon_pt jagged ROOT file");
+    assert_eq!(
+        serialized_leaf_count_ref(&path, "Muon_pt[nMuon]").expect("Muon_pt fLeafCount ref"),
+        4,
+        "Muon_pt fLeafCount must be the read-order object-map index for nMuon's TLeaf"
+    );
 
     let file = RootFile::open(&path).expect("nano-rootio open");
     let tree = file.tree("Events").expect("nano-rootio tree");
     assert_eq!(tree.read_scalar::<u32>("nMuon").unwrap(), counts);
+    assert_eq!(tree.read_scalar::<f32>("MET_pt").unwrap(), met_pt);
     assert_eq!(tree.read_jagged_auto::<f32>("Muon_pt").unwrap(), muon_pt);
     assert_eq!(
         tree.read_jagged_range_auto::<f32>("Muon_pt", 2, 4).unwrap(),
@@ -673,4 +681,19 @@ fn temp_root_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("{}-{name}", std::process::id()));
     path
+}
+
+fn serialized_leaf_count_ref(path: &Path, leaf_title: &str) -> Option<u32> {
+    let bytes = std::fs::read(path).ok()?;
+    let title = leaf_title.as_bytes();
+    let mut needle = Vec::with_capacity(title.len() + 1);
+    needle.push(u8::try_from(title.len()).ok()?);
+    needle.extend(title);
+    let start = bytes
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice())?;
+    let after_title = start + needle.len();
+    let ref_offset = after_title + 4 + 4 + 4 + 1 + 1;
+    let raw = bytes.get(ref_offset..ref_offset + 4)?;
+    Some(u32::from_be_bytes(raw.try_into().ok()?))
 }
