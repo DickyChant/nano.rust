@@ -1,0 +1,24 @@
+name: links
+
+# Check that documentation links resolve (lychee). Config in lychee.toml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, to catch link rot
+
+permissions:
+  contents: read
+
+jobs:
+  lychee:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: "--no-progress README.md docs/**/*.md"
+          fail: true

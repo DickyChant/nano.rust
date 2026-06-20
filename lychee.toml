@@ -1,0 +1,22 @@
+# Configuration for the lychee link checker (https://github.com/lycheeverse/lychee).
+# Only verify real web links; skip placeholder/example and CERN grid endpoints.
+
+# Check web links only (skips root://, mailto:, etc. used as examples in docs).
+scheme = ["https", "http"]
+
+# Don't descend into generated, vendored, or local-only trees.
+exclude_path = ["target", "public", "external", "paper"]
+
+# Hosts that are placeholders or unreachable/awkward from CI:
+#   - eospublic example URLs are literal placeholders ("/.../*.root") and use CERN grid TLS
+exclude = [
+  "eospublic\\.cern\\.ch",
+  "opendata\\.web\\.cern\\.ch",
+]
+
+exclude_loopback = true
+
+# Tolerate transient/rate-limited responses (e.g. GitHub) without failing CI.
+accept = ["200..=206", "429"]
+max_retries = 2
+retry_wait_time = 5
