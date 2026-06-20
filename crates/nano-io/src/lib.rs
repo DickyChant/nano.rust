@@ -73,7 +73,7 @@ pub mod reader {
         if let Some(item) = file
             .items()
             .iter()
-            .find(|item| item.name() == tree_name && item.verbose_info().contains("TTree"))
+            .find(|item| item.name() == format!("`{tree_name}` of type `TTree`"))
         {
             return item.as_tree().await;
         }

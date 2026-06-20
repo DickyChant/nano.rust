@@ -10,6 +10,11 @@ use nom::{
     IResult,
 };
 
+fn tiofeatures(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    let (i, payload) = length_data(checked_byte_count)(i)?;
+    Ok((i, payload))
+}
+
 use crate::{
     core::parsers::*, core::types::*, tree_reader::branch::tbranch_hdr,
     tree_reader::branch::TBranch, tree_reader::leafs::TLeaf,
@@ -137,7 +142,7 @@ pub fn ttree<'s>(i: &'s [u8], context: &'s Context) -> IResult<&'s [u8], Tree> {
             Ok((i, cnt))
         })(i)
     };
-    let (i, ver) = verify(be_u16, |v| [16, 17, 18, 19].contains(v))(i)?;
+    let (i, ver) = verify(be_u16, |v| [16, 17, 18, 19, 20].contains(v))(i)?;
     let (i, tnamed) = length_value(checked_byte_count, tnamed)(i)?;
     let (i, _tattline) = grab_checked_byte_count(i)?;
     let (i, _tattfill) = grab_checked_byte_count(i)?;
@@ -175,6 +180,7 @@ pub fn ttree<'s>(i: &'s [u8], context: &'s Context) -> IResult<&'s [u8], Tree> {
             (i, None)
         }
     };
+    let (i, _fiofeatures) = cond(ver >= 20, tiofeatures)(i)?;
     let (i, fbranches) =
         length_value(checked_byte_count, |i| tobjarray(tbranch_hdr, i, context))(i)?;
     let (i, fleaves) = length_value(checked_byte_count, |i| {

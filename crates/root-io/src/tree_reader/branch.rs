@@ -2,7 +2,7 @@ use std::fmt::Debug;
 
 use futures::prelude::*;
 use nom::{
-    combinator::verify,
+    combinator::{cond, verify},
     multi::{count, length_data, length_value},
     number::complete::*,
     sequence::preceded,
@@ -13,6 +13,11 @@ use crate::{
     core::parsers::*, core::types::*, tree_reader::container::Container,
     tree_reader::leafs::TLeaf,
 };
+
+fn tiofeatures(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    let (i, payload) = length_data(checked_byte_count)(i)?;
+    Ok((i, payload))
+}
 
 /// A `TBranch` describes one "Column" of a `TTree`
 /// Even though this class is described in the `TStreamerInfo` of a ROOT
@@ -184,7 +189,7 @@ pub fn tbranch_hdr<'s>(raw: &Raw<'s>, ctxt: &'s Context) -> IResult<&'s [u8], TB
 }
 
 pub fn tbranch<'s>(i: &'s [u8], context: &'s Context) -> IResult<&'s [u8], TBranch> {
-    let (i, _ver) = verify(be_u16, |v| [11, 12].contains(v))(i)?;
+    let (i, ver) = verify(be_u16, |v| [11, 12, 13].contains(v))(i)?;
     let (i, tnamed) = length_value(checked_byte_count, tnamed)(i)?;
     let (i, _tattfill) = length_data(checked_byte_count)(i)?;
     let (i, fcompress) = be_i32(i)?;
@@ -192,6 +197,7 @@ pub fn tbranch<'s>(i: &'s [u8], context: &'s Context) -> IResult<&'s [u8], TBran
     let (i, fentryoffsetlen) = be_i32(i)?;
     let (i, fwritebasket) = be_i32(i)?;
     let (i, fentrynumber) = be_i64(i)?;
+    let (i, _fiofeatures) = cond(ver >= 13, tiofeatures)(i)?;
     let (i, foffset) = be_i32(i)?;
     let (i, fmaxbaskets) = be_i32(i)?;
     let (i, fsplitlevel) = be_i32(i)?;
