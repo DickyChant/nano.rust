@@ -58,16 +58,21 @@ crates/
   nano-io        streaming reader + skim writer over nano-rootio
   nano-producers analysis channels (muon control region)
   nano-analysis  compile-enforced analysis state machine (typestate)
-  nano-spec      semantic IR: spec -> validate -> derive read_branches
+  nano-spec      semantic compiler: spec -> validate -> derive read_branches -> codegen
+  nano-corrections  native correctionlib evaluator (typed SF inputs)
+  nano-inference    backend-agnostic ML inference protocol (mock/ONNX/remote/managed)
+  nano-cli       the `nano` CLI: validate / branches / inspect / codegen
+  nano-mcp       MCP server exposing the same ops as agent tools
+  nano-gen-demo, nano-gen-tagger-demo   codegen == hand-written equivalence proofs
   root-io        vendored upstream reader, retained only as a dev/A-B oracle
 ```
 
 The architecture, layer by layer:
 
 ```
-physics spec (YAML/ADL)  ->  semantic IR (typed, validated)
-                         ->  Rust execution kernels (typed state machine)
-                         ->  workflow IR (planned)
+physics spec (TOML/YAML)  ->  semantic IR (typed, validated) -> Rust codegen
+                          ->  Rust execution kernels (typed state machine)
+                          ->  Rust-native workflow DAG (planned)
 ```
 
 ## Build, test, run
@@ -88,13 +93,19 @@ against CMS Open Data over HTTPS — **no checked-in data files**.
 
 ## Status & roadmap
 
-Built and validated: owned ROOT I/O (read + write, local + remote), the event
-model, the compile-enforced state machine, and the semantic IR. Next: a native
-`correctionlib` layer, code generation from the semantic IR into the typed
-kernel, a workflow IR, and golden tests against the original references. See
-[`docs/`](docs/) — [vision](docs/vision.md), [state machine](docs/state-machine.md),
-[semantic layer](docs/semantic-layer.md), [reader rewrite](docs/reader-rewrite.md),
-[remote source](docs/xrootd-source.md), [migration](docs/rust-migration.md).
+Built: owned ROOT I/O (read + write, local + remote), the event model, the
+compile-enforced state machine, the semantic compiler **including codegen**
+(proven equal to a hand-written producer), a **native `correctionlib`**
+evaluator, an **ML inference protocol**, and an agent action space (`nano` CLI +
+MCP server). Next: golden tests against the frozen `.root` references, wiring
+real corrections/JME systematics into the channel, and a **Rust-native workflow
+DAG orchestrator** (the LAW backend is descoped). See [`docs/`](docs/) —
+[vision](docs/vision.md), [versioning](docs/versioning.md),
+[state machine](docs/state-machine.md), [semantic layer](docs/semantic-layer.md),
+[inference protocol](docs/inference-protocol.md),
+[agent interface](docs/agent-interface.md),
+[reader rewrite](docs/reader-rewrite.md), [remote source](docs/xrootd-source.md),
+[migration](docs/rust-migration.md).
 
 ## Acknowledgments
 

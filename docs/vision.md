@@ -28,27 +28,31 @@ Analysis Semantic IR             (typed meaning; static validation against data 
         ↓
 Rust execution kernels           (safe, fast event processing — generated, not hand-written)
         ↓
-Workflow orchestration IR        (backend-independent; targets LAW first, Rust-native later)
+Workflow orchestration IR        (Rust-native typed DAG: chunking, provenance, staleness)
 ```
 
-ROOT/correctionlib/LAW/Combine/pyhf are **boundary integrations**. ROOT is a *storage
+ROOT/correctionlib/Combine/pyhf are **boundary integrations**. ROOT is a *storage
 format*, not the semantic core — no `TTree`/`TH1`/raw branch strings leak above the I/O
 layer. The analysis *meaning* lives in the typed IR, independent of any backend.
+(The workflow layer is **Rust-native**: the LAW backend is descoped — see below.)
 
 ## Where we are now (status against the roadmap)
 
 | Phase | Scope | Status |
 |---|---|---|
-| 0 — Design study | IRs, ADL-like syntax, design docs | **In progress** — this doc + `docs/rust-migration.md` |
-| 1 — Minimal Rust kernel | NanoAOD reader, typed schema, selection, cutflow, histograms | **In progress** — `crates/root-io` (read **+ write**), `crates/nano-io` (reader), `crates/nano-core` (event model). Benchmark = the existing **muon** channel. |
-| 2 — Corrections & systematics | correctionlib, typed SF API, weights, shape variations | **Next** — port C++ helpers (JME, PU, top-pt); decide FFI vs native correctionlib |
-| 3 — Semantic compiler | YAML/ADL → semantic IR → validate → Rust codegen | Future |
-| 4 — Workflow IR + LAW backend | chunking, merging, datacards, plots | Future (C++ side already has Condor builders to learn from) |
-| 5 — Rust-native orchestrator | typed DAG, targets, provenance, staleness | Future / optional |
-| 6 — Agentic integration | semantic-diff reviews, validation suite, repair | Future |
+| 0 — Design study | IRs, spec syntax, design docs | **Done** — vision + migration + state-machine + semantic-layer + inference-protocol + versioning + agent-interface |
+| 1 — Minimal Rust kernel | reader, typed schema, selection, histograms | **Done (one debt)** — `nano-rootio` (read **+ write**, local **+ remote**), `nano-core`, `nano-io`, `nano-producers` (muon), `nano-analysis` (`Hist1D`, typestate). Debt: golden test vs the frozen `.root` references not wired yet |
+| 2 — Corrections & systematics | correctionlib, typed SF, weights, variations | **In progress** — native `nano-corrections` evaluator + typed SF + units + exhaustive `Systematic` done; JME weights/variations being wired into the channel from the real `jet_jerc` payloads |
+| 3 — Semantic compiler | spec → semantic IR → validate → Rust codegen | **Core done** — `nano-spec` validate + derive `read_branches` + codegen, proven equal to hand-written (`nano-gen-demo`), incl. **inference codegen** (`nano-gen-tagger-demo`) |
+| 4 — Rust-native orchestration | typed workflow **DAG**: chunking, merging, provenance, staleness, datacards/plots | **Next frontier** — LAW backend **descoped**; target a Rust-native typed DAG directly ("parallelism-for-free" is the groundwork) |
+| 5 — Agentic integration | agent-operable harness, semantic-diff review, validation/repair | **Started** — `nano-cli` + `nano-mcp` expose the compiler-gated action space; review/repair loops are future |
 
-**We are squarely in Phase 1**, which is the correct foundation: every higher layer
-consumes the typed event kernel and the I/O boundary.
+Beyond the original plan, an **inference protocol** (`nano-inference`: mock / in-process
+ONNX / remote / self-launching server, declared as `[[model]]`) was added as a boundary
+layer.
+
+**Foundations (Phases 0–1) and the core of the semantic compiler (Phase 3) are in
+place; the next frontier is the Rust-native orchestrator (Phase 4).**
 
 ## Design decisions & refinements (stances taken for this project)
 
@@ -68,10 +72,16 @@ consumes the typed event kernel and the I/O boundary.
   a **native Rust evaluator** is realistic and removes a C++ dependency — aligns with the
   pure-Rust thesis. Either way, expose typed inputs (`MuonIdInput { pt, eta, year,
   variation }`), never `evaluate(vec![pt, eta, "nominal"])`.
-- **Defer the native orchestrator.** Phase 5 competes with mature tooling (LAW, batch
-  systems). Highest value-per-effort is the **Workflow IR + a LAW backend** (Phase 4);
-  treat the Rust-native engine as optional and later. Define the IR first so the backend
-  is swappable.
+- **Rust-native orchestrator; LAW descoped.** Earlier this doc deferred the native
+  engine in favour of a LAW backend. That is **reversed**: target a **Rust-native typed
+  workflow DAG directly** and drop the LAW backend. Rationale: the correctness/parallelism
+  result ("if it compiles, it's safe to parallelize") already gives a sound, typed
+  execution graph in-language; a separate LAW backend would re-export the IR to an external
+  Python orchestrator and reintroduce a heavy dependency, against the pure-Rust thesis.
+  Still define the workflow IR cleanly (chunking, merging, provenance, staleness) so a
+  batch/HTCondor *submission target* can sit under it later — but the orchestrator itself
+  is Rust-native, not LAW. (The existing C++ Condor builders remain a reference for
+  chunk/merge semantics.)
 - **Where the thesis pays off fastest:** typed kernel + typed corrections + the
   validation/golden-test layer. That trio delivers "agent writes, compiler+validation
   reject mistakes" without needing the full semantic compiler. Prove it on the muon
@@ -84,8 +94,9 @@ consumes the typed event kernel and the I/O boundary.
   confine advanced Rust to internal/generated code.
 - False confidence from compilation → Rust catches *implementation* errors, not physics;
   golden/closure tests and physics validation reports remain mandatory.
-- Rebuilding too much infra → LAW + existing batch/storage first; backend-independent IRs
-  before native alternatives.
+- Rebuilding too much infra → keep the workflow IR clean with a thin batch/HTCondor
+  *submission* target under the Rust-native orchestrator; don't reimplement storage/batch
+  systems, only the typed DAG and provenance/staleness on top of them.
 - Adoption → physicists edit specs and read reports, not Rust; keep ROOT-histogram /
   Combine-datacard outputs familiar.
 
