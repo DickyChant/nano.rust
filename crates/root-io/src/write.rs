@@ -235,11 +235,7 @@ struct TKeySpec {
 /// This intentionally covers the narrow NanoAOD bootstrap subset used by the
 /// in-tree reader: fixed-size scalar leaves, flattened `Vec<f32>` payloads,
 /// and one on-disk basket per branch.
-pub fn write_tree<P: AsRef<Path>>(
-    path: P,
-    tree_name: &str,
-    branches: &[Branch],
-) -> Result<()> {
+pub fn write_tree<P: AsRef<Path>>(path: P, tree_name: &str, branches: &[Branch]) -> Result<()> {
     if branches.is_empty() {
         return Err(RootError::other("cannot write a TTree without branches"));
     }

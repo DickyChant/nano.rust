@@ -10,8 +10,7 @@ use nom::{
 };
 
 use crate::{
-    core::parsers::*, core::types::*, tree_reader::container::Container,
-    tree_reader::leafs::TLeaf,
+    core::parsers::*, core::types::*, tree_reader::container::Container, tree_reader::leafs::TLeaf,
 };
 
 fn tiofeatures(i: &[u8]) -> IResult<&[u8], &[u8]> {
@@ -75,6 +74,31 @@ impl TBranch {
         &self.containers
     }
 
+    /// Total number of entries described by this branch.
+    pub fn total_entries(&self) -> i64 {
+        self.fentries
+    }
+
+    /// Number of baskets backing this branch.
+    pub fn basket_count(&self) -> usize {
+        self.containers.len()
+    }
+
+    /// First global entry index stored in basket `index`.
+    pub fn basket_first_entry(&self, index: usize) -> Option<i64> {
+        self.fbasketentry.get(index).copied()
+    }
+
+    /// Read and decompress basket `index`, returning its entry count and payload bytes.
+    pub async fn read_basket(&self, index: usize) -> crate::Result<(u32, Vec<u8>)> {
+        self.containers
+            .get(index)
+            .cloned()
+            .ok_or_else(|| crate::RootError::other(format!("basket {index} out of range")))?
+            .raw_data()
+            .await
+    }
+
     /// The name of this branch
     pub fn name(&self) -> String {
         self.name.to_owned()
@@ -83,10 +107,7 @@ impl TBranch {
     /// The type(s) of the elements in this branch For some reason,
     /// there may be situations where a branch has several leaves and thus types.
     pub fn element_types(&self) -> Vec<String> {
-        self.fleaves
-            .iter()
-            .map(TLeaf::type_name)
-            .collect()
+        self.fleaves.iter().map(TLeaf::type_name).collect()
     }
 
     /// Create an iterator over the data of a column (`TBranch`) with a

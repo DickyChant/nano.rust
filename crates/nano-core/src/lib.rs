@@ -14,12 +14,14 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::ops::Index;
+use std::rc::Rc;
 
 /// Convenient result alias for the core event model.
 pub type Result<T> = std::result::Result<T, NanoError>;
 
 type AnyMap = HashMap<String, Box<dyn Any>>;
 type ObjectExtraMap = HashMap<String, HashMap<usize, AnyMap>>;
+pub type BranchColumns = HashMap<String, BranchColumn>;
 
 /// Split a NanoAOD branch name into `(object, attribute)` per the grouping rule.
 ///
@@ -359,9 +361,10 @@ impl BranchColumn {
 
 /// Per-entry context, branch-backed values, and dynamic event/object extras.
 pub struct Event {
-    schema: BranchSchema,
-    columns: HashMap<String, BranchColumn>,
+    schema: Rc<BranchSchema>,
+    columns: Rc<BranchColumns>,
     entry: usize,
+    row_index: usize,
     attachments: RefCell<AnyMap>,
     object_attachments: RefCell<ObjectExtraMap>,
 }
@@ -376,8 +379,29 @@ impl Event {
         let columns = columns
             .into_iter()
             .map(|(name, column)| (name.into(), column))
-            .collect::<HashMap<_, _>>();
+            .collect::<BranchColumns>();
 
+        Self::from_shared_columns(Rc::new(schema), Rc::new(columns), entry)
+    }
+
+    /// Construct one event view over shared in-memory column buffers.
+    pub fn from_shared_columns(
+        schema: Rc<BranchSchema>,
+        columns: Rc<BranchColumns>,
+        entry: usize,
+    ) -> Result<Self> {
+        Self::from_shared_columns_at(schema, columns, entry, entry)
+    }
+
+    /// Construct one event view over shared column buffers using a separate
+    /// row index into those buffers. Streaming readers use this when a chunk's
+    /// first row corresponds to a non-zero global tree entry.
+    pub fn from_shared_columns_at(
+        schema: Rc<BranchSchema>,
+        columns: Rc<BranchColumns>,
+        entry: usize,
+        row_index: usize,
+    ) -> Result<Self> {
         for spec in schema.specs() {
             match columns.get(&spec.name) {
                 Some(column) if column.branch_type() != spec.branch_type => {
@@ -387,10 +411,10 @@ impl Event {
                         actual: column.branch_type(),
                     });
                 }
-                Some(column) if entry >= column.len() => {
+                Some(column) if row_index >= column.len() => {
                     return Err(NanoError::EntryOutOfRange {
                         branch: spec.name.clone(),
-                        entry,
+                        entry: row_index,
                         len: column.len(),
                     });
                 }
@@ -408,6 +432,7 @@ impl Event {
             schema,
             columns,
             entry,
+            row_index,
             attachments: RefCell::new(HashMap::new()),
             object_attachments: RefCell::new(HashMap::new()),
         })
@@ -433,7 +458,7 @@ impl Event {
     pub fn scalar<T: ScalarValue>(&self, branch_name: impl AsRef<str>) -> Result<T> {
         let branch_name = branch_name.as_ref();
         let column = self.column(branch_name)?;
-        T::get_scalar(column, self.entry).ok_or_else(|| NanoError::TypeMismatch {
+        T::get_scalar(column, self.row_index).ok_or_else(|| NanoError::TypeMismatch {
             name: branch_name.to_string(),
             expected: T::TYPE_NAME,
         })
@@ -443,7 +468,7 @@ impl Event {
     pub fn vector<T: ObjectValue>(&self, branch_name: impl AsRef<str>) -> Result<Vec<T>> {
         let branch_name = branch_name.as_ref();
         let column = self.column(branch_name)?;
-        T::get_vector(column, self.entry).ok_or_else(|| NanoError::TypeMismatch {
+        T::get_vector(column, self.row_index).ok_or_else(|| NanoError::TypeMismatch {
             name: branch_name.to_string(),
             expected: T::VECTOR_TYPE_NAME,
         })
@@ -456,7 +481,7 @@ impl Event {
     pub fn vector_ref<T: VectorSliceValue>(&self, branch_name: impl AsRef<str>) -> Result<&[T]> {
         let branch_name = branch_name.as_ref();
         let column = self.column(branch_name)?;
-        T::get_vector_slice(column, self.entry).ok_or_else(|| NanoError::TypeMismatch {
+        T::get_vector_slice(column, self.row_index).ok_or_else(|| NanoError::TypeMismatch {
             name: branch_name.to_string(),
             expected: T::VECTOR_TYPE_NAME,
         })
@@ -475,7 +500,7 @@ impl Event {
             .into_iter()
             .filter_map(|attr| self.schema.find(format!("{canonical}_{attr}")))
             .filter_map(|info| self.columns.get(&info.full_name))
-            .filter_map(|column| column.vector_len_at(self.entry))
+            .filter_map(|column| column.vector_len_at(self.row_index))
             .max()
             .unwrap_or(0);
 
@@ -612,9 +637,11 @@ impl<'a> ObjectView<'a> {
 
         let branch_name = format!("{}_{}", self.object_name, attr);
         let column = self.event.column(&branch_name)?;
-        T::get_object(column, self.event.entry, self.index).ok_or_else(|| NanoError::TypeMismatch {
-            name: branch_name,
-            expected: T::TYPE_NAME,
+        T::get_object(column, self.event.row_index, self.index).ok_or_else(|| {
+            NanoError::TypeMismatch {
+                name: branch_name,
+                expected: T::TYPE_NAME,
+            }
         })
     }
 

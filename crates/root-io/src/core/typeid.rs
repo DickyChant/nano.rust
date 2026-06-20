@@ -39,25 +39,25 @@ pub(crate) enum StlTypeID {
 /// ID describing a primitive type. This is a subset (1..19) of the integers used for `TypeID`.
 #[derive(Debug, Clone)]
 pub(crate) enum PrimitiveID {
-    KChar,                    // 1 => "i8"
-    KShort,                   // 2 => "i16"
-    KInt,                     // 3 => i32
-    KCounter,                 // 6 => i32
-    KLong,                    // 4 => "i64"
-    KFloat,                   // 5 => "f32"
-    KCharStar,                // 7 => "&'s str"
-    KDouble,                  // 8 => "f64"
-    KDouble32,                // 9 => "f64"
-    KLegacyChar,              // 10 => unimplemented!()
-    KUChar,                   // 11 => "u8"
-    KUShort,                  // 12 => "u16"
-    KUInt,                    // 13 => "u32"
-    KULong,                   // 14 => "u64"
-    KBits,                    // 15 => "u32"
-    KLong64,                  // 16 => "i64"
-    KULong64,                 // 17 => "u64"
-    KBool,                    // 18 => "u8"
-    KFloat16,                 // 19 => unimplemented!()
+    KChar,       // 1 => "i8"
+    KShort,      // 2 => "i16"
+    KInt,        // 3 => i32
+    KCounter,    // 6 => i32
+    KLong,       // 4 => "i64"
+    KFloat,      // 5 => "f32"
+    KCharStar,   // 7 => "&'s str"
+    KDouble,     // 8 => "f64"
+    KDouble32,   // 9 => "f64"
+    KLegacyChar, // 10 => unimplemented!()
+    KUChar,      // 11 => "u8"
+    KUShort,     // 12 => "u16"
+    KUInt,       // 13 => "u32"
+    KULong,      // 14 => "u64"
+    KBits,       // 15 => "u32"
+    KLong64,     // 16 => "i64"
+    KULong64,    // 17 => "u64"
+    KBool,       // 18 => "u8"
+    KFloat16,    // 19 => unimplemented!()
 }
 
 impl PrimitiveID {

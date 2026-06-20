@@ -42,7 +42,10 @@ fn reads_first_entries_of_real_nanoaod() {
             .collect()
             .await;
         assert_eq!(n_muon.len(), 5, "expected at least 5 entries");
-        assert!(n_muon.iter().all(|&n| n < 100), "implausible nMuon: {n_muon:?}");
+        assert!(
+            n_muon.iter().all(|&n| n < 100),
+            "implausible nMuon: {n_muon:?}"
+        );
 
         // Jagged read for those same entries, using nMuon as the per-entry count.
         let muon_pt: Vec<Vec<f32>> = tree

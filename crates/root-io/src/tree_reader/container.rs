@@ -47,9 +47,9 @@ fn tbasket2vec(input: &[u8]) -> IResult<&[u8], (u32, Vec<u8>)> {
     let (input, _flag) = be_i8(input)?;
     let (input, buf) = rest(input)?;
     let buf = if hdr.uncomp_len as usize > buf.len() {
-        decompress(buf)
-            .map(|(_, out)| out)
-            .map_err(|_| nom::Err::Failure(nom::error::Error::new(input, error::ErrorKind::MapRes)))?
+        decompress(buf).map(|(_, out)| out).map_err(|_| {
+            nom::Err::Failure(nom::error::Error::new(input, error::ErrorKind::MapRes))
+        })?
     } else {
         buf.to_vec()
     };

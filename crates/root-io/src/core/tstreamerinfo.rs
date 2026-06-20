@@ -2,7 +2,7 @@ use std::fmt::Debug;
 
 use nom::{combinator::eof, multi::length_value, number::complete::*, IResult};
 
-use crate::{core::*, core::tstreamer::type_is_core};
+use crate::{core::tstreamer::type_is_core, core::*};
 
 #[derive(Debug)]
 #[allow(dead_code)]

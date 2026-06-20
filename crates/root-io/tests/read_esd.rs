@@ -10,8 +10,7 @@ use root_io::{
     core::parsers::{parse_custom_mantissa, parse_tobjarray_of_tnameds},
     stream_zip,
     tree_reader::Tree,
-    Result,
-    RootFile,
+    Result, RootFile,
 };
 
 /// A model for the / a subset of the ESD data

@@ -17,9 +17,9 @@
 #![recursion_limit = "256"]
 #[macro_use]
 extern crate bitflags;
-extern crate nom;
 extern crate flate2;
 extern crate lzma_rs;
+extern crate nom;
 #[cfg(feature = "remote")]
 extern crate reqwest;
 

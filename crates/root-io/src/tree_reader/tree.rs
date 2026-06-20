@@ -17,8 +17,7 @@ fn tiofeatures(i: &[u8]) -> IResult<&[u8], &[u8]> {
 
 use crate::{
     core::parsers::*, core::types::*, tree_reader::branch::tbranch_hdr,
-    tree_reader::branch::TBranch, tree_reader::leafs::TLeaf,
-    Result, RootError,
+    tree_reader::branch::TBranch, tree_reader::leafs::TLeaf, Result, RootError,
 };
 
 /// `TTree` potentially has members with very large `Vec<u8>` buffers
@@ -95,6 +94,11 @@ pub struct Tree {
 }
 
 impl Tree {
+    /// Total number of entries in this tree.
+    pub fn entries(&self) -> i64 {
+        self.fentries
+    }
+
     /// Get all branches of a tree (including nested ones)
     pub(crate) fn branches(&self) -> Vec<&TBranch> {
         self.fbranches

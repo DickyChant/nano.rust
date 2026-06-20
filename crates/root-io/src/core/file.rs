@@ -10,12 +10,7 @@ use nom::{
 
 use uuid::Uuid;
 
-use crate::{
-    core::tstreamer::streamers,
-    core::*,
-    Result, RootError,
-    MAP_OFFSET,
-};
+use crate::{core::tstreamer::streamers, core::*, Result, RootError, MAP_OFFSET};
 
 /// Size of serialized `FileHeader` in bytes
 const FILE_HEADER_SIZE: u64 = 75;
@@ -219,7 +214,6 @@ impl RootFile {
         }
         Ok(())
     }
-
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
