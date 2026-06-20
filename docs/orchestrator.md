@@ -98,9 +98,44 @@ Serial vs parallel producing bit-identical output is an **assertion the
 executor checks**, not a hope — the same discipline as the `bench_parallel`
 demo, lifted to the workflow.
 
-A later **submission target** (local thread pool now; a thin HTCondor/SLURM
-mapper later) assigns independent map nodes to jobs. The target is swappable
-*under* the DAG; the graph and its guarantees do not change. No LAW.
+## The DAG is the IR; executors are pluggable backends
+
+We do **not** build our own distributed scheduler, and there is **no** batch
+(HTCondor/SLURM/LAW) integration baked in. Instead, the typed DAG is a
+**backend-independent intermediate representation**, and execution is delegated
+to whatever modern system the user already runs — Dask, Ray, or anything else.
+A clean DAG is intrinsically friendly to any executor; we just have to expose it
+as one.
+
+Two pure-Rust pieces make that work:
+
+1. **A portable serialization** of the `WorkflowPlan` — JSON listing nodes,
+   dependency edges, and each task's spec (input source + entry range +
+   kernel/spec id). Any orchestrator can ingest this; it is the interchange
+   format.
+2. **A standalone task unit** — Rust entry points that execute *one* node
+   without the orchestrator: `run-chunk` (read a chunk → run the kernel →
+   write a serialized `PartialOutput`) and `merge` (reduce partials → merged
+   output / skim). This is the atom an external scheduler invokes; the verified
+   Rust kernel stays the unit of compute, so correctness/parallelism guarantees
+   travel with it regardless of who schedules.
+
+Backends, all running the *same* DAG to the *same* result:
+
+- **Local** (`Executor`, built) — in-process serial or rayon-parallel, with the
+  serial==parallel assertion.
+- **Dask / Ray** (adapters) — a thin (~30-line) Python shim reads the portable
+  graph and submits each `run-chunk`/`merge` unit as a `dask.delayed` /
+  `ray.remote` task, inheriting their clusters, autoscaling, and dashboards. The
+  Python is a *boundary adapter* (like uproot in tests), not a runtime
+  dependency — the compute is the Rust atom it shells out to.
+- **Anything else** — because the graph is JSON and the unit is a CLI
+  invocation, Airflow, Snakemake, Nextflow, k8s Jobs, or a plain `Makefile` can
+  drive it too. No backend is privileged; none is required.
+
+The guarantees (node order, staleness, provenance, sound parallel schedule) live
+in the IR and the Rust atom, so they hold under every backend — the scheduler
+only decides *where/when* tasks run, never *what* they compute.
 
 ## How it connects to the rest
 
@@ -111,7 +146,7 @@ mapper later) assigns independent map nodes to jobs. The target is swappable
   `nano run <spec> --inputs <list> [--systematics all]` builds and executes the
   DAG — the CLI/MCP "run" verb on top of the same compiler-gated action space.
 
-## First implementable slice (`nano-workflow`)
+## Slice 1 — typed DAG + local executor (`nano-workflow`) — **built**
 
 Deliberately narrow, end-to-end, hermetic:
 
@@ -129,7 +164,30 @@ Deliberately narrow, end-to-end, hermetic:
    over it serial vs parallel (identical), run twice (second run skips), and
    check the merged skim equals the single-pass `MuonProducer` result.
 
-Deferred: systematic fan-out beyond one reduce-per-`Systematic`, the HTCondor
-submission target, datacards/plots, and a graphical DAG view. Keep the typed
-graph small and load-bearing — the guarantees (order, staleness, provenance,
-sound parallel schedule), not a general workflow engine.
+## Slice 2 — portable IR + standalone task unit + Dask/Ray adapters
+
+Make the DAG executor-agnostic:
+
+1. **Portable export** — `WorkflowPlan` → a versioned JSON `PortableGraph`
+   (`serde`): nodes, dependency edges, and per-task specs (source, entry range,
+   kernel/spec id, output path). Round-trips back so our `Executor` can run an
+   imported graph too.
+2. **Standalone task unit** — CLI/library entry points that run *one* node with
+   no orchestrator: `run-chunk` (read chunk → kernel → write serialized
+   `PartialOutput`) and `merge` (reduce partials → `MergedOutput`/skim). These
+   are the atoms any scheduler invokes; they reuse the exact `nano-workflow`
+   compute so results match the local executor bit-for-bit.
+3. **Adapters** — a thin Python shim (`integrations/`) that reads `PortableGraph`
+   and submits each unit as `dask.delayed` / `ray.remote` tasks. Not CI-gated on
+   Dask/Ray being installed; a documented, runnable example. The compute is the
+   Rust atom it shells out to.
+4. Tests (hermetic, Rust): export → re-import → run → equals the in-memory
+   plan's `MergedOutput`; `run-chunk` + `merge` composed by hand equals the
+   single-pass result (proving the atoms are faithful). The Python adapter is
+   demonstrated, not unit-tested in CI.
+
+Deferred: systematic fan-out beyond one reduce-per-`Systematic`, datacards/plots,
+a graphical DAG view, and any *built-in* distributed scheduler (we delegate to
+Dask/Ray/etc. instead). Keep the typed graph small and load-bearing — the
+guarantees (order, staleness, provenance, sound parallel schedule), not a general
+workflow engine.

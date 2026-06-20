@@ -44,7 +44,7 @@ layer. The analysis *meaning* lives in the typed IR, independent of any backend.
 | 1 — Minimal Rust kernel | reader, typed schema, selection, histograms | **Done (one debt)** — `nano-rootio` (read **+ write**, local **+ remote**), `nano-core`, `nano-io`, `nano-producers` (muon), `nano-analysis` (`Hist1D`, typestate). Debt: golden test vs the frozen `.root` references not wired yet |
 | 2 — Corrections & systematics | correctionlib, typed SF, weights, variations | **Mostly done** — native `nano-corrections` evaluator + typed SF + units + exhaustive `Systematic`; **JME weights + all five shape variations wired into the channel from the real `jet_jerc` payloads**, carried by `Weighted<R>`. Remaining: full four-vector JES/JER propagation (current slice is bookkeeping-weight scaffolding) + PU/muon-SF payloads |
 | 3 — Semantic compiler | spec → semantic IR → validate → Rust codegen | **Core done** — `nano-spec` validate + derive `read_branches` + codegen, proven equal to hand-written (`nano-gen-demo`), incl. **inference codegen** (`nano-gen-tagger-demo`) |
-| 4 — Rust-native orchestration | typed workflow **DAG**: chunking, merging, provenance, staleness, datacards/plots | **Next frontier** — LAW backend **descoped**; target a Rust-native typed DAG directly ("parallelism-for-free" is the groundwork) |
+| 4 — Workflow DAG (executor-agnostic) | typed workflow **DAG** as a portable IR: chunking, merging, provenance, staleness | **In progress** — `nano-workflow` typed DAG + local serial/parallel executor built; portable JSON export + standalone task unit + **Dask/Ray adapters** next. No built-in scheduler (LAW/HTCondor descoped) — the DAG is delegated to Dask/Ray/any system |
 | 5 — Agentic integration | agent-operable harness, semantic-diff review, validation/repair | **Started** — `nano-cli` + `nano-mcp` expose the compiler-gated action space; review/repair loops are future |
 
 Beyond the original plan, an **inference protocol** (`nano-inference`: mock / in-process
@@ -72,16 +72,18 @@ place; the next frontier is the Rust-native orchestrator (Phase 4).**
   a **native Rust evaluator** is realistic and removes a C++ dependency — aligns with the
   pure-Rust thesis. Either way, expose typed inputs (`MuonIdInput { pt, eta, year,
   variation }`), never `evaluate(vec![pt, eta, "nominal"])`.
-- **Rust-native orchestrator; LAW descoped.** Earlier this doc deferred the native
-  engine in favour of a LAW backend. That is **reversed**: target a **Rust-native typed
-  workflow DAG directly** and drop the LAW backend. Rationale: the correctness/parallelism
-  result ("if it compiles, it's safe to parallelize") already gives a sound, typed
-  execution graph in-language; a separate LAW backend would re-export the IR to an external
-  Python orchestrator and reintroduce a heavy dependency, against the pure-Rust thesis.
-  Still define the workflow IR cleanly (chunking, merging, provenance, staleness) so a
-  batch/HTCondor *submission target* can sit under it later — but the orchestrator itself
-  is Rust-native, not LAW. (The existing C++ Condor builders remain a reference for
-  chunk/merge semantics.)
+- **Workflow DAG as a portable IR; delegate execution; LAW descoped.** The workflow
+  layer is a **Rust-native typed DAG** — but we do **not** build our own distributed
+  scheduler, and there is no LAW/HTCondor backend baked in. The DAG is a backend-independent
+  **IR** (with a portable JSON export and a standalone Rust task unit per node); execution
+  is **delegated to modern systems the user already runs — Dask, Ray, or any other** (the
+  graph is JSON + a CLI atom, so Airflow/Snakemake/k8s/`make` work too). Rationale: the
+  correctness/parallelism result ("if it compiles, it's safe to parallelize") makes the
+  Rust per-chunk kernel a sound, self-contained atom; once it is, *who* schedules it is a
+  swappable backend, and reusing Dask/Ray beats reimplementing a scheduler. The guarantees
+  (order, staleness, provenance, sound parallel schedule) live in the IR + atom, so they
+  hold under every backend. (See `docs/orchestrator.md`; the C++ Condor builders remain a
+  reference for chunk/merge semantics.)
 - **Where the thesis pays off fastest:** typed kernel + typed corrections + the
   validation/golden-test layer. That trio delivers "agent writes, compiler+validation
   reject mistakes" without needing the full semantic compiler. Prove it on the muon
