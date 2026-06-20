@@ -54,6 +54,25 @@ def build_stamp() -> str:
 
 BUILD_STAMP = build_stamp()
 
+
+def last_commit_date(path: Path) -> str:
+    """Last commit date (YYYY-MM-DD) that touched `path`, or "" if unavailable.
+
+    Used for blog "updated" dates (editorial versioning). Needs full git history:
+    a shallow CI clone dates every file to the latest commit, so docs.yml checks
+    out with fetch-depth: 0.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "log", "-1", "--format=%cs", "--", str(path)],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+        )
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
 NAV = (
     '<nav class="nav"><a href="{up}index.html">nano.rust</a> · '
     '<a href="{up}blog/index.html">blog</a> · '
@@ -97,7 +116,7 @@ def build() -> None:
     if RUSTDOC.exists():
         shutil.copytree(RUSTDOC, PUBLIC / "api")
 
-    # blog -> /blog
+    # blog -> /blog  (editorial versioning: published slug-date + git-derived updated)
     blog_out = PUBLIC / "blog"
     blog_out.mkdir(parents=True, exist_ok=True)
     posts = []
@@ -106,14 +125,20 @@ def build() -> None:
         m = re.search(r"^#\s+(.+)$", text, re.M)
         title = m.group(1).strip() if m else md_path.stem
         dm = re.match(r"(\d{4}-\d{2}-\d{2})", md_path.name)
-        date = dm.group(1) if dm else ""
+        published = dm.group(1) if dm else ""
+        updated = last_commit_date(md_path)
+        # show "updated" only when a later revision exists
+        revised = updated if (updated and published and updated > published) else ""
+        date_html = f'published {published}' if published else ""
+        if revised:
+            date_html += f' · updated {revised}'
         body = markdown.markdown(text, extensions=["fenced_code", "tables"])
         (blog_out / f"{md_path.stem}.html").write_text(page(title, body, 1))
-        posts.append((date, title, f"{md_path.stem}.html"))
+        posts.append((published, date_html, title, f"{md_path.stem}.html"))
 
     items = "\n".join(
-        f'<li><a href="{href}">{title}</a><div class="date">{date}</div></li>'
-        for date, title, href in posts
+        f'<li><a href="{href}">{title}</a><div class="date">{date_html}</div></li>'
+        for _published, date_html, title, href in posts
     )
     index_body = (
         "<h1>Notes / blog</h1>"
