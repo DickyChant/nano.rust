@@ -1,0 +1,19 @@
+[package]
+name = "nano-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP stdio server exposing nano.rust verified operations as agent tools"
+
+[[bin]]
+name = "nano-mcp"
+path = "src/main.rs"
+
+[dependencies]
+nano-core = { workspace = true }
+nano-io = { workspace = true }
+nano-rootio = { workspace = true }
+nano-spec = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -22,3 +22,4 @@ nano-corrections = { path = "crates/nano-corrections" }
 nano-spec = { path = "crates/nano-spec" }
 nano-gen-demo = { path = "crates/nano-gen-demo" }
 nano-cli = { path = "crates/nano-cli" }
+nano-mcp = { path = "crates/nano-mcp" }
