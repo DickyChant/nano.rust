@@ -1,0 +1,14 @@
+[analysis]
+name = "broken_muon_demo"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = ["pt > 30", "abs(nope) < 2.4"]
+
+[regions.signal]
+require = ["count(ghost_muon) >= 1"]
+
+[[outputs]]
+name = "lead_muon_pt"
+expr = "leading(good_muon).pt"

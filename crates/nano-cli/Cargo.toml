@@ -1,0 +1,18 @@
+[package]
+name = "nano-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent-operable CLI for typed nano.rust validation, planning, inspection, and codegen"
+
+[[bin]]
+name = "nano"
+path = "src/main.rs"
+
+[dependencies]
+nano-core = { workspace = true }
+nano-rootio = { workspace = true }
+nano-spec = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

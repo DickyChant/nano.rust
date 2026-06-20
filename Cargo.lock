@@ -526,6 +526,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-cli"
+version = "0.0.0"
+dependencies = [
+ "nano-core",
+ "nano-rootio",
+ "nano-spec",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nano-core"
 version = "0.0.0"
 
