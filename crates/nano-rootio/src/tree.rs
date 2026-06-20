@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::ops::Range;
 
 use crate::decompress::decompress_root_blocks;
 use crate::error::{Error, Result};
@@ -17,6 +18,7 @@ pub struct LeafInfo {
     pub element_size: i32,
     pub is_unsigned: bool,
     pub has_leaf_count: bool,
+    pub leaf_count_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,61 @@ pub struct Tree {
     name: String,
     entries: i64,
     branches: Vec<Branch>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnRequest {
+    ScalarF32(String),
+    ScalarF64(String),
+    ScalarI32(String),
+    ScalarI64(String),
+    ScalarU32(String),
+    ScalarU64(String),
+    Bool(String),
+    JaggedF32 { branch: String, counter: String },
+    JaggedF64 { branch: String, counter: String },
+    JaggedI32 { branch: String, counter: String },
+    JaggedI64 { branch: String, counter: String },
+    JaggedU32 { branch: String, counter: String },
+    JaggedU64 { branch: String, counter: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnData {
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+    Bool(Vec<bool>),
+    JaggedF32(Vec<Vec<f32>>),
+    JaggedF64(Vec<Vec<f64>>),
+    JaggedI32(Vec<Vec<i32>>),
+    JaggedI64(Vec<Vec<i64>>),
+    JaggedU32(Vec<Vec<u32>>),
+    JaggedU64(Vec<Vec<u64>>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnChunk {
+    pub name: String,
+    pub data: ColumnData,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeChunk {
+    pub start: i64,
+    pub len: usize,
+    pub columns: Vec<ColumnChunk>,
+}
+
+pub struct ChunkedReader<'a> {
+    tree: &'a Tree,
+    requests: Vec<ColumnRequest>,
+    next: i64,
+    end: i64,
+    chunk_size: usize,
 }
 
 pub trait Scalar: Sized + Copy + Debug + PartialEq + 'static {
@@ -99,6 +156,14 @@ impl Scalar for f32 {
     }
 }
 
+impl Scalar for f64 {
+    const TYPE_NAME: &'static str = "f64";
+    const WIDTH: usize = 8;
+    fn decode(bytes: &[u8]) -> Self {
+        f64::from_bits(u64::from_be_bytes(bytes.try_into().unwrap()))
+    }
+}
+
 impl Scalar for bool {
     const TYPE_NAME: &'static str = "bool";
     const WIDTH: usize = 1;
@@ -133,11 +198,17 @@ impl Tree {
     }
 
     pub fn read_scalar<T: Scalar>(&self, branch_name: &str) -> Result<Vec<T>> {
-        let branch = self
-            .branch_refs()
-            .into_iter()
-            .find(|branch| branch.name == branch_name)
-            .ok_or_else(|| Error::MissingBranch(branch_name.to_string()))?;
+        let branch = self.find_branch(branch_name)?;
+        self.read_scalar_range(branch_name, 0, branch.entries.max(0) as usize)
+    }
+
+    pub fn read_scalar_range<T: Scalar>(
+        &self,
+        branch_name: &str,
+        start: i64,
+        len: usize,
+    ) -> Result<Vec<T>> {
+        let branch = self.find_branch(branch_name)?;
         let leaf = branch.scalar_leaf()?;
         if leaf.type_name != T::TYPE_NAME {
             return Err(Error::TypeMismatch {
@@ -146,8 +217,16 @@ impl Tree {
                 requested: T::TYPE_NAME,
             });
         }
-        let mut out = Vec::with_capacity(branch.entries.max(0) as usize);
-        for basket in &branch.baskets {
+        let range = checked_window(branch.entries, start, len)?;
+        let mut out = Vec::with_capacity(range_len(&range));
+        for basket_index in branch.overlapping_basket_indices(&range) {
+            let basket_start = branch.basket_start(basket_index)?;
+            let basket_end = branch.basket_end(basket_index)?;
+            let overlap_start = range.start.max(basket_start);
+            let overlap_end = range.end.min(basket_end);
+            let local_start = usize::try_from(overlap_start - basket_start).unwrap();
+            let local_len = usize::try_from(overlap_end - overlap_start).unwrap();
+            let basket = &branch.baskets[basket_index];
             let (entries, payload) = read_basket_payload(basket)?;
             let need = entries as usize * T::WIDTH;
             if payload.len() < need {
@@ -156,12 +235,253 @@ impl Tree {
                     format!("basket for {branch_name} needs {need} bytes"),
                 ));
             }
-            for chunk in payload[..need].chunks_exact(T::WIDTH) {
+            let byte_start = local_start
+                .checked_mul(T::WIDTH)
+                .ok_or_else(|| Error::parse(0, "scalar basket byte offset overflow"))?;
+            let byte_len = local_len
+                .checked_mul(T::WIDTH)
+                .ok_or_else(|| Error::parse(0, "scalar basket byte length overflow"))?;
+            let byte_end = byte_start
+                .checked_add(byte_len)
+                .ok_or_else(|| Error::parse(0, "scalar basket byte range overflow"))?;
+            if byte_end > payload.len() {
+                return Err(Error::parse(
+                    payload.len(),
+                    format!("basket for {branch_name} lacks requested byte range"),
+                ));
+            }
+            for chunk in payload[byte_start..byte_end].chunks_exact(T::WIDTH) {
                 out.push(T::decode(chunk));
             }
         }
-        out.truncate(branch.entries.max(0) as usize);
         Ok(out)
+    }
+
+    pub fn read_jagged<T: Scalar>(
+        &self,
+        branch_name: &str,
+        counter_branch_name: &str,
+    ) -> Result<Vec<Vec<T>>> {
+        let branch = self.find_branch(branch_name)?;
+        self.read_jagged_range(
+            branch_name,
+            counter_branch_name,
+            0,
+            branch.entries.max(0) as usize,
+        )
+    }
+
+    pub fn read_jagged_auto<T: Scalar>(&self, branch_name: &str) -> Result<Vec<Vec<T>>> {
+        let counter = self
+            .find_branch(branch_name)?
+            .jagged_leaf::<T>()?
+            .leaf_count_name
+            .clone()
+            .ok_or_else(|| Error::unsupported(branch_name, "jagged leaf has no counter name"))?;
+        self.read_jagged(branch_name, &counter)
+    }
+
+    pub fn read_jagged_range<T: Scalar>(
+        &self,
+        branch_name: &str,
+        counter_branch_name: &str,
+        start: i64,
+        len: usize,
+    ) -> Result<Vec<Vec<T>>> {
+        let branch = self.find_branch(branch_name)?;
+        let _leaf = branch.jagged_leaf::<T>()?;
+        let counter = self.find_branch(counter_branch_name)?;
+        let counter_leaf = counter.scalar_leaf()?;
+        if counter_leaf.type_name != u32::TYPE_NAME {
+            return Err(Error::TypeMismatch {
+                branch: counter_branch_name.to_string(),
+                root_type: counter_leaf.type_name.clone(),
+                requested: u32::TYPE_NAME,
+            });
+        }
+        if branch.entries != counter.entries {
+            return Err(Error::unsupported(
+                branch_name,
+                format!(
+                    "jagged branch has {} entries but counter {counter_branch_name} has {}",
+                    branch.entries, counter.entries
+                ),
+            ));
+        }
+
+        let range = checked_window(branch.entries, start, len)?;
+        let mut out = Vec::with_capacity(range_len(&range));
+        for basket_index in branch.overlapping_basket_indices(&range) {
+            let basket_start = branch.basket_start(basket_index)?;
+            let basket_end = branch.basket_end(basket_index)?;
+            let overlap_start = range.start.max(basket_start);
+            let overlap_end = range.end.min(basket_end);
+            let counts_len = usize::try_from(overlap_end - basket_start).unwrap();
+            let counts =
+                self.read_scalar_range::<u32>(counter_branch_name, basket_start, counts_len)?;
+            let local_start = usize::try_from(overlap_start - basket_start).unwrap();
+            let overlap_len = usize::try_from(overlap_end - overlap_start).unwrap();
+            let prefix_elems = sum_counts(branch_name, &counts[..local_start])?;
+            let requested_counts = &counts[local_start..local_start + overlap_len];
+            let requested_elems = sum_counts(branch_name, requested_counts)?;
+
+            let (_, payload) = read_basket_payload(&branch.baskets[basket_index])?;
+            let byte_start = prefix_elems
+                .checked_mul(T::WIDTH)
+                .ok_or_else(|| Error::parse(0, "jagged basket byte offset overflow"))?;
+            let byte_len = requested_elems
+                .checked_mul(T::WIDTH)
+                .ok_or_else(|| Error::parse(0, "jagged basket byte length overflow"))?;
+            let byte_end = byte_start
+                .checked_add(byte_len)
+                .ok_or_else(|| Error::parse(0, "jagged basket byte range overflow"))?;
+            if byte_end > payload.len() {
+                return Err(Error::parse(
+                    payload.len(),
+                    format!("basket for {branch_name} lacks requested jagged byte range"),
+                ));
+            }
+            let mut pos = byte_start;
+            for &count in requested_counts {
+                let row_len = usize::try_from(count)
+                    .map_err(|_| Error::parse(0, "jagged counter overflows usize"))?;
+                let mut row = Vec::with_capacity(row_len);
+                for _ in 0..row_len {
+                    let next = pos + T::WIDTH;
+                    row.push(T::decode(&payload[pos..next]));
+                    pos = next;
+                }
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn read_jagged_range_auto<T: Scalar>(
+        &self,
+        branch_name: &str,
+        start: i64,
+        len: usize,
+    ) -> Result<Vec<Vec<T>>> {
+        let counter = self
+            .find_branch(branch_name)?
+            .jagged_leaf::<T>()?
+            .leaf_count_name
+            .clone()
+            .ok_or_else(|| Error::unsupported(branch_name, "jagged leaf has no counter name"))?;
+        self.read_jagged_range(branch_name, &counter, start, len)
+    }
+
+    pub fn read_chunk(
+        &self,
+        start: i64,
+        len: usize,
+        requests: &[ColumnRequest],
+    ) -> Result<TreeChunk> {
+        let range = checked_window(self.entries, start, len)?;
+        let len = range_len(&range);
+        let mut columns = Vec::with_capacity(requests.len());
+        for request in requests {
+            columns.push(self.read_column_chunk(range.start, len, request)?);
+        }
+        Ok(TreeChunk {
+            start: range.start,
+            len,
+            columns,
+        })
+    }
+
+    pub fn chunked_reader(
+        &self,
+        start: i64,
+        len: usize,
+        chunk_size: usize,
+        requests: Vec<ColumnRequest>,
+    ) -> Result<ChunkedReader<'_>> {
+        if chunk_size == 0 {
+            return Err(Error::unsupported(
+                "chunked reader",
+                "chunk size must be positive",
+            ));
+        }
+        let range = checked_window(self.entries, start, len)?;
+        Ok(ChunkedReader {
+            tree: self,
+            requests,
+            next: range.start,
+            end: range.end,
+            chunk_size,
+        })
+    }
+
+    fn read_column_chunk(
+        &self,
+        start: i64,
+        len: usize,
+        request: &ColumnRequest,
+    ) -> Result<ColumnChunk> {
+        let (name, data) = match request {
+            ColumnRequest::ScalarF32(name) => (
+                name.clone(),
+                ColumnData::F32(self.read_scalar_range(name, start, len)?),
+            ),
+            ColumnRequest::ScalarF64(name) => (
+                name.clone(),
+                ColumnData::F64(self.read_scalar_range(name, start, len)?),
+            ),
+            ColumnRequest::ScalarI32(name) => (
+                name.clone(),
+                ColumnData::I32(self.read_scalar_range(name, start, len)?),
+            ),
+            ColumnRequest::ScalarI64(name) => (
+                name.clone(),
+                ColumnData::I64(self.read_scalar_range(name, start, len)?),
+            ),
+            ColumnRequest::ScalarU32(name) => (
+                name.clone(),
+                ColumnData::U32(self.read_scalar_range(name, start, len)?),
+            ),
+            ColumnRequest::ScalarU64(name) => (
+                name.clone(),
+                ColumnData::U64(self.read_scalar_range(name, start, len)?),
+            ),
+            ColumnRequest::Bool(name) => (
+                name.clone(),
+                ColumnData::Bool(self.read_scalar_range(name, start, len)?),
+            ),
+            ColumnRequest::JaggedF32 { branch, counter } => (
+                branch.clone(),
+                ColumnData::JaggedF32(self.read_jagged_range(branch, counter, start, len)?),
+            ),
+            ColumnRequest::JaggedF64 { branch, counter } => (
+                branch.clone(),
+                ColumnData::JaggedF64(self.read_jagged_range(branch, counter, start, len)?),
+            ),
+            ColumnRequest::JaggedI32 { branch, counter } => (
+                branch.clone(),
+                ColumnData::JaggedI32(self.read_jagged_range(branch, counter, start, len)?),
+            ),
+            ColumnRequest::JaggedI64 { branch, counter } => (
+                branch.clone(),
+                ColumnData::JaggedI64(self.read_jagged_range(branch, counter, start, len)?),
+            ),
+            ColumnRequest::JaggedU32 { branch, counter } => (
+                branch.clone(),
+                ColumnData::JaggedU32(self.read_jagged_range(branch, counter, start, len)?),
+            ),
+            ColumnRequest::JaggedU64 { branch, counter } => (
+                branch.clone(),
+                ColumnData::JaggedU64(self.read_jagged_range(branch, counter, start, len)?),
+            ),
+        };
+        Ok(ColumnChunk { name, data })
+    }
+
+    fn find_branch(&self, branch_name: &str) -> Result<&Branch> {
+        self.branch_refs()
+            .into_iter()
+            .find(|branch| branch.name == branch_name)
+            .ok_or_else(|| Error::MissingBranch(branch_name.to_string()))
     }
 
     fn branch_refs(&self) -> Vec<&Branch> {
@@ -170,6 +490,21 @@ impl Tree {
             branch.collect_refs(&mut out);
         }
         out
+    }
+}
+
+impl Iterator for ChunkedReader<'_> {
+    type Item = Result<TreeChunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.end {
+            return None;
+        }
+        let remaining = usize::try_from(self.end - self.next).ok()?;
+        let len = remaining.min(self.chunk_size);
+        let start = self.next;
+        self.next += len as i64;
+        Some(self.tree.read_chunk(start, len, &self.requests))
     }
 }
 
@@ -201,11 +536,99 @@ impl Branch {
         if leaf.has_leaf_count {
             return Err(Error::unsupported(
                 &self.name,
-                "jagged leaf-count branches are P2 scope",
+                "leaf-count branch must be read with read_jagged",
             ));
         }
         Ok(leaf)
     }
+
+    fn jagged_leaf<T: Scalar>(&self) -> Result<&LeafInfo> {
+        let [leaf] = self.leaves.as_slice() else {
+            return Err(Error::unsupported(
+                &self.name,
+                format!("expected exactly one leaf, found {}", self.leaves.len()),
+            ));
+        };
+        if leaf.type_name != T::TYPE_NAME {
+            return Err(Error::TypeMismatch {
+                branch: self.name.clone(),
+                root_type: leaf.type_name.clone(),
+                requested: T::TYPE_NAME,
+            });
+        }
+        if !leaf.has_leaf_count {
+            return Err(Error::unsupported(
+                &self.name,
+                "branch has no leaf-count metadata",
+            ));
+        }
+        Ok(leaf)
+    }
+
+    fn basket_start(&self, index: usize) -> Result<i64> {
+        self.basket_entry
+            .get(index)
+            .copied()
+            .ok_or_else(|| Error::parse(0, format!("missing basket {index} first-entry metadata")))
+    }
+
+    fn basket_end(&self, index: usize) -> Result<i64> {
+        if index + 1 < self.basket_entry.len() {
+            Ok(self.basket_entry[index + 1])
+        } else {
+            Ok(self.entries)
+        }
+    }
+
+    fn overlapping_basket_indices(&self, range: &Range<i64>) -> Vec<usize> {
+        if range.start == range.end {
+            return Vec::new();
+        }
+        (0..self.baskets.len().min(self.basket_entry.len()))
+            .filter(|&index| {
+                let start = self.basket_entry[index];
+                let end = if index + 1 < self.basket_entry.len() {
+                    self.basket_entry[index + 1]
+                } else {
+                    self.entries
+                };
+                start < range.end && end > range.start
+            })
+            .collect()
+    }
+}
+
+fn checked_window(entries: i64, start: i64, len: usize) -> Result<Range<i64>> {
+    if start < 0 {
+        return Err(Error::parse(0, format!("negative entry start {start}")));
+    }
+    let len_i64 = i64::try_from(len)
+        .map_err(|_| Error::parse(0, format!("entry window length {len} overflows i64")))?;
+    let end = start
+        .checked_add(len_i64)
+        .ok_or_else(|| Error::parse(0, "entry window end overflows i64"))?;
+    if end > entries {
+        return Err(Error::parse(
+            0,
+            format!("entry window [{start}, {end}) exceeds branch entries {entries}"),
+        ));
+    }
+    Ok(start..end)
+}
+
+fn range_len(range: &Range<i64>) -> usize {
+    usize::try_from(range.end - range.start).unwrap_or(0)
+}
+
+fn sum_counts(branch_name: &str, counts: &[u32]) -> Result<usize> {
+    counts.iter().try_fold(0_usize, |acc, &count| {
+        acc.checked_add(count as usize).ok_or_else(|| {
+            Error::parse(
+                0,
+                format!("jagged element count overflow while reading {branch_name}"),
+            )
+        })
+    })
 }
 
 pub(crate) fn parse_tree<'a>(
@@ -488,7 +911,8 @@ where
         len: base.len,
         element_size: base.element_size,
         is_unsigned: base.is_unsigned,
-        has_leaf_count: base.has_leaf_count,
+        has_leaf_count: base.leaf_count_name.is_some(),
+        leaf_count_name: base.leaf_count_name,
     })
 }
 
@@ -515,7 +939,8 @@ fn parse_leaf_element<'a>(
         len: base.len,
         element_size: base.element_size,
         is_unsigned: matches!(type_name, "u8" | "u16" | "u32" | "u64"),
-        has_leaf_count: base.has_leaf_count,
+        has_leaf_count: base.leaf_count_name.is_some(),
+        leaf_count_name: base.leaf_count_name,
     })
 }
 
@@ -524,7 +949,7 @@ struct LeafBase {
     len: i32,
     element_size: i32,
     is_unsigned: bool,
-    has_leaf_count: bool,
+    leaf_count_name: Option<String>,
 }
 
 fn parse_leaf_base<'a>(cur: &mut Cursor<'a>, ctx: &ObjectContext<'a>) -> Result<LeafBase> {
@@ -537,19 +962,19 @@ fn parse_leaf_base<'a>(cur: &mut Cursor<'a>, ctx: &ObjectContext<'a>) -> Result<
     let _offset = base_payload.i32()?;
     let _is_range = base_payload.bool()?;
     let is_unsigned = base_payload.bool()?;
-    let has_leaf_count = if base_payload.peek_u32()? == 0 {
+    let leaf_count_name = if base_payload.peek_u32()? == 0 {
         let _ = base_payload.u32()?;
-        false
+        None
     } else {
-        let _ = read_raw(&mut base_payload, ctx)?;
-        true
+        let raw = read_raw(&mut base_payload, ctx)?;
+        Some(parse_leaf(raw, ctx)?.name)
     };
     Ok(LeafBase {
         name: named.name,
         len,
         element_size,
         is_unsigned,
-        has_leaf_count,
+        leaf_count_name,
     })
 }
 

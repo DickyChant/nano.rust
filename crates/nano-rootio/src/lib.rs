@@ -1,10 +1,10 @@
 //! Synchronous, NanoAOD-focused ROOT reader.
 //!
 //! This crate is the first strangler phase for the owned ROOT I/O core.  It
-//! deliberately implements only the read foundation: local TFile/TKey/TTree
-//! parsing, ROOT compressed block decoding, and scalar fixed-size branch reads.
-//! Jagged branches, general object streaming, and writing are intentionally out
-//! of scope for this phase.
+//! implements local TFile/TKey/TTree parsing, ROOT compressed block decoding,
+//! scalar and NanoAOD-style leaf-count jagged branch reads, and bounded
+//! basket-windowed chunk reads.  General object streaming and writing are still
+//! out of scope for this strangler stage.
 
 mod decompress;
 mod error;
@@ -14,4 +14,7 @@ mod tree;
 
 pub use error::{Error, Result};
 pub use root_file::{FileObject, RootFile};
-pub use tree::{BranchInfo, LeafInfo, Scalar, Tree};
+pub use tree::{
+    BranchInfo, ChunkedReader, ColumnChunk, ColumnData, ColumnRequest, LeafInfo, Scalar, Tree,
+    TreeChunk,
+};
