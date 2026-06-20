@@ -8,6 +8,8 @@
 use std::path::Path;
 
 use nano_core::{BranchSchema, Event};
+#[cfg(feature = "http")]
+pub use root_io::HttpSourceOptions;
 pub use root_io::{Result, RootError};
 
 /// Synchronously read the `Events` TTree from a ROOT file into one [`Event`] per entry.
@@ -57,6 +59,63 @@ pub fn events_chunked_from_tree(
     reader::EventIterator::new(path, tree_name, schema, chunk_size)
 }
 
+/// Stream the `Events` TTree from an HTTP(S) URL using byte-range reads.
+#[cfg(feature = "http")]
+pub fn events_url(url: &str, schema: &BranchSchema) -> Result<reader::EventIterator> {
+    events_url_from_tree(url, "Events", schema)
+}
+
+/// Stream one named TTree from an HTTP(S) URL using byte-range reads.
+#[cfg(feature = "http")]
+pub fn events_url_from_tree(
+    url: &str,
+    tree_name: &str,
+    schema: &BranchSchema,
+) -> Result<reader::EventIterator> {
+    events_url_chunked_from_tree(url, tree_name, schema, reader::DEFAULT_CHUNK_SIZE)
+}
+
+/// Stream the `Events` TTree from an HTTP(S) URL with an explicit chunk size.
+#[cfg(feature = "http")]
+pub fn events_url_chunked(
+    url: &str,
+    schema: &BranchSchema,
+    chunk_size: usize,
+) -> Result<reader::EventIterator> {
+    events_url_chunked_from_tree(url, "Events", schema, chunk_size)
+}
+
+/// Stream one named TTree from an HTTP(S) URL with explicit chunk size and
+/// environment-driven TLS options.
+#[cfg(feature = "http")]
+pub fn events_url_chunked_from_tree(
+    url: &str,
+    tree_name: &str,
+    schema: &BranchSchema,
+    chunk_size: usize,
+) -> Result<reader::EventIterator> {
+    events_url_chunked_from_tree_with_options(
+        url,
+        tree_name,
+        schema,
+        chunk_size,
+        HttpSourceOptions::from_env(),
+    )
+}
+
+/// Stream one named TTree from an HTTP(S) URL with explicit TLS options.
+#[cfg(feature = "http")]
+pub fn events_url_chunked_from_tree_with_options(
+    url: &str,
+    tree_name: &str,
+    schema: &BranchSchema,
+    chunk_size: usize,
+    options: HttpSourceOptions,
+) -> Result<reader::EventIterator> {
+    let source = root_io::Source::http_with_options(url, options)?;
+    reader::EventIterator::new_from_source(source, url, tree_name, schema, chunk_size)
+}
+
 pub mod reader {
     use std::collections::HashMap;
     use std::path::Path;
@@ -72,12 +131,15 @@ pub mod reader {
     use root_io::tree_reader::TBranch;
     use root_io::tree_reader::Tree;
     use root_io::RootFile;
+    use root_io::Source;
 
     use crate::{Result, RootError};
 
     pub const DEFAULT_CHUNK_SIZE: usize = 65_536;
 
     pub struct EventIterator {
+        source: Source,
+        file_size: u64,
         tree: Tree,
         schema: Rc<BranchSchema>,
         chunk_size: usize,
@@ -96,10 +158,29 @@ pub mod reader {
             schema: &BranchSchema,
             chunk_size: usize,
         ) -> Result<Self> {
-            let file = block_on(RootFile::new(path))?;
-            let tree = block_on(tree_by_name_or_first(&file, path, tree_name))?;
+            Self::new_from_source(
+                Source::new(path),
+                &path.display().to_string(),
+                tree_name,
+                schema,
+                chunk_size,
+            )
+        }
+
+        pub fn new_from_source(
+            source: Source,
+            source_label: &str,
+            tree_name: &str,
+            schema: &BranchSchema,
+            chunk_size: usize,
+        ) -> Result<Self> {
+            let file = block_on(RootFile::from_source(source.clone()))?;
+            let file_size = file.file_size();
+            let tree = block_on(tree_by_name_or_first(&file, source_label, tree_name))?;
             let total_entries = usize::try_from(tree.entries()).map_err(RootError::from)?;
             Ok(Self {
+                source,
+                file_size,
                 tree,
                 schema: Rc::new(schema.clone()),
                 chunk_size: chunk_size.max(1),
@@ -110,6 +191,14 @@ pub mod reader {
                 chunk_row: 0,
                 columns: None,
             })
+        }
+
+        pub fn bytes_fetched(&self) -> u64 {
+            self.source.bytes_fetched()
+        }
+
+        pub fn file_size(&self) -> u64 {
+            self.file_size
         }
 
         fn load_next_chunk(&mut self) -> Result<bool> {
@@ -156,7 +245,11 @@ pub mod reader {
         }
     }
 
-    async fn tree_by_name_or_first(file: &RootFile, path: &Path, tree_name: &str) -> Result<Tree> {
+    async fn tree_by_name_or_first(
+        file: &RootFile,
+        source_label: &str,
+        tree_name: &str,
+    ) -> Result<Tree> {
         if let Some(item) = file
             .items()
             .iter()
@@ -168,7 +261,7 @@ pub mod reader {
         file.items()
             .iter()
             .find(|item| item.verbose_info().contains("TTree"))
-            .ok_or_else(|| RootError::other(format!("No TTree found in {}", path.display())))?
+            .ok_or_else(|| RootError::other(format!("No TTree found in {source_label}")))?
             .as_tree()
             .await
     }

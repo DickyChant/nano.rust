@@ -10,6 +10,8 @@ use nom::{
 
 use uuid::Uuid;
 
+#[cfg(feature = "http")]
+use crate::HttpSourceOptions;
 use crate::{core::tstreamer::streamers, core::*, Result, RootError, MAP_OFFSET};
 
 /// Size of serialized `FileHeader` in bytes
@@ -143,6 +145,24 @@ impl RootFile {
     /// `remote` feature is enabled. Local paths are not available on `wasm32`.
     pub async fn new<S: Into<Source>>(source: S) -> Result<Self> {
         let source = source.into();
+        Self::from_source(source).await
+    }
+
+    /// Open a ROOT file from an HTTP(S) URL using byte-range requests.
+    ///
+    /// TLS options are read from `SSL_CERT_FILE` and `NANO_HTTP_INSECURE`.
+    #[cfg(feature = "http")]
+    pub async fn open_url(url: &str) -> Result<Self> {
+        Self::from_source(Source::http(url)?).await
+    }
+
+    /// Open a ROOT file from an HTTP(S) URL using explicit TLS options.
+    #[cfg(feature = "http")]
+    pub async fn open_url_with_options(url: &str, options: HttpSourceOptions) -> Result<Self> {
+        Self::from_source(Source::http_with_options(url, options)?).await
+    }
+
+    pub async fn from_source(source: Source) -> Result<Self> {
         let hdr = source.fetch(0, FILE_HEADER_SIZE).await.and_then(|buf| {
             file_header(&buf)
                 .map_err(|_| RootError::parse("Failed to parse file header"))
@@ -175,6 +195,16 @@ impl RootFile {
             .collect();
 
         Ok(RootFile { source, hdr, items })
+    }
+
+    /// ROOT header `fEND`, i.e. the logical file size in bytes.
+    pub fn file_size(&self) -> u64 {
+        self.hdr.end
+    }
+
+    /// Bytes fetched through this file's source so far.
+    pub fn bytes_fetched(&self) -> u64 {
+        self.source.bytes_fetched()
     }
 
     pub async fn get_streamer_context(&self) -> Result<Context> {

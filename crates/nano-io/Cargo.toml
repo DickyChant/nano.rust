@@ -12,5 +12,9 @@ futures = "0.3"
 nom = "^7"
 root-io = { workspace = true }
 
+[features]
+default = []
+http = ["root-io/http"]
+
 [dev-dependencies]
 nano-producers = { workspace = true }

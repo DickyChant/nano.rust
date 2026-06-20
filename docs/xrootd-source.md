@@ -1,6 +1,37 @@
-# Next-step project: remote `Source` (xrootd / HTTP byte-range)
+# Remote `Source` (HTTP byte-range / xrootd)
 
-Status: **planned**, not started. Sequenced after the semantic-layer slices.
+Status: **HTTP byte-range = stage one, in progress** (promoted ahead of the semantic
+layer so CI can read open data remotely with no stored files). Native xrootd remains a
+later project.
+
+## Confirmed: CMS Open Data is HTTPS byte-range readable
+
+Probed `https://eospublic.cern.ch//eos/opendata/cms/Run2016H/DoubleMuon/.../*.root`:
+- It returns **307** to an EOS data node (`:8443`) with a capability token in the URL;
+  following the redirect (re-sending `Range`) yields **206 Partial Content** (verified:
+  first 64 bytes = ROOT magic `root`; an independent range at a 1 MB offset also 206).
+- TLS: the cert chain fails default verification (CERN grid CAs → "self-signed
+  certificate in certificate chain"). Handle via a configurable CA bundle, or an
+  opt-in insecure mode for public read-only data.
+- Robust pattern: per `fetch(start,len)`, request the original eospublic URL with the
+  `Range` header and follow redirects (the token may be per-request).
+
+This composes with the bounded streaming reader: a remote read pulls only the baskets
+each chunk touches → bounded memory, minimal bytes fetched. Implemented behind a
+`http` cargo feature (pure-Rust, prefer `ureq`).
+
+## TLS configuration
+
+The HTTP source honors:
+
+- `SSL_CERT_FILE=/path/to/ca-bundle.pem` to verify with an explicit CA bundle.
+- `NANO_HTTP_INSECURE=1` to disable TLS certificate verification.
+
+`NANO_HTTP_INSECURE=1` is intended only for public, read-only open data where the
+caller accepts transport-authenticity risk. It must not be used for private data,
+credentials, or write-capable endpoints. The ROOT reader still validates the ROOT
+container structure and basket checksums where present, but insecure TLS no longer
+authenticates the server.
 
 ## Why it's clean here
 

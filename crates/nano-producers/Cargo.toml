@@ -8,3 +8,7 @@ description = "Channel producers for the nano.rust event loop"
 
 [dependencies]
 nano-core = { workspace = true }
+
+[features]
+default = []
+http = ["nano-core/http"]

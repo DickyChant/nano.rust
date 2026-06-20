@@ -19,6 +19,8 @@ pub(crate) use self::tstreamerinfo::{tstreamerinfo, TStreamerInfo};
 pub(crate) use self::typeid::*;
 pub(crate) use self::types::*;
 
+#[cfg(feature = "http")]
+pub use self::data_source::HttpSourceOptions;
 pub use self::data_source::Source;
 pub use self::file::RootFile;
 pub use self::file_item::FileItem;

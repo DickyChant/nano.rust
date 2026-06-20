@@ -20,11 +20,6 @@ extern crate bitflags;
 extern crate flate2;
 extern crate lzma_rs;
 extern crate nom;
-#[cfg(feature = "remote")]
-extern crate reqwest;
-
-#[cfg(feature = "remote")]
-extern crate alice_open_data;
 
 pub mod core;
 pub mod error;
@@ -36,6 +31,8 @@ pub mod write;
 // Contains the stream_zip macro
 pub mod utils;
 
+#[cfg(feature = "http")]
+pub use crate::core::HttpSourceOptions;
 pub use crate::core::{FileItem, RootFile, Source};
 pub use crate::error::{Result, RootError};
 
