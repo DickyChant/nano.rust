@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 
 use crate::error::{Error, Result};
@@ -12,22 +14,43 @@ pub(crate) const TBUFFER_OBJECT_MAP_OFFSET: u64 = 2;
 pub(crate) struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,
+    origin: usize,
 }
 
 impl<'a> Cursor<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        Self {
+            data,
+            pos: 0,
+            origin: 0,
+        }
     }
 
     pub(crate) fn at(data: &'a [u8], pos: usize) -> Result<Self> {
         if pos > data.len() {
             return Err(Error::parse(pos, "cursor start beyond input"));
         }
-        Ok(Self { data, pos })
+        Ok(Self {
+            data,
+            pos,
+            origin: 0,
+        })
+    }
+
+    pub(crate) fn with_origin(data: &'a [u8], origin: usize) -> Self {
+        Self {
+            data,
+            pos: 0,
+            origin,
+        }
     }
 
     pub(crate) fn position(&self) -> usize {
         self.pos
+    }
+
+    pub(crate) fn absolute_position(&self) -> usize {
+        self.origin.saturating_add(self.pos)
     }
 
     pub(crate) fn remaining(&self) -> usize {
@@ -62,7 +85,12 @@ impl<'a> Cursor<'a> {
     }
 
     pub(crate) fn sub(&mut self, len: usize) -> Result<Cursor<'a>> {
-        Ok(Cursor::new(self.take(len)?))
+        let origin = self.absolute_position();
+        Ok(Cursor {
+            data: self.take(len)?,
+            pos: 0,
+            origin,
+        })
     }
 
     pub(crate) fn u8(&mut self) -> Result<u8> {
@@ -204,6 +232,7 @@ enum ClassInfo<'a> {
 pub(crate) struct RawObject<'a> {
     pub(crate) class_name: &'a str,
     pub(crate) payload: &'a [u8],
+    pub(crate) payload_origin: usize,
 }
 
 /// Parser context for ROOT object references.
@@ -218,11 +247,16 @@ pub(crate) struct RawObject<'a> {
 pub(crate) struct ObjectContext<'a> {
     bytes: &'a [u8],
     map_offset: u64,
+    refs: RefCell<HashMap<u32, RawObject<'a>>>,
 }
 
 impl<'a> ObjectContext<'a> {
     pub(crate) fn new(bytes: &'a [u8], map_offset: u64) -> Self {
-        Self { bytes, map_offset }
+        Self {
+            bytes,
+            map_offset,
+            refs: RefCell::new(HashMap::new()),
+        }
     }
 
     fn local_offset(&self, absolute: u32) -> Result<usize> {
@@ -247,6 +281,7 @@ impl<'a> ObjectContext<'a> {
             return Ok(RawObject {
                 class_name: "",
                 payload: &self.bytes[..0],
+                payload_origin: 0,
             });
         }
         let pos = self.local_offset(absolute)?;
@@ -256,6 +291,18 @@ impl<'a> ObjectContext<'a> {
 
     fn class_name_at(&self, absolute: u32) -> Result<&'a str> {
         self.raw_at(absolute).map(|raw| raw.class_name)
+    }
+
+    fn register_ref(&self, object_start: usize, raw: RawObject<'a>) -> Result<()> {
+        let tag = object_reference_tag(self.map_offset, object_start)?;
+        self.refs.borrow_mut().insert(tag, raw);
+        let tree_buffer_tag = object_reference_tag(TBUFFER_OBJECT_MAP_OFFSET, object_start)?;
+        self.refs.borrow_mut().insert(tree_buffer_tag, raw);
+        Ok(())
+    }
+
+    fn ref_at(&self, tag: u32) -> Option<RawObject<'a>> {
+        self.refs.borrow().get(&tag).copied()
     }
 }
 
@@ -292,23 +339,70 @@ fn read_class_info<'a>(cur: &mut Cursor<'a>) -> Result<ClassInfo<'a>> {
 }
 
 pub(crate) fn read_raw<'a>(cur: &mut Cursor<'a>, ctx: &ObjectContext<'a>) -> Result<RawObject<'a>> {
+    let object_start = cur.absolute_position();
     match read_class_info(cur)? {
         ClassInfo::New(class_name) => {
-            let payload = cur.checked_sub()?.rest();
-            Ok(RawObject {
+            let mut payload_cur = cur.checked_sub()?;
+            let payload_origin = payload_cur.absolute_position();
+            let payload = payload_cur.rest();
+            let raw = RawObject {
                 class_name,
                 payload,
-            })
+                payload_origin,
+            };
+            ctx.register_ref(object_start, raw)?;
+            Ok(raw)
         }
         ClassInfo::Exists(tag) => {
             let class_name = ctx.class_name_at(tag)?;
-            let payload = cur.checked_sub()?.rest();
-            Ok(RawObject {
+            let mut payload_cur = cur.checked_sub()?;
+            let payload_origin = payload_cur.absolute_position();
+            let payload = payload_cur.rest();
+            let raw = RawObject {
                 class_name,
                 payload,
-            })
+                payload_origin,
+            };
+            ctx.register_ref(object_start, raw)?;
+            Ok(raw)
         }
-        ClassInfo::References(tag) => ctx.raw_at(tag),
+        ClassInfo::References(tag) => ctx.ref_at(tag).map_or_else(|| ctx.raw_at(tag), Ok),
+    }
+}
+
+pub(crate) fn read_raw_optional<'a>(
+    cur: &mut Cursor<'a>,
+    ctx: &ObjectContext<'a>,
+) -> Result<Option<RawObject<'a>>> {
+    let object_start = cur.absolute_position();
+    match read_class_info(cur)? {
+        ClassInfo::New(class_name) => {
+            let mut payload_cur = cur.checked_sub()?;
+            let payload_origin = payload_cur.absolute_position();
+            let payload = payload_cur.rest();
+            let raw = RawObject {
+                class_name,
+                payload,
+                payload_origin,
+            };
+            ctx.register_ref(object_start, raw)?;
+            Ok(Some(raw))
+        }
+        ClassInfo::Exists(tag) => {
+            let class_name = ctx.class_name_at(tag)?;
+            let mut payload_cur = cur.checked_sub()?;
+            let payload_origin = payload_cur.absolute_position();
+            let payload = payload_cur.rest();
+            let raw = RawObject {
+                class_name,
+                payload,
+                payload_origin,
+            };
+            ctx.register_ref(object_start, raw)?;
+            Ok(Some(raw))
+        }
+        ClassInfo::References(0 | 1) => Ok(None),
+        ClassInfo::References(tag) => Ok(ctx.ref_at(tag)),
     }
 }
 

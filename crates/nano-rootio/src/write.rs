@@ -627,10 +627,13 @@ fn build_tree_object(
     let branches_checked_start = tree.len();
     let mut branch_array = tobjarray_header("", branches.len());
     let mut leaf_refs = Vec::with_capacity(branches.len());
+    let mut leaf_count_refs = Vec::with_capacity(branches.len());
     for (branch_index, ((branch, meta), basket)) in
         branches.iter().zip(branch_meta).zip(baskets).enumerate()
     {
-        let counter_ref = meta.counter.map(|counter_index| leaf_refs[counter_index]);
+        let counter_ref = meta
+            .counter
+            .map(|counter_index| leaf_count_refs[counter_index]);
         let branch_raw_start = branches_checked_start + 4 + branch_array.len();
         let built = build_branch_raw_object(
             branch,
@@ -641,8 +644,10 @@ fn build_tree_object(
             branch_raw_start,
             counter_ref,
         )?;
-        leaf_refs.push(built.leaf_ref);
+        leaf_refs.push(built.leaf_tree_ref);
+        leaf_count_refs.push(built.leaf_count_ref);
         debug_assert_eq!(leaf_refs.len(), branch_index + 1);
+        debug_assert_eq!(leaf_count_refs.len(), branch_index + 1);
         branch_array.extend(built.raw_object);
     }
     tree.extend(checked(branch_array)?);
@@ -661,7 +666,8 @@ fn build_tree_object(
 
 struct BuiltBranch {
     raw_object: Vec<u8>,
-    leaf_ref: u32,
+    leaf_tree_ref: u32,
+    leaf_count_ref: u32,
 }
 
 fn build_branch_raw_object(
@@ -682,16 +688,17 @@ fn build_branch_raw_object(
         branch_raw_start,
         counter_ref,
     )?;
-    let leaf_ref = branch_body.leaf_ref;
     Ok(BuiltBranch {
         raw_object: raw_object("TBranch", branch_body.bytes)?,
-        leaf_ref,
+        leaf_tree_ref: branch_body.leaf_tree_ref,
+        leaf_count_ref: branch_body.leaf_count_ref,
     })
 }
 
 struct BuiltBranchBody {
     bytes: Vec<u8>,
-    leaf_ref: u32,
+    leaf_tree_ref: u32,
+    leaf_count_ref: u32,
 }
 
 fn build_branch(
@@ -734,7 +741,8 @@ fn build_branch(
         + leaf_array_checked_start
         + 4
         + leaf_array.len();
-    let leaf_ref = tree_object_reference_tag(tree_key_len, leaf_raw_start)?;
+    let leaf_count_ref = tree_buffer_object_reference_tag(leaf_raw_start)?;
+    let leaf_tree_ref = key_framed_object_reference_tag(tree_key_len, leaf_raw_start)?;
     leaf_array.extend(raw_object(
         branch.data.leaf_class(),
         build_leaf(branch, meta, counter_ref)?,
@@ -750,11 +758,19 @@ fn build_branch(
     put_string(&mut out, "");
     Ok(BuiltBranchBody {
         bytes: out,
-        leaf_ref,
+        leaf_tree_ref,
+        leaf_count_ref,
     })
 }
 
-fn tree_object_reference_tag(
+fn tree_buffer_object_reference_tag(tree_body_raw_object_start: usize) -> Result<u32> {
+    let local_offset = 4_usize
+        .checked_add(tree_body_raw_object_start)
+        .ok_or_else(|| Error::unsupported("object reference", "offset overflow"))?;
+    object_reference_tag(TBUFFER_OBJECT_MAP_OFFSET, local_offset)
+}
+
+fn key_framed_object_reference_tag(
     tree_key_len: usize,
     tree_body_raw_object_start: usize,
 ) -> Result<u32> {
@@ -789,11 +805,10 @@ fn build_leaf(branch: &Branch, meta: &BranchMeta, counter_ref: Option<u32>) -> R
     put_u8(&mut base, u8::from(branch.data.is_unsigned()));
 
     // ROOT stores `TLeaf::fLeafCount` with `TBufferFile::WriteObjectAny`.
-    // When the counter leaf was already written, the buffer contains only a
-    // reference tag: a big-endian u32 absolute offset into this TTree key
-    // payload. `ObjectContext::read_raw` subtracts the same map offset
-    // (`key_len + 2`) and reparses the referenced raw `TLeaf*` object. This is
-    // the inverse of nano-rootio's reader path and the key jagged-interop byte.
+    // For an already-written counter leaf, write a plain object-reference tag:
+    // the counter leaf raw-object start within the TTree object buffer plus
+    // ROOT's object-map offset (2). The frame is the TTree key payload, not a
+    // file offset and not key-header-relative.
     put_u32(&mut base, counter_ref.unwrap_or(0));
     out.extend(checked(base)?);
 

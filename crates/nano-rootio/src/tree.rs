@@ -4,7 +4,7 @@ use std::ops::Range;
 use crate::decompress::decompress_root_blocks;
 use crate::error::{Error, Result};
 use crate::parse::{
-    maybe_raw_buffer, parse_tnamed, read_raw, read_tobjarray, skip_tiofeatures, Cursor,
+    maybe_raw_buffer, parse_tnamed, read_raw_optional, read_tobjarray, skip_tiofeatures, Cursor,
     ObjectContext, RawObject,
 };
 use crate::root_file::{parse_tkey_header, Source};
@@ -721,13 +721,13 @@ fn parse_branch_header<'a>(
 ) -> Result<Branch> {
     match raw.class_name {
         "TBranchElement" | "TBranchObject" => {
-            let mut cur = Cursor::new(raw.payload);
+            let mut cur = Cursor::with_origin(raw.payload, raw.payload_origin);
             let _version = cur.u16()?;
             let mut payload = cur.checked_sub()?;
             parse_branch(&mut payload, ctx, source)
         }
         "TBranch" => {
-            let mut cur = Cursor::new(raw.payload);
+            let mut cur = Cursor::with_origin(raw.payload, raw.payload_origin);
             parse_branch(&mut cur, ctx, source)
         }
         other => Err(Error::parse(
@@ -844,7 +844,7 @@ fn read_u64_array(cur: &mut Cursor<'_>, count: i32) -> Result<Vec<u64>> {
 }
 
 fn parse_leaf<'a>(raw: RawObject<'a>, ctx: &ObjectContext<'a>) -> Result<LeafInfo> {
-    let mut cur = Cursor::new(raw.payload);
+    let mut cur = Cursor::with_origin(raw.payload, raw.payload_origin);
     match raw.class_name {
         "TLeafB" => parse_simple_leaf(&mut cur, ctx, raw.class_name, "i8", "u8", |cur| {
             cur.i8().map(|_| ())
@@ -962,13 +962,9 @@ fn parse_leaf_base<'a>(cur: &mut Cursor<'a>, ctx: &ObjectContext<'a>) -> Result<
     let _offset = base_payload.i32()?;
     let _is_range = base_payload.bool()?;
     let is_unsigned = base_payload.bool()?;
-    let leaf_count_name = if base_payload.peek_u32()? == 0 {
-        let _ = base_payload.u32()?;
-        None
-    } else {
-        let raw = read_raw(&mut base_payload, ctx)?;
-        Some(parse_leaf(raw, ctx)?.name)
-    };
+    let leaf_count_name = read_raw_optional(&mut base_payload, ctx)?
+        .map(|raw| parse_leaf(raw, ctx).map(|leaf| leaf.name))
+        .transpose()?;
     Ok(LeafBase {
         name: named.name,
         len,

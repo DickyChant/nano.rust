@@ -2,7 +2,9 @@
 use nano_rootio::write::{write_tree, Branch};
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/tmp/nr_demo.root".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/nr_demo.root".into());
     let n_muon = vec![0u32, 1, 2, 2, 1, 3];
     let muon_pt = vec![
         vec![],

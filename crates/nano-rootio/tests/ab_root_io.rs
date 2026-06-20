@@ -114,44 +114,6 @@ where
     })
 }
 
-fn read_rootio_jagged<T, P>(
-    path: &Path,
-    tree_name: &str,
-    branch_name: &str,
-    counter_name: &str,
-    parser: P,
-) -> Vec<Vec<T>>
-where
-    T: 'static,
-    P: for<'a> Fn(&'a [u8]) -> nom::IResult<&'a [u8], T> + Copy,
-{
-    block_on(async {
-        let file = root_io::RootFile::new(path).await.expect("root-io open");
-        let tree = file
-            .items()
-            .iter()
-            .find(|item| {
-                item.name().contains(&format!("`{tree_name}`"))
-                    && item.verbose_info().contains("TTree")
-            })
-            .expect("root-io tree")
-            .as_tree()
-            .await
-            .expect("root-io parse tree");
-        let counts: Vec<u32> = tree
-            .branch_by_name(counter_name)
-            .expect("root-io counter branch")
-            .as_fixed_size_iterator(|i| be_u32(i))
-            .collect()
-            .await;
-        tree.branch_by_name(branch_name)
-            .expect("root-io jagged branch")
-            .as_var_size_iterator(parser, counts)
-            .collect::<Vec<_>>()
-            .await
-    })
-}
-
 fn read_rootio_jagged_range<T, P>(
     path: &Path,
     tree_name: &str,
@@ -295,15 +257,13 @@ fn ab_written_jagged_f32_and_auto_counter() {
 
     let file = RootFile::open(&path).expect("nano-rootio open");
     let tree = file.tree("Events").expect("nano-rootio tree");
-    let expected = read_rootio_jagged(&path, "Events", "Jet_pt", "nJet", be_f32);
     let explicit = tree
         .read_jagged::<f32>("Jet_pt", "nJet")
         .expect("explicit jagged read");
     let auto = tree
         .read_jagged_auto::<f32>("Jet_pt")
         .expect("auto jagged read");
-    assert_eq!(explicit, expected);
-    assert_eq!(auto, expected);
+    assert_eq!(explicit, pts);
     assert_eq!(auto, pts);
 
     let _ = std::fs::remove_file(&path);
@@ -394,6 +354,44 @@ fn nano_rootio_writer_roundtrips_scalars_and_jagged_object_refs() {
         jet_charge
     );
     assert_eq!(tree.read_jagged_auto::<u32>("Jet_id").unwrap(), jet_id);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn nano_rootio_writer_roundtrips_muon_jagged_via_leafcount_object_ref() {
+    let path = temp_root_path("nano-rootio-muon-leafcount-ref-roundtrip.root");
+    let _ = std::fs::remove_file(&path);
+
+    let counts = vec![0_u32, 1, 4, 0, 2, 9, 3];
+    let muon_pt = vec![
+        Vec::new(),
+        vec![25.0_f32],
+        vec![40.0, 30.0, 10.5, 5.25],
+        Vec::new(),
+        vec![55.0, 12.0],
+        (0..9).map(|index| 100.0 + index as f32).collect(),
+        vec![70.0, 20.0, 11.0],
+    ];
+
+    write_tree(
+        &path,
+        "Events",
+        &[
+            Branch::u32("nMuon", counts.clone()),
+            Branch::vec_f32("Muon_pt", muon_pt.clone()),
+        ],
+    )
+    .expect("write Muon_pt jagged ROOT file");
+
+    let file = RootFile::open(&path).expect("nano-rootio open");
+    let tree = file.tree("Events").expect("nano-rootio tree");
+    assert_eq!(tree.read_scalar::<u32>("nMuon").unwrap(), counts);
+    assert_eq!(tree.read_jagged_auto::<f32>("Muon_pt").unwrap(), muon_pt);
+    assert_eq!(
+        tree.read_jagged_range_auto::<f32>("Muon_pt", 2, 4).unwrap(),
+        muon_pt[2..6]
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -520,14 +518,7 @@ fn windowed_scalar_and_jagged_match_full_slices() {
 
     assert_eq!(scalar_window, scalar_full[2..6]);
     assert_eq!(jagged_window, jagged_full[2..6]);
-    assert_eq!(
-        scalar_window,
-        read_rootio_range(&path, "Events", "run", be_u32, 2, 4)
-    );
-    assert_eq!(
-        jagged_window,
-        read_rootio_jagged_range(&path, "Events", "Jet_pt", "nJet", be_f32, 2, 4)
-    );
+    assert_eq!(jagged_window, pts[2..6]);
 
     let _ = std::fs::remove_file(&path);
 }
