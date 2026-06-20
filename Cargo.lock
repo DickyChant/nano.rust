@@ -607,7 +607,9 @@ dependencies = [
 name = "nano-producers"
 version = "0.0.0"
 dependencies = [
+ "nano-analysis",
  "nano-core",
+ "nano-corrections",
 ]
 
 [[package]]

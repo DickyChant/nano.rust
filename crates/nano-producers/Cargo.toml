@@ -7,6 +7,8 @@ repository.workspace = true
 description = "Channel producers for the nano.rust event loop"
 
 [dependencies]
+nano-analysis = { workspace = true }
+nano-corrections = { workspace = true }
 nano-core = { workspace = true }
 
 [features]

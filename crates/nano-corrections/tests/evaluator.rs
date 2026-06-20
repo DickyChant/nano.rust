@@ -147,10 +147,25 @@ fn reads_gzipped_json_payload() {
 }
 
 #[test]
-fn parses_real_jme_payload_when_present() {
-    let path = Path::new("../../data/jme-derived/Run2-2018-UL-NanoAODv9/latest/jet_jerc.json.gz");
-    if path.exists() {
-        let set = CorrectionSet::from_path(path).unwrap();
-        assert!(!set.corrections.is_empty());
-    }
+fn loads_real_gzipped_jme_payload_and_evaluates_total_uncertainty() {
+    let path =
+        Path::new("../../data/jme-derived/Run2-2016postVFP-UL-NanoAODv9/latest/jet_jerc.json.gz");
+    let set = CorrectionSet::from_path(path).unwrap();
+    let names = set
+        .corrections
+        .iter()
+        .map(|correction| correction.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&"Summer19UL16_V7_MC_Total_AK4PFPuppi"));
+
+    let correction = set
+        .correction("Summer19UL16_V7_MC_Total_AK4PFPuppi")
+        .unwrap();
+    let factor = correction
+        .evaluate(&[Value::Real(0.5), Value::Real(100.0)])
+        .unwrap();
+
+    assert!(factor.is_finite());
+    assert_eq!(factor, 0.0108);
 }
