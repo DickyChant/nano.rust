@@ -96,23 +96,17 @@ kernel, a workflow IR, and golden tests against the original references. See
 [semantic layer](docs/semantic-layer.md), [reader rewrite](docs/reader-rewrite.md),
 [remote source](docs/xrootd-source.md), [migration](docs/rust-migration.md).
 
-## History
-
-nano.rust began as a C++ port (`nano.cpp` / NanoAODToolsCpp) of selected
-[NanoAOD-tools](https://github.com/cms-nanoAOD/nanoAOD-tools) /
-[NanoHRT-tools](https://github.com/hqucms/NanoHRT-tools) workflows; that snapshot
-is preserved on the `cpp-snapshot` branch. The Rust rewrite then vendored the
-pure-Rust [`root-io`](https://github.com/cbourjau/alice-rs) reader and grew the
-owned `nano-rootio` I/O core (read + write) from it; that is the active line of
-development.
-
 ## Acknowledgments
 
-This project stands on, and is inspired by, prior work:
+nano.rust grew out of, and is inspired by, prior work:
 
+- **Origins** — it began as a C++ port (`nano.cpp` / NanoAODToolsCpp) of selected
+  [NanoAOD-tools](https://github.com/cms-nanoAOD/nanoAOD-tools) /
+  [NanoHRT-tools](https://github.com/hqucms/NanoHRT-tools) workflows, preserved on
+  the `cpp-snapshot` branch.
 - **[root-io](https://github.com/cbourjau/alice-rs)** (cbourjau / alice-rs) — the
-  pure-Rust ROOT reader we vendored and grew `nano-rootio` from, and which still
-  serves as a differential A/B oracle in tests (MPL-2.0).
+  pure-Rust ROOT reader we vendored and grew the owned `nano-rootio` I/O core
+  (read + write) from; still a differential A/B oracle in tests (MPL-2.0).
 - **[uproot](https://github.com/scikit-hep/uproot5)** (with awkward-array) — for
   showing that ROOT can be treated as a *storage format* readable outside ROOT;
   it is also our independent read/write oracle in CI.
