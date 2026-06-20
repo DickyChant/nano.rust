@@ -8,7 +8,8 @@
 
 use std::marker::PhantomData;
 
-use nano_core::Event;
+use nano_core::{Event, ObjectView};
+use nano_inference::{InferError, InferRequest, Predictor, Tensor, TensorData};
 
 /// Zero-sized marker for an event before analysis preselection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -17,6 +18,46 @@ pub struct Raw;
 /// Zero-sized marker for an event after baseline preselection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Baseline;
+
+/// Zero-sized marker for an event after model `M` has attached its score.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Scored<M> {
+    _model: PhantomData<M>,
+}
+
+/// Type-level identity for a model score used by generated analysis code.
+pub trait ModelTag {
+    /// Model name sent through the inference protocol.
+    const NAME: &'static str;
+    /// NanoAOD collection/object batch, such as `Muon` or `FatJet`.
+    const BATCH: &'static str;
+    /// Derived object attribute attached by inference, such as `topscore`.
+    const OUTPUT: &'static str;
+}
+
+/// Prepared model features for inference of model `M`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Features<M> {
+    inputs: Vec<Tensor>,
+    _model: PhantomData<M>,
+}
+
+impl<M: ModelTag> Features<M> {
+    /// Build features from already materialized protocol tensors.
+    pub fn from_tensors(inputs: Vec<Tensor>) -> Self {
+        Self {
+            inputs,
+            _model: PhantomData,
+        }
+    }
+
+    fn into_request(self) -> InferRequest {
+        InferRequest {
+            model: M::NAME.to_string(),
+            inputs: self.inputs,
+        }
+    }
+}
 
 /// Marker trait for selected analysis regions.
 pub trait Region {
@@ -75,12 +116,111 @@ impl<'e> Ev<'e, Baseline> {
             _stage: PhantomData,
         })
     }
+
+    /// Advance `Baseline -> Scored<M>` by running inference and attaching the
+    /// model output as a typed per-object score.
+    pub fn infer<M: ModelTag>(
+        self,
+        predictor: &impl Predictor,
+        features: Features<M>,
+    ) -> Result<Ev<'e, Scored<M>>, InferError> {
+        let response = predictor.predict(&features.into_request())?;
+        let output = response
+            .outputs
+            .iter()
+            .find(|tensor| tensor.name == M::OUTPUT)
+            .or_else(|| {
+                (response.outputs.len() == 1)
+                    .then(|| response.outputs.first())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                InferError::InvalidPayload(format!(
+                    "model `{}` response did not contain output `{}`",
+                    M::NAME,
+                    M::OUTPUT
+                ))
+            })?;
+
+        let values = match &output.data {
+            TensorData::F32(values) => values,
+            other => {
+                return Err(InferError::InvalidPayload(format!(
+                    "model `{}` output `{}` has dtype {:?}, expected F32",
+                    M::NAME,
+                    output.name,
+                    other.dtype()
+                )));
+            }
+        };
+
+        let objects = self
+            .inner
+            .collection(M::BATCH)
+            .map_err(|error| InferError::Feature(error.to_string()))?;
+        if values.len() != objects.len() {
+            return Err(InferError::ShapeMismatch {
+                tensor: output.name.clone(),
+                expected: vec![objects.len()],
+                actual: output.shape.clone(),
+            });
+        }
+
+        for (object, value) in objects.iter().zip(values.iter().copied()) {
+            object.set(M::OUTPUT, value);
+        }
+
+        Ok(Ev {
+            inner: self.inner,
+            _stage: PhantomData,
+        })
+    }
 }
 
 impl<'e, S> Ev<'e, S> {
     /// Access the underlying dynamic event for branch reads and object access.
     pub fn event(&self) -> &'e Event {
         self.inner
+    }
+}
+
+impl<'e, M: ModelTag> Ev<'e, Scored<M>> {
+    /// Read the model score attached by [`Ev::infer`].
+    ///
+    /// Reading a score *before* inference does not compile: `score` exists only
+    /// on `Ev<Scored<M>>`, so a `Baseline` event has no such method. This is the
+    /// score-before-use guarantee — the dual of weight-before-fill.
+    ///
+    /// ```compile_fail
+    /// use nano_analysis::{Ev, ModelTag};
+    /// use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
+    ///
+    /// struct MuonTagger;
+    /// impl ModelTag for MuonTagger {
+    ///     const NAME: &'static str = "muon_tagger";
+    ///     const BATCH: &'static str = "Muon";
+    ///     const OUTPUT: &'static str = "topscore";
+    /// }
+    ///
+    /// let schema = BranchSchema::new([
+    ///     BranchSpec::new("Muon_pt", BranchType::VecF32),
+    /// ])
+    /// .unwrap();
+    /// let event = Event::from_columns(
+    ///     schema,
+    ///     [("Muon_pt", BranchColumn::VecF32(vec![vec![45.0]]))],
+    ///     0,
+    /// )
+    /// .unwrap();
+    /// // `baseline` is inferred as `Ev<Baseline>` here.
+    /// let baseline = Ev::new(&event).preselect(|_| true).unwrap();
+    /// let muons = event.collection("Muon").unwrap();
+    /// // No `score` method on a Baseline event (it lives on Ev<Scored<M>>)
+    /// // -> fails to compile. Reach it only after `.infer::<MuonTagger>(..)`.
+    /// let _ = baseline.score(muons.get(0).unwrap());
+    /// ```
+    pub fn score(&self, object: &ObjectView<'_>) -> nano_core::Result<f32> {
+        object.get(M::OUTPUT)
     }
 }
 

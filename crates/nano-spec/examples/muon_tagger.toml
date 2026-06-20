@@ -1,0 +1,27 @@
+[analysis]
+name = "muon_tagger_demo"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = ["pt > 30 GeV", "abs(eta) < 2.4"]
+
+[[model]]
+name = "muon_tagger"
+inputs = ["Muon_pt", "Muon_eta", "Muon_phi"]
+output = "Muon_topscore"
+batch = "Muon"
+
+[model.provider]
+kind = "mock"
+
+[regions.signal]
+require = ["count(good_muon) >= 1", "leading(good_muon).topscore > 0.5"]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"
+
+[[outputs]]
+name = "lead_muon_topscore"
+expr = "leading(good_muon).topscore"

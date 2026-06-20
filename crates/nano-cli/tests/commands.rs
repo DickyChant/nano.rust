@@ -76,6 +76,31 @@ fn branches_muon_toml_reports_derived_read_branches() {
 }
 
 #[test]
+fn validate_and_branches_report_models() {
+    let spec = repo_path("crates/nano-spec/examples/muon_tagger.toml");
+    let output = run(["validate", spec.to_str().unwrap()]).expect("validate command");
+
+    let Output::Validate(report) = output else {
+        panic!("expected validate report");
+    };
+
+    assert_eq!(report.analysis.models.len(), 1);
+    assert_eq!(report.analysis.models[0].name, "muon_tagger");
+    assert_eq!(report.analysis.models[0].output, "Muon_topscore");
+
+    let output = run(["branches", spec.to_str().unwrap()]).expect("branches command");
+    let Output::Branches(report) = output else {
+        panic!("expected branches report");
+    };
+
+    assert_eq!(report.models[0].provider, "Mock");
+    assert!(report
+        .branches
+        .iter()
+        .any(|branch| branch.name == "Muon_phi"));
+}
+
+#[test]
 fn codegen_muon_toml_emits_generated_producer_source() {
     let spec = repo_path("crates/nano-spec/examples/muon.toml");
     let output = run(["codegen", spec.to_str().unwrap()]).expect("codegen command");

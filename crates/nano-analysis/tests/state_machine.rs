@@ -1,8 +1,17 @@
 use nano_analysis::{
-    fill, passes_muon_signal_selection, select_muon_signal_region, Ev, EventWeight, Hist1D,
-    SignalRegion,
+    fill, passes_muon_signal_selection, select_muon_signal_region, Ev, EventWeight, Features,
+    Hist1D, ModelTag, SignalRegion,
 };
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
+use nano_inference::{MockPredictor, Tensor, TensorData};
+
+struct MuonTagger;
+
+impl ModelTag for MuonTagger {
+    const NAME: &'static str = "muon_tagger";
+    const BATCH: &'static str = "Muon";
+    const OUTPUT: &'static str = "topscore";
+}
 
 fn muon_schema() -> BranchSchema {
     BranchSchema::new([
@@ -65,4 +74,30 @@ fn typed_muon_selection_matches_existing_cut_shape() {
     assert!(select_muon_signal_region(Ev::new(&passing)).is_some());
     assert!(select_muon_signal_region(Ev::new(&failing_pt)).is_none());
     assert!(select_muon_signal_region(Ev::new(&failing_eta)).is_none());
+}
+
+#[test]
+fn inference_transition_attaches_typed_score() {
+    let event = muon_event(vec![24.0, 45.0], vec![0.1, -1.2]);
+    let baseline = Ev::new(&event).preselect(|_| true).unwrap();
+    let features = Features::<MuonTagger>::from_tensors(vec![Tensor {
+        name: "features".to_string(),
+        shape: vec![2, 2],
+        data: TensorData::F32(vec![24.0, 0.1, 45.0, -1.2]),
+    }]);
+
+    let scored = baseline
+        .infer::<MuonTagger>(&MockPredictor::new(MuonTagger::NAME), features)
+        .unwrap();
+    let muons = scored.event().collection("Muon").unwrap();
+    let first_score = scored.score(muons.get(0).unwrap()).unwrap();
+    let second_score = scored.score(muons.get(1).unwrap()).unwrap();
+
+    assert!((0.0..=1.0).contains(&first_score));
+    assert!((0.0..=1.0).contains(&second_score));
+    assert_eq!(
+        first_score,
+        muons.get(0).unwrap().get::<f32>("topscore").unwrap()
+    );
+    assert_ne!(first_score, second_score);
 }

@@ -20,6 +20,7 @@ pub struct AnalysisSpec {
     pub name: String,
     pub year: Year,
     pub objects: Vec<ObjectDef>,
+    pub models: Vec<ModelDef>,
     pub regions: Vec<RegionDef>,
     pub outputs: Vec<OutputDef>,
 }
@@ -130,6 +131,54 @@ pub struct Cut {
     pub lhs: Expr,
     pub op: CmpOp,
     pub rhs: Quantity,
+}
+
+/// A model binding declared by a `[[model]]` spec table.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelDef {
+    pub name: String,
+    pub inputs: Vec<String>,
+    pub output: String,
+    pub output_dtype: ModelOutputDType,
+    pub batch: String,
+    pub provider: ModelProviderSpec,
+}
+
+/// Model output dtype. Layer 3 only accepts one F32 score column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ModelOutputDType {
+    F32,
+}
+
+/// Inference provider binding from the spec.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelProviderSpec {
+    pub kind: ModelProviderKind,
+    pub endpoint: Option<String>,
+    pub launch: Option<String>,
+    pub onnx_path: Option<String>,
+}
+
+impl ModelProviderSpec {
+    fn mock() -> Self {
+        Self {
+            kind: ModelProviderKind::Mock,
+            endpoint: None,
+            launch: None,
+            onnx_path: None,
+        }
+    }
+}
+
+/// Supported provider kinds. `Other` is retained so validation can report a
+/// structured provider error instead of failing during serde conversion.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ModelProviderKind {
+    Mock,
+    InProcess,
+    Remote,
+    Managed,
+    Other(String),
 }
 
 /// A value with an explicit or dimensionless unit.
@@ -270,6 +319,12 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
         });
     }
 
+    let models = raw
+        .models
+        .into_iter()
+        .map(model_def_from_raw)
+        .collect::<Result<Vec<_>, _>>()?;
+
     let mut regions = Vec::with_capacity(raw.regions.len());
     for (name, region) in raw.regions {
         let require = region
@@ -295,6 +350,7 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
         name: raw.analysis.name,
         year: Year::parse(&raw.analysis.year),
         objects,
+        models,
         regions,
         outputs,
     })
@@ -312,6 +368,8 @@ pub fn validate(
         .collect::<HashMap<_, _>>();
     let mut errors = Vec::new();
     let mut required = RequiredBranches::default();
+    let model_outputs =
+        validate_models(spec, catalogue, &object_sources, &mut required, &mut errors);
 
     for object in &spec.objects {
         required.require_counter(&object.source);
@@ -322,6 +380,7 @@ pub fn validate(
                 cut,
                 catalogue,
                 &object_sources,
+                &model_outputs,
                 &mut required,
                 &mut errors,
             );
@@ -336,6 +395,7 @@ pub fn validate(
                 requirement,
                 catalogue,
                 &object_sources,
+                &model_outputs,
                 &mut required,
                 &mut errors,
             );
@@ -348,6 +408,7 @@ pub fn validate(
             &format!("output `{}`", output.name),
             catalogue,
             &object_sources,
+            &model_outputs,
             &mut required,
             &mut errors,
         );
@@ -378,6 +439,7 @@ fn validate_cut(
     cut: &Cut,
     catalogue: &Catalogue,
     object_sources: &HashMap<&str, &str>,
+    model_outputs: &ModelOutputs,
     required: &mut RequiredBranches,
     errors: &mut Vec<SpecError>,
 ) {
@@ -387,6 +449,7 @@ fn validate_cut(
         &context,
         catalogue,
         object_sources,
+        model_outputs,
         required,
         errors,
     );
@@ -409,6 +472,7 @@ fn validate_requirement(
     requirement: &Requirement,
     catalogue: &Catalogue,
     object_sources: &HashMap<&str, &str>,
+    model_outputs: &ModelOutputs,
     required: &mut RequiredBranches,
     errors: &mut Vec<SpecError>,
 ) {
@@ -418,6 +482,7 @@ fn validate_requirement(
         &context,
         catalogue,
         object_sources,
+        model_outputs,
         required,
         errors,
     );
@@ -428,6 +493,7 @@ fn validate_expr(
     context: &str,
     catalogue: &Catalogue,
     object_sources: &HashMap<&str, &str>,
+    model_outputs: &ModelOutputs,
     required: &mut RequiredBranches,
     errors: &mut Vec<SpecError>,
 ) -> Option<ExprType> {
@@ -438,11 +504,20 @@ fn validate_expr(
             context,
             catalogue,
             object_sources,
+            model_outputs,
             required,
             errors,
         ),
         Expr::Abs(inner) => {
-            match validate_expr(inner, context, catalogue, object_sources, required, errors) {
+            match validate_expr(
+                inner,
+                context,
+                catalogue,
+                object_sources,
+                model_outputs,
+                required,
+                errors,
+            ) {
                 Some(ExprType::Numeric(dimension)) => Some(ExprType::Numeric(dimension)),
                 Some(ExprType::Count) => {
                     errors.push(SpecError::InvalidExpression {
@@ -471,6 +546,7 @@ fn validate_expr(
             context,
             catalogue,
             object_sources,
+            model_outputs,
             required,
             errors,
         ),
@@ -483,6 +559,7 @@ fn validate_attr(
     context: &str,
     catalogue: &Catalogue,
     object_sources: &HashMap<&str, &str>,
+    model_outputs: &ModelOutputs,
     required: &mut RequiredBranches,
     errors: &mut Vec<SpecError>,
 ) -> Option<ExprType> {
@@ -495,6 +572,11 @@ fn validate_attr(
     };
 
     let branch = format!("{source}_{attr}");
+    if let Some(output) = model_outputs.by_branch.get(&branch) {
+        required.require_counter(source);
+        return Some(ExprType::Numeric(output.dimension));
+    }
+
     let Some(entry) = catalogue.branch(&branch) else {
         errors.push(SpecError::MissingBranch {
             context: context.to_string(),
@@ -551,6 +633,241 @@ fn validate_quantity_unit(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelOutputInfo {
+    dimension: Dimension,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ModelOutputs {
+    by_branch: BTreeMap<String, ModelOutputInfo>,
+}
+
+fn validate_models(
+    spec: &AnalysisSpec,
+    catalogue: &Catalogue,
+    object_sources: &HashMap<&str, &str>,
+    required: &mut RequiredBranches,
+    errors: &mut Vec<SpecError>,
+) -> ModelOutputs {
+    let mut outputs = ModelOutputs::default();
+    let mut seen_names = BTreeSet::new();
+    let mut seen_outputs = BTreeSet::new();
+
+    for model in &spec.models {
+        let context = format!("model `{}`", model.name);
+        if !seen_names.insert(model.name.as_str()) {
+            errors.push(SpecError::InvalidModel {
+                context: context.clone(),
+                detail: format!("duplicate model name `{}`", model.name),
+            });
+        }
+
+        let batch_source = validate_model_batch(model, &context, object_sources, errors);
+        validate_model_inputs(model, &context, catalogue, required, errors);
+        validate_model_output(
+            model,
+            &context,
+            batch_source,
+            catalogue,
+            &mut seen_outputs,
+            &mut outputs,
+            errors,
+        );
+        validate_model_provider(model, &context, errors);
+    }
+
+    outputs
+}
+
+fn validate_model_batch(
+    model: &ModelDef,
+    context: &str,
+    object_sources: &HashMap<&str, &str>,
+    errors: &mut Vec<SpecError>,
+) -> Option<String> {
+    if let Some(source) = object_sources.get(model.batch.as_str()) {
+        return Some((*source).to_string());
+    }
+    if object_sources
+        .values()
+        .any(|source| *source == model.batch.as_str())
+    {
+        return Some(model.batch.clone());
+    }
+
+    errors.push(SpecError::UndefinedBatch {
+        context: context.to_string(),
+        batch: model.batch.clone(),
+    });
+    None
+}
+
+fn validate_model_inputs(
+    model: &ModelDef,
+    context: &str,
+    catalogue: &Catalogue,
+    required: &mut RequiredBranches,
+    errors: &mut Vec<SpecError>,
+) {
+    if model.inputs.is_empty() {
+        errors.push(SpecError::InvalidModel {
+            context: context.to_string(),
+            detail: "model inputs must not be empty".to_string(),
+        });
+    }
+
+    for input in &model.inputs {
+        let input_context = format!("{context} input `{input}`");
+        let Some(entry) = catalogue.branch(input) else {
+            errors.push(SpecError::MissingBranch {
+                context: input_context,
+                branch: input.clone(),
+            });
+            continue;
+        };
+        let Some(branch_type) = entry.branch_type else {
+            errors.push(SpecError::UnsupportedBranchType {
+                context: input_context,
+                branch: input.clone(),
+                raw_type: entry.raw_type.clone(),
+            });
+            continue;
+        };
+        if !is_numeric_branch(branch_type) {
+            errors.push(SpecError::WrongBranchType {
+                context: input_context,
+                branch: input.clone(),
+                expected: "numeric branch".to_string(),
+                actual: branch_type,
+            });
+            continue;
+        }
+        required.require_branch(input);
+    }
+}
+
+fn validate_model_output(
+    model: &ModelDef,
+    context: &str,
+    batch_source: Option<String>,
+    catalogue: &Catalogue,
+    seen_outputs: &mut BTreeSet<String>,
+    outputs: &mut ModelOutputs,
+    errors: &mut Vec<SpecError>,
+) {
+    if model.output_dtype != ModelOutputDType::F32 {
+        errors.push(SpecError::InvalidModel {
+            context: context.to_string(),
+            detail: "model output dtype must be F32".to_string(),
+        });
+    }
+
+    let Some((output_source, output_attr)) = model.output.split_once('_') else {
+        errors.push(SpecError::InvalidModel {
+            context: context.to_string(),
+            detail: format!(
+                "output `{}` must be a per-object column like `Collection_score`",
+                model.output
+            ),
+        });
+        return;
+    };
+
+    if output_source.is_empty() || output_attr.is_empty() {
+        errors.push(SpecError::InvalidModel {
+            context: context.to_string(),
+            detail: format!(
+                "output `{}` must be a per-object column like `Collection_score`",
+                model.output
+            ),
+        });
+        return;
+    }
+
+    if let Some(batch_source) = batch_source.as_deref() {
+        if output_source != batch_source {
+            errors.push(SpecError::InvalidModel {
+                context: context.to_string(),
+                detail: format!(
+                    "output `{}` belongs to `{output_source}`, but batch `{}` resolves to `{batch_source}`",
+                    model.output, model.batch
+                ),
+            });
+        }
+    }
+
+    if catalogue.branch(&model.output).is_some() {
+        errors.push(SpecError::ModelOutputCollision {
+            context: context.to_string(),
+            output: model.output.clone(),
+        });
+    }
+
+    if !seen_outputs.insert(model.output.clone()) {
+        errors.push(SpecError::ModelOutputCollision {
+            context: context.to_string(),
+            output: model.output.clone(),
+        });
+    }
+
+    outputs.by_branch.insert(
+        model.output.clone(),
+        ModelOutputInfo {
+            dimension: Dimension::Dimensionless,
+        },
+    );
+}
+
+fn validate_model_provider(model: &ModelDef, context: &str, errors: &mut Vec<SpecError>) {
+    match &model.provider.kind {
+        ModelProviderKind::Mock => {}
+        ModelProviderKind::InProcess => {
+            if model
+                .provider
+                .onnx_path
+                .as_deref()
+                .is_none_or(str::is_empty)
+            {
+                errors.push(SpecError::InvalidProvider {
+                    context: context.to_string(),
+                    detail: "inproc provider requires `onnx_path`".to_string(),
+                });
+            }
+        }
+        ModelProviderKind::Remote => match model.provider.endpoint.as_deref() {
+            Some(endpoint) if url::Url::parse(endpoint).is_ok() => {}
+            Some(endpoint) => errors.push(SpecError::InvalidProvider {
+                context: context.to_string(),
+                detail: format!("remote provider endpoint `{endpoint}` is not a valid URL"),
+            }),
+            None => errors.push(SpecError::InvalidProvider {
+                context: context.to_string(),
+                detail: "remote provider requires `endpoint`".to_string(),
+            }),
+        },
+        ModelProviderKind::Managed => {
+            if model.provider.launch.as_deref().is_none_or(str::is_empty) {
+                errors.push(SpecError::InvalidProvider {
+                    context: context.to_string(),
+                    detail: "managed provider requires `launch`".to_string(),
+                });
+            }
+        }
+        ModelProviderKind::Other(kind) => {
+            let detail = if kind.is_empty() {
+                "provider requires `kind`".to_string()
+            } else {
+                format!("unsupported provider kind `{kind}`")
+            };
+            errors.push(SpecError::InvalidProvider {
+                context: context.to_string(),
+                detail,
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExprType {
     Numeric(Dimension),
     Count,
@@ -574,6 +891,7 @@ fn attribute_dimension(attr: &str) -> Dimension {
 struct RequiredBranches {
     counters: BTreeSet<String>,
     attrs: BTreeSet<(String, String)>,
+    branches: BTreeSet<String>,
 }
 
 impl RequiredBranches {
@@ -585,19 +903,36 @@ impl RequiredBranches {
         self.attrs.insert((source.to_string(), attr.to_string()));
     }
 
+    fn require_branch(&mut self, branch: &str) {
+        self.branches.insert(branch.to_string());
+    }
+
     fn to_branch_specs(&self, catalogue: &Catalogue) -> Result<Vec<BranchSpec>, SpecError> {
-        let mut specs = Vec::with_capacity(self.counters.len() + self.attrs.len());
+        let mut specs =
+            Vec::with_capacity(self.counters.len() + self.attrs.len() + self.branches.len());
+        let mut seen = BTreeSet::new();
 
         for source in &self.counters {
             let branch = format!("n{source}");
             let branch_type = catalogue_branch_type(catalogue, &branch, "derived read_branches")?;
-            specs.push(BranchSpec::new(branch, branch_type));
+            if seen.insert(branch.clone()) {
+                specs.push(BranchSpec::new(branch, branch_type));
+            }
         }
 
         for (source, attr) in &self.attrs {
             let branch = format!("{source}_{attr}");
             let branch_type = catalogue_branch_type(catalogue, &branch, "derived read_branches")?;
-            specs.push(BranchSpec::new(branch, branch_type));
+            if seen.insert(branch.clone()) {
+                specs.push(BranchSpec::new(branch, branch_type));
+            }
+        }
+
+        for branch in &self.branches {
+            let branch_type = catalogue_branch_type(catalogue, branch, "derived read_branches")?;
+            if seen.insert(branch.clone()) {
+                specs.push(BranchSpec::new(branch.clone(), branch_type));
+            }
         }
 
         Ok(specs)
@@ -628,6 +963,30 @@ fn is_numeric_vector(branch_type: BranchType) -> bool {
     matches!(
         branch_type,
         BranchType::VecI8
+            | BranchType::VecU8
+            | BranchType::VecI16
+            | BranchType::VecU16
+            | BranchType::VecI32
+            | BranchType::VecU32
+            | BranchType::VecI64
+            | BranchType::VecU64
+            | BranchType::VecF32
+    )
+}
+
+fn is_numeric_branch(branch_type: BranchType) -> bool {
+    matches!(
+        branch_type,
+        BranchType::I8
+            | BranchType::U8
+            | BranchType::I16
+            | BranchType::U16
+            | BranchType::I32
+            | BranchType::U32
+            | BranchType::I64
+            | BranchType::U64
+            | BranchType::F32
+            | BranchType::VecI8
             | BranchType::VecU8
             | BranchType::VecI16
             | BranchType::VecU16
@@ -931,11 +1290,17 @@ fn validate_identifier(value: &str, expression: &str) -> Result<(), ParseError> 
     Ok(())
 }
 
+fn validate_branch_name(value: &str, expression: &str) -> Result<(), ParseError> {
+    validate_identifier(value, expression)
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct RawAnalysisSpec {
     analysis: RawAnalysis,
     #[serde(default)]
     objects: BTreeMap<String, RawObject>,
+    #[serde(default, rename = "model")]
+    models: Vec<RawModel>,
     #[serde(default)]
     regions: BTreeMap<String, RawRegion>,
     #[serde(default)]
@@ -956,6 +1321,31 @@ struct RawObject {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct RawModel {
+    name: String,
+    #[serde(default)]
+    inputs: Vec<String>,
+    output: String,
+    #[serde(default)]
+    dtype: Option<String>,
+    batch: String,
+    #[serde(default)]
+    provider: Option<RawModelProvider>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawModelProvider {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    launch: Option<String>,
+    #[serde(default)]
+    onnx_path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct RawRegion {
     #[serde(default)]
     require: Vec<String>,
@@ -965,6 +1355,55 @@ struct RawRegion {
 struct RawOutput {
     name: String,
     expr: String,
+}
+
+fn model_def_from_raw(raw: RawModel) -> Result<ModelDef, ParseError> {
+    validate_identifier(&raw.name, "model name")?;
+    for input in &raw.inputs {
+        validate_branch_name(input, &format!("model `{}` input", raw.name))?;
+    }
+    validate_branch_name(&raw.output, &format!("model `{}` output", raw.name))?;
+    validate_identifier(&raw.batch, &format!("model `{}` batch", raw.name))?;
+
+    let output_dtype = match raw.dtype.as_deref() {
+        None | Some("F32" | "f32" | "float" | "Float") => ModelOutputDType::F32,
+        Some(dtype) => {
+            return Err(ParseError::InvalidSpec(format!(
+                "model `{}` has unsupported output dtype `{dtype}`; expected F32",
+                raw.name
+            )));
+        }
+    };
+
+    Ok(ModelDef {
+        name: raw.name,
+        inputs: raw.inputs,
+        output: raw.output,
+        output_dtype,
+        batch: raw.batch,
+        provider: raw
+            .provider
+            .map(model_provider_from_raw)
+            .unwrap_or_else(ModelProviderSpec::mock),
+    })
+}
+
+fn model_provider_from_raw(raw: RawModelProvider) -> ModelProviderSpec {
+    let kind = match raw.kind.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("mock") => ModelProviderKind::Mock,
+        Some("inproc") => ModelProviderKind::InProcess,
+        Some("remote") => ModelProviderKind::Remote,
+        Some("managed") => ModelProviderKind::Managed,
+        Some(other) => ModelProviderKind::Other(other.to_string()),
+        None => ModelProviderKind::Other(String::new()),
+    };
+
+    ModelProviderSpec {
+        kind,
+        endpoint: raw.endpoint,
+        launch: raw.launch,
+        onnx_path: raw.onnx_path,
+    }
 }
 
 /// Spec/cut parsing errors.
@@ -1033,6 +1472,22 @@ pub enum SpecError {
         context: String,
         object: String,
     },
+    UndefinedBatch {
+        context: String,
+        batch: String,
+    },
+    ModelOutputCollision {
+        context: String,
+        output: String,
+    },
+    InvalidModel {
+        context: String,
+        detail: String,
+    },
+    InvalidProvider {
+        context: String,
+        detail: String,
+    },
     InvalidExpression {
         context: String,
         detail: String,
@@ -1085,6 +1540,17 @@ impl fmt::Display for SpecError {
             Self::UndefinedObject { context, object } => {
                 write!(f, "{context}: undefined object `{object}`")
             }
+            Self::UndefinedBatch { context, batch } => {
+                write!(f, "{context}: undefined batch `{batch}`")
+            }
+            Self::ModelOutputCollision { context, output } => {
+                write!(
+                    f,
+                    "{context}: model output `{output}` collides with an existing column"
+                )
+            }
+            Self::InvalidModel { context, detail } => write!(f, "{context}: {detail}"),
+            Self::InvalidProvider { context, detail } => write!(f, "{context}: {detail}"),
             Self::InvalidExpression { context, detail } => write!(f, "{context}: {detail}"),
             Self::InvalidReadSchema { detail } => write!(f, "invalid read schema: {detail}"),
         }
@@ -1118,6 +1584,7 @@ mod tests {
     use super::*;
 
     const MUON_SPEC_TOML: &str = include_str!("../examples/muon.toml");
+    const MUON_TAGGER_SPEC_TOML: &str = include_str!("../examples/muon_tagger.toml");
     const MUON_SPEC_YAML: &str = include_str!("../examples/muon.yaml");
     const MUON_SPEC_JSON: &str = r#"
 {
@@ -1199,6 +1666,75 @@ mod tests {
                 ("Muon_pt", BranchType::VecF32),
             ]
         );
+    }
+
+    #[test]
+    fn parses_model_binding_with_default_mock_provider() {
+        let spec = AnalysisSpec::from_toml_str(MUON_TAGGER_SPEC_TOML).expect("parse model spec");
+
+        assert_eq!(spec.models.len(), 1);
+        assert_eq!(spec.models[0].name, "muon_tagger");
+        assert_eq!(
+            spec.models[0].inputs,
+            vec!["Muon_pt", "Muon_eta", "Muon_phi"]
+        );
+        assert_eq!(spec.models[0].output, "Muon_topscore");
+        assert_eq!(spec.models[0].output_dtype, ModelOutputDType::F32);
+        assert_eq!(spec.models[0].provider.kind, ModelProviderKind::Mock);
+    }
+
+    #[test]
+    fn validation_accepts_model_output_and_derives_model_inputs() {
+        let spec = AnalysisSpec::from_toml_str(MUON_TAGGER_SPEC_TOML).expect("parse model spec");
+        let plan = validate(&spec, &catalogue()).expect("validate model spec");
+        let read_branches = plan
+            .read_branches
+            .specs()
+            .iter()
+            .map(|spec| (spec.name.as_str(), spec.branch_type))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            read_branches,
+            vec![
+                ("nMuon", BranchType::U32),
+                ("Muon_eta", BranchType::VecF32),
+                ("Muon_pt", BranchType::VecF32),
+                ("Muon_phi", BranchType::VecF32),
+            ]
+        );
+    }
+
+    #[test]
+    fn validation_rejects_unproduced_score_reference() {
+        let spec_text = MUON_TAGGER_SPEC_TOML.replacen(
+            "output = \"Muon_topscore\"",
+            "output = \"Muon_other_score\"",
+            1,
+        );
+        let spec = AnalysisSpec::from_toml_str(&spec_text).expect("parse modified spec");
+        let errors = validate(&spec, &catalogue()).expect_err("validation should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::MissingBranch { branch, .. } if branch == "Muon_topscore"
+        )));
+    }
+
+    #[test]
+    fn validation_rejects_malformed_model_provider() {
+        let spec_text = MUON_TAGGER_SPEC_TOML.replace(
+            "kind = \"mock\"",
+            "kind = \"remote\"\nendpoint = \"not a url\"",
+        );
+        let spec = AnalysisSpec::from_toml_str(&spec_text).expect("parse modified spec");
+        let errors = validate(&spec, &catalogue()).expect_err("validation should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidProvider { detail, .. }
+                if detail.contains("not a valid URL")
+        )));
     }
 
     #[test]

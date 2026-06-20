@@ -123,6 +123,13 @@ impl<'a> Generator<'a> {
     }
 
     fn validate_supported_spec(&self) -> Result<(), CodegenError> {
+        if !self.spec().models.is_empty() {
+            return Err(CodegenError::UnsupportedFeature(
+                "model bindings are validated, but this codegen slice does not emit inference"
+                    .to_string(),
+            ));
+        }
+
         for object in &self.spec().objects {
             checked_ident(&object.name, "object name")?;
             checked_ident(&object.source, "object source")?;

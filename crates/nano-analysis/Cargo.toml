@@ -8,6 +8,7 @@ description = "Typed analysis state-machine layer for nano.rust events"
 
 [dependencies]
 nano-core = { workspace = true }
+nano-inference = { workspace = true }
 
 [features]
 default = []

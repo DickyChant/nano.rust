@@ -40,6 +40,7 @@ pub struct AnalysisSummary {
     pub name: String,
     pub year: String,
     pub objects: Vec<ObjectSummary>,
+    pub models: Vec<ModelSummary>,
     pub regions: Vec<String>,
     pub outputs: Vec<String>,
 }
@@ -51,10 +52,20 @@ pub struct ObjectSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModelSummary {
+    pub name: String,
+    pub inputs: Vec<String>,
+    pub output: String,
+    pub batch: String,
+    pub provider: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BranchesReport {
     pub status: Status,
     pub spec_path: PathBuf,
     pub catalogue_version: String,
+    pub models: Vec<ModelSummary>,
     pub branches: Vec<BranchReport>,
 }
 
@@ -154,6 +165,10 @@ pub enum ValidationErrorKind {
     MissingUnit,
     UnitMismatch,
     UndefinedObject,
+    UndefinedBatch,
+    ModelOutputCollision,
+    InvalidModel,
+    InvalidProvider,
     InvalidExpression,
     InvalidReadSchema,
 }
@@ -185,24 +200,31 @@ pub fn render_text(output: &Output) -> String {
                 .join(", ");
             let regions = report.analysis.regions.join(", ");
             let outputs = report.analysis.outputs.join(", ");
+            let models = format_models(&report.analysis.models);
             format!(
-                "OK validate {}\nanalysis: {} ({})\ncatalogue: {}\nobjects: {}\nregions: {}\noutputs: {}\nread_branches: {}",
+                "OK validate {}\nanalysis: {} ({})\ncatalogue: {}\nobjects: {}\nmodels: {}\nregions: {}\noutputs: {}\nread_branches: {}",
                 report.spec_path.display(),
                 report.analysis.name,
                 report.analysis.year,
                 report.catalogue_version,
                 objects,
+                models,
                 regions,
                 outputs,
                 format_branches(&report.read_branches)
             )
         }
-        Output::Branches(report) => report
-            .branches
-            .iter()
-            .map(|branch| format!("{} {}", branch.name, branch.branch_type))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        Output::Branches(report) => {
+            let mut lines = report
+                .branches
+                .iter()
+                .map(|branch| format!("{} {}", branch.name, branch.branch_type))
+                .collect::<Vec<_>>();
+            if !report.models.is_empty() {
+                lines.push(format!("models: {}", format_models(&report.models)));
+            }
+            lines.join("\n")
+        }
         Output::Inspect(report) => {
             let mut lines = Vec::new();
             for tree in &report.trees {
@@ -259,6 +281,7 @@ fn branches_command(spec_path: &Path) -> Result<Output> {
         status: Status::Ok,
         spec_path: spec_path.to_path_buf(),
         catalogue_version: DEFAULT_CATALOGUE_VERSION.to_string(),
+        models: analysis_summary(&plan.spec).models,
         branches: branch_reports(plan.read_branches.specs()),
     }))
 }
@@ -369,6 +392,17 @@ fn analysis_summary(spec: &AnalysisSpec) -> AnalysisSummary {
                 source: object.source.clone(),
             })
             .collect(),
+        models: spec
+            .models
+            .iter()
+            .map(|model| ModelSummary {
+                name: model.name.clone(),
+                inputs: model.inputs.clone(),
+                output: model.output.clone(),
+                batch: model.batch.clone(),
+                provider: format!("{:?}", model.provider.kind),
+            })
+            .collect(),
         regions: spec
             .regions
             .iter()
@@ -380,6 +414,22 @@ fn analysis_summary(spec: &AnalysisSpec) -> AnalysisSummary {
             .map(|output| output.name.clone())
             .collect(),
     }
+}
+
+fn format_models(models: &[ModelSummary]) -> String {
+    if models.is_empty() {
+        return "(none)".to_string();
+    }
+    models
+        .iter()
+        .map(|model| {
+            format!(
+                "{}:{} -> {} [{}]",
+                model.name, model.batch, model.output, model.provider
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn branch_reports(branches: &[nano_core::BranchSpec]) -> Vec<BranchReport> {
@@ -489,6 +539,50 @@ fn validation_error_report(error: &SpecError) -> ValidationErrorReport {
             expected: Some("defined object".to_string()),
             actual: None,
             detail: None,
+        },
+        SpecError::UndefinedBatch { context, batch } => ValidationErrorReport {
+            kind: ValidationErrorKind::UndefinedBatch,
+            message: error.to_string(),
+            context: Some(context.clone()),
+            branch: None,
+            object: Some(batch.clone()),
+            expr: None,
+            expected: Some("defined object or collection".to_string()),
+            actual: None,
+            detail: None,
+        },
+        SpecError::ModelOutputCollision { context, output } => ValidationErrorReport {
+            kind: ValidationErrorKind::ModelOutputCollision,
+            message: error.to_string(),
+            context: Some(context.clone()),
+            branch: Some(output.clone()),
+            object: None,
+            expr: None,
+            expected: Some("fresh model output column".to_string()),
+            actual: Some("existing column".to_string()),
+            detail: None,
+        },
+        SpecError::InvalidModel { context, detail } => ValidationErrorReport {
+            kind: ValidationErrorKind::InvalidModel,
+            message: error.to_string(),
+            context: Some(context.clone()),
+            branch: None,
+            object: None,
+            expr: None,
+            expected: None,
+            actual: None,
+            detail: Some(detail.clone()),
+        },
+        SpecError::InvalidProvider { context, detail } => ValidationErrorReport {
+            kind: ValidationErrorKind::InvalidProvider,
+            message: error.to_string(),
+            context: Some(context.clone()),
+            branch: None,
+            object: None,
+            expr: None,
+            expected: None,
+            actual: None,
+            detail: Some(detail.clone()),
         },
         SpecError::InvalidExpression { context, detail } => ValidationErrorReport {
             kind: ValidationErrorKind::InvalidExpression,
