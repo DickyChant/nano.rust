@@ -76,6 +76,31 @@ correctionlib, combine, pyhf) at the boundary; **SIMD** per-event execution; and
 a rich **TUI** ecosystem useful both for human orchestration tooling and for
 agent-driven execution.
 
+## Correctness is (most of) the parallelism proof
+
+The deepest payoff is a near-tautology in Rust: **if it compiles, it's safe to
+parallelize.** A per-event kernel that satisfies the spec is one the borrow
+checker has already proven to have no hidden aliasing and no shared mutable state
+escaping its declared inputs — which is *exactly* the soundness condition for
+parallel execution. It's not a second proof; it's the same proof.
+
+So the **schedule becomes free.** The analysis is really a dependency graph
+(objects ← branches, cuts ← objects, weights/outputs ← objects + corrections,
+systematics as a fan-out); the typed state machine is just one *linearization* of
+it — a serial event loop. Any schedule that respects the dependencies is equally
+legal, so the *same* verified kernel runs event-at-a-time for clarity,
+column-at-a-time for SIMD, or chunk-parallel across cores — each correct by
+construction. You verify *what* once; the framework picks *how*.
+
+And the compiler **guides** it: a `Fn(&Event) -> Row` over `Send` data
+parallelizes through `rayon`'s `par_iter` by construction; share state through a
+non-thread-safe reference and it simply won't compile until you make it
+thread-safe — the compiler rejects the unsafe schedule instead of letting a
+silent data race through. Reductions (histograms) are a safe parallel-reduce.
+This is also the real performance lever: correctness-preserving parallelism is
+essentially *free*, where C++ makes you audit for races and Python can't express
+it safely at all.
+
 ## It's buildable today
 
 [nano.rust](https://github.com/DickyChant/nano.rust) is the realization in
