@@ -7,7 +7,8 @@ structured error data.
 
 The server is intentionally the agent-facing form of the same validation-confined action
 space as the `nano` CLI. Tool effects are limited to parsing, validation, ROOT file
-inspection, and source generation. A failed validation is returned as data, not as a
+inspection, source generation, and running a validated workflow over inputs. A failed
+validation is returned as data, not as a
 transport error, so an agent can revise its next proposal from concrete diagnostics.
 
 ## Running
@@ -111,6 +112,30 @@ Output:
 { "ok": true, "source": "generated Rust source...", "errors": [] }
 ```
 
+`run_workflow`
+
+Validate a spec, resolve a registered runtime kernel, execute the local workflow DAG
+over ROOT inputs, and write the skim plus provenance manifest.
+
+Input: `{ "spec_path": "...toml", "inputs": ["a.root", "b.root"], "output": "skim.root"?, "parallel": false? }`.
+
+Output:
+
+```json
+{
+  "ok": true,
+  "inputs": ["a.root"],
+  "events_seen": 1000,
+  "events_selected": 348,
+  "output": "skim.root",
+  "errors": []
+}
+```
+
+(Runtime execution uses the precompiled kernel registry; a spec with no compatible
+compiled kernel returns `ok: false` with a `kernel` error — codegen produces source to
+compile in, it is not JIT-run. See [`architecture.md`](architecture.md).)
+
 ## Errors
 
 Domain failures are returned in the tool result with `ok: false` and `isError: true` at
@@ -136,6 +161,7 @@ the MCP tool-call layer:
 }
 ```
 
-Error kinds are `usage`, `parse`, `catalogue`, `validation`, `codegen`, and `inspect`.
+Error kinds are `usage`, `parse`, `catalogue`, `validation`, `codegen`, `inspect`,
+and `kernel` (no compiled kernel for the spec, from `run_workflow`).
 Validation diagnostics preserve typed fields such as `context`, `branch`, `object`,
 `expr`, `expected`, `actual`, and `detail`.

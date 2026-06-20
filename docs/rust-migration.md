@@ -1,5 +1,15 @@
 # Rust Migration Plan
 
+> **Status — much of this plan is now built; this remains the rationale + staged
+> record.** ROOT I/O is done in pure Rust: `crates/nano-rootio` is the **owned read +
+> write** core (the "make root-io a true read+write library" goal below — realized as our
+> own crate), with `crates/root-io` kept only as a dev/A-B oracle; remote HTTPS byte-range
+> reads work and are uproot-validated in CI. The event model, the typed state machine, the
+> semantic compiler **with codegen**, native corrections, the inference protocol, the
+> workflow DAG, and the `nano` CLI + MCP all exist. See [`vision.md`](vision.md) for the
+> live phase status and [`architecture.md`](architecture.md) for the verifier/back-end
+> picture. The text below is the original Phase-0/1 plan, kept for the reasoning.
+
 ## Why Rust
 
 The framework's contract is **"agents write, you review."** Agents produce most of the implementation code; the human reviews physics, not syntax. That makes the *language's safety floor* the most important property: the cheaper it is to catch agent mistakes at compile time, the less physics-review effort leaks into chasing memory/aliasing bugs.

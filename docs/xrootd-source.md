@@ -1,8 +1,9 @@
 # Remote `Source` (HTTP byte-range / xrootd)
 
-Status: **HTTP byte-range = stage one, in progress** (promoted ahead of the semantic
-layer so CI can read open data remotely with no stored files). Native xrootd remains a
-later project.
+Status: **HTTP byte-range = built and CI-tested** — remote on-demand reads work
+(`nano_io::events_url` / `events_url_chunked` behind the `http` feature; the first ten
+events of a 2 GB open-data file fetch ~1.3 MB), validated against uproot in CI with no
+stored files. Native xrootd remains a later project (HTTPS covers CMS Open Data today).
 
 ## Confirmed: CMS Open Data is HTTPS byte-range readable
 

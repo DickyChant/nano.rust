@@ -1,5 +1,12 @@
 # Framework Structure
 
+> **Status — C++ snapshot reference.** This describes the **C++** framework
+> (`nano_run` / NanoAODToolsCpp) preserved on the `cpp-snapshot` branch, kept as the
+> behavioral reference. Active development is the Rust rewrite on `main` — for the
+> current design see [`architecture.md`](architecture.md), [`vision.md`](vision.md),
+> and [`rust-migration.md`](rust-migration.md). Do not read the directory layout /
+> execution flow below as the current (Rust) structure.
+
 ## Entry points
 
 - `app/nano_run.cpp`: run one channel locally on one or more input ROOT files.

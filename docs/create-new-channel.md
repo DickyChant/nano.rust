@@ -1,5 +1,12 @@
 # Create a New Channel
 
+> **Status — C++ snapshot reference.** This is the **C++** channel-creation workflow
+> (`src/producers/*.cpp`), preserved on `cpp-snapshot`. On the Rust `main` a channel is
+> **spec-driven**: write and validate a spec (`nano-spec`), let codegen emit the
+> `nano-analysis` typestate kernel, and run it via `nano run` / `nano-workflow` — see
+> [`semantic-layer.md`](semantic-layer.md) and [`architecture.md`](architecture.md).
+> A Rust-specific channel guide will replace this doc.
+
 ## Goal
 
 Add one new producer with minimal framework churn and with enough file-level documentation that a reviewer can understand the channel without reading all helper code.
