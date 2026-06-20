@@ -1,166 +1,111 @@
-# nano.cpp
+# nano.rust
 
-`nano.cpp` (also named as `NanoAODTools.Cpp`) is a C++ rewrite of selected [NanoAOD-tools](https://github.com/cms-nanoAOD/nanoAOD-tools)/[NanoHRTTools](https://github.com/hqucms/NanoHRT-tools) workflows.
+[![CI](https://github.com/DickyChant/nano.rust/actions/workflows/ci.yml/badge.svg)](https://github.com/DickyChant/nano.rust/actions/workflows/ci.yml)
+[![docs](https://github.com/DickyChant/nano.rust/actions/workflows/docs.yml/badge.svg)](https://github.com/DickyChant/nano.rust/actions/workflows/docs.yml)
+[![links](https://github.com/DickyChant/nano.rust/actions/workflows/links.yml/badge.svg)](https://github.com/DickyChant/nano.rust/actions/workflows/links.yml)
 
-The goal is to keep the analysis logic human-readable while making the event loop faster and easier to validate. The style is intentionally close to the traditional ROOT event loop:
+A **pure-Rust, semantics-first NanoAOD analysis framework** for high-energy physics,
+built for the agentic-coding era.
 
-- read one event
-- build objects
-- apply selections
-- compute new features
-- write a skim tree
+📖 **API docs + notes:** https://dickychant.github.io/nano.rust/
 
-The guiding idea is:
+## The idea
 
-> Agents write, you review.
+Agentic tools can write analysis code faster than anyone can review it. The
+bottleneck is no longer *writing* code but *guaranteeing* it is correct. Soft
+guardrails — prompts, skills, harnesses, human review — can *steer* an agent but
+cannot *guarantee* the absence of silent analysis bugs (wrong branch, dropped
+systematic, mixed units, stale outputs). A hard guarantee needs a mechanical
+enforcer:
 
-The framework is designed so AI agents can write straightforward C++ while humans can still review the physics logic in a direct, readable way.
+> Physicists define and review physics **semantics**.
+> Agents generate **implementation**.
+> The **Rust compiler** and a validation layer reject inconsistent states.
 
-## Why This Exists
+So the analysis is modelled as a typed **state machine** the compiler checks
+(make invalid analysis states unrepresentable), with Rust's strengths layered on:
+performance, FFI to legacy libraries, SIMD per-event execution, and TUI-friendly
+orchestration. Full rationale: [`paper`/`docs/vision.md`](docs/vision.md).
 
-The original NanoAOD-tools code is Python-based and flexible, but it is not as fast as columnar analysis frameworks such as RDataFrame or awkward-array/coffea. This repository keeps the useful NanoAOD-tools programming model and moves the event processing to C++ for faster ntuplization.
+## What works today
 
-The intended style is explicit event-level code:
+- **Owned, pure-Rust ROOT I/O** (`nano-rootio`, no ROOT/C++ dependency):
+  - reads real **CMS NanoAODv9** — scalars, jagged collections, windowed reads,
+    **bounded-memory streaming** (~3 MB to stream a skim of any-size file);
+  - reads **locally and remotely on-demand** over HTTPS byte-range (the first 10
+    events of a 2 GB open-data file fetch ~1.3 MB — only the baskets touched);
+  - **writes** ROOT/uproot-readable skims (scalars **and** jagged);
+  - validated A/B against the upstream reader and cross-checked against
+    **`uproot`** in CI, both read and write.
+- **Typed event model** (`nano-core`): collections, attributes, the
+  `Prefix_attr` grouping rule, `Rc`-shared per-event columns.
+- **Compile-enforced state machine** (`nano-analysis`):
+  `Ev<Raw> → Baseline → InRegion<R> → Weighted<R>`; filling a histogram
+  *requires* a `Weighted<R>`, so wrong-stage / wrong-region / unweighted fills are
+  **compile errors** (proven by compile-fail tests). Unit newtypes, exhaustive
+  `Systematic`.
+- **Semantic IR** (`nano-spec`): a physics-facing YAML spec is parsed, statically
+  validated (missing branch / wrong type / missing unit / undefined object are
+  rejected with precise errors), and used to **derive the exact `read_branches`**
+  for the reader.
 
-```cpp
-auto fatjets = event.collection("FatJet").objects();
+## Workspace
 
-for (auto &jet : event.collection("Jet").objects()) {
-  const auto btag = jet.get<float>("btagUParTAK4B");
-  if (jet.pt() > 30.0f && std::abs(jet.eta()) < 2.4f && btag > btag_wp) {
-    bjets.push_back(jet);
-  }
-}
-
-event.set("bjets", bjets);
-event.set("leptonicW", leptonic_w);
-
-for (auto &fj : fatjets) {
-  fj.set("subjets", linked_subjets);
-  fj.set("dr_T", delta_r_to_top);
-  fj.set("is_qualified", true);
-}
+```
+crates/
+  nano-rootio    owned ROOT TTree read + write (NanoAOD subset; pure Rust)
+  nano-core      event model (Event / Collection / ObjectView, branch schema)
+  nano-io        streaming reader + skim writer over nano-rootio
+  nano-producers analysis channels (muon control region)
+  nano-analysis  compile-enforced analysis state machine (typestate)
+  nano-spec      semantic IR: spec -> validate -> derive read_branches
+  root-io        vendored upstream reader, retained only as a dev/A-B oracle
 ```
 
-In practice this means:
+The architecture, layer by layer:
 
-- Object collections are accessed from the event, for example `event.collection("FatJet")`.
-- NanoAOD branches are accessed as typed object attributes, for example `fj.get<float>("msoftdrop")`.
-- New event-level values can be attached to `event`, for example:
-  - attach selected muons: `event.set("muons", selected_muons);`
-  - attach corrected MET: `event.set("met_pt", corrected_met_pt);`
-  - attach the reconstructed W candidate: `event.set("leptonicW", leptonic_w);`
-- New object-level features can be attached to each object, for example:
-  - attach corrected four-vectors: `auto corrected_p4 = polar_p4(obj); obj.set("p4", corrected_p4);`
-  - attach linked subjets to a given fatjet: `fj.set("subjets", linked_subjets);`
-- Channel producers are plain C++ event loops. In the main `analyze()` function, use `return false` to veto an event.
-- A YAML card in `configs/run/` contains all information to guide the run.
-- Corrections use modern correctionlib payloads where possible. JEC and MET corrections build on the CMSJMECalculators project.
+```
+physics spec (YAML/ADL)  ->  semantic IR (typed, validated)
+                         ->  Rust execution kernels (typed state machine)
+                         ->  workflow IR (planned)
+```
 
-You do not need to write this code or worry about C++ syntax; agents will fill in the implementation, and you only need to review it.
-
-## Current Scope
-
-The implemented channel is:
-
-- `muon`: a heavy-flavour muon control region targeting semileptonic ttbar-like phase space, enriched in boosted top/W jets.
-
-### Direction: rewrite in Rust
-
-The implementation in this tree is C++17, but the framework is being repositioned toward **Rust**. Under the "agents write, you review" model, the language's safety floor matters most: Rust's explicit ownership/lifetime semantics and stronger compiler catch agent-authored mistakes at compile time instead of letting them become subtle physics bugs, and `cargo` removes the ROOT/CMake build friction. NanoAOD is TTree-based, so the pure-Rust [`root-io`](https://crates.io/crates/root-io) crate covers the input side (it is read-only — the output writer is the main open problem). The C++ implementation is frozen on the `cpp-snapshot` branch as the behavioral reference. Full rationale and staged plan: `docs/rust-migration.md`.
-
-Main files:
-
-- `app/nano_run.cpp`: local runner.
-- `app/nano_make_condor.cpp`: Condor submission builder.
-- `configs/run/`: runnable YAML cards.
-- `configs/samples/`: dataset YAML files for batch submission.
-
-For agents: for framework details, read `docs/framework-structure.md`.
-
-## Build the Project
-
-Use the ROOT/LCG runtime before configuring, building, or running:
+## Build, test, run
 
 ```bash
-source /cvmfs/sft.cern.ch/lcg/views/LCG_108/x86_64-el9-gcc13-opt/setup.sh
+cargo build
+cargo test                 # whole workspace
+cargo test --features http # also exercise remote (HTTPS byte-range) reads
+
+# write a small NanoAOD-like file and inspect it (e.g. with uproot)
+cargo run -p nano-rootio --example write_demo -- /tmp/demo.root
 ```
 
-Build:
+Real-data tests read a local NanoAOD file from
+`tests/data/muon_validation/inputs/` if present (gitignored) and skip otherwise.
+The `uproot` interop + benchmark runs in CI (`scripts/bench_vs_uproot.py`)
+against CMS Open Data over HTTPS — **no checked-in data files**.
 
-```bash
-cmake -S . -B build
-cmake --build build -j
-```
+## Status & roadmap
 
-## Process One Input
+Built and validated: owned ROOT I/O (read + write, local + remote), the event
+model, the compile-enforced state machine, and the semantic IR. Next: a native
+`correctionlib` layer, code generation from the semantic IR into the typed
+kernel, a workflow IR, and golden tests against the original references. See
+[`docs/`](docs/) — [vision](docs/vision.md), [state machine](docs/state-machine.md),
+[semantic layer](docs/semantic-layer.md), [reader rewrite](docs/reader-rewrite.md),
+[remote source](docs/xrootd-source.md), [migration](docs/rust-migration.md).
 
-Example using a local validation file:
+## History
 
-```bash
-build/nano_run \
-  --input-files /store/mc/RunIISummer20UL18NanoAODv9/TTToSemiLeptonic_TuneCP5_13TeV-powheg-pythia8/NANOAODSIM/106X_upgrade2018_realistic_v16_L1v1-v1/120000/87DEE912-70CF-A549-B10B-1A229B256E88.root \
-  --output-file muon_2018_test.root \
-  --config configs/run/muon_2018_v9.yaml \
-  --channel muon \
-  --num-events 5000
-```
+nano.rust began as a C++ port (`nano.cpp` / NanoAODToolsCpp) of selected
+[NanoAOD-tools](https://github.com/cms-nanoAOD/nanoAOD-tools) /
+[NanoHRT-tools](https://github.com/hqucms/NanoHRT-tools) workflows; that snapshot
+is preserved on the `cpp-snapshot` branch. The Rust rewrite is the active line of
+development.
 
-`--input-files` accepts one file or a comma-separated list. Local paths, `root://...` paths, and `/store/...` paths are supported.
+## License
 
-Useful options:
-
-```bash
---tree-name Events
---set output.include_lhe_weights=true
---variations all
-```
-
-`--variations all` writes the nominal and JME variation outputs in one event loop.
-
-## Run Validation
-
-```bash
-ctest --test-dir build -R muon_validation --output-on-failure
-```
-
-The validation report is written to:
-
-```text
-build/test-muon-validation/key_branch_compare_report.txt
-```
-
-## Make Condor Jobs
-
-Create a Condor work directory from a sample YAML:
-
-```bash
-build/nano_make_condor \
-  --input-yaml configs/samples/muon_2018_v9_MC.yaml \
-  --output-dir /path/to/output \
-  --config configs/run/muon_2018_v9.yaml \
-  --channel muon \
-  --nfiles-per-job 5 \
-  --num-events -1
-```
-
-This creates a directory under `run/`, copies a merged config snapshot, packs the repository, and writes `submit.jdl`.
-
-Submit manually:
-
-```bash
-cd run/condor_muon_2018_<pid>
-condor_submit submit.jdl
-```
-
-Each job runs `process.sh`, unpacks the repository, builds it if needed, prints the full `nano_run` command, and writes one ROOT piece under:
-
-```text
-<output-dir>/pieces/
-```
-
-## Adding Channels
-
-Follow `docs/create-new-channel.md`.
-
-The intended workflow is that you define the physics purpose and review the logic, while agents help write a new channel by following the existing producer pattern.
+MPL-2.0. `crates/root-io` is vendored from
+[`cbourjau/alice-rs`](https://github.com/cbourjau/alice-rs) (MPL-2.0); its license
+and attribution are retained.
