@@ -489,12 +489,12 @@ mod tests {
     use super::*;
     use crate::{validate, AnalysisSpec, Catalogue};
 
-    const MUON_SPEC: &str = include_str!("../examples/muon.yaml");
+    const MUON_SPEC: &str = include_str!("../examples/muon.toml");
     const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 
     #[test]
     fn generates_muon_producer_source() {
-        let spec = AnalysisSpec::from_yaml_str(MUON_SPEC).unwrap();
+        let spec = AnalysisSpec::from_toml_str(MUON_SPEC).unwrap();
         let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
         let plan = validate(&spec, &catalogue).unwrap();
         let source = generate_producer_source(&plan).unwrap();

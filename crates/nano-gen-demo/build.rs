@@ -14,14 +14,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|path| path.parent())
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "could not find repo root"))?;
 
-    let spec_path = repo_root.join("crates/nano-spec/examples/muon.yaml");
+    let spec_path = repo_root.join("crates/nano-spec/examples/muon.toml");
     let catalogue_path = repo_root.join("configs/branches/nanov9.yaml");
     println!("cargo:rerun-if-changed={}", spec_path.display());
     println!("cargo:rerun-if-changed={}", catalogue_path.display());
 
-    let spec_text = fs::read_to_string(&spec_path)?;
     let catalogue_text = fs::read_to_string(&catalogue_path)?;
-    let spec = AnalysisSpec::from_yaml_str(&spec_text)?;
+    let spec = AnalysisSpec::from_path(&spec_path)?;
     let catalogue = Catalogue::from_nanoaod_yaml_str(&catalogue_text, "v9")?;
     let plan = validate(&spec, &catalogue).map_err(|errors| {
         io::Error::new(

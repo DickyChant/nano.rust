@@ -9,6 +9,9 @@ description = "Semantic analysis specification IR and validation for nano.rust"
 [dependencies]
 nano-core = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
 
 [features]
 default = []

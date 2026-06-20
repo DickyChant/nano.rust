@@ -1,18 +1,21 @@
 //! Semantic analysis specifications for nano.rust.
 //!
 //! This crate implements the first semantic-IR slice: parse a physics-facing
-//! YAML specification, validate it against a NanoAOD branch catalogue, and
+//! TOML/YAML/JSON specification, validate it against a NanoAOD branch catalogue, and
 //! derive the exact [`nano_core::BranchSchema`] needed by the streaming reader.
 
 use nano_core::{BranchSchema, BranchSpec, BranchType};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
 pub mod codegen;
 
 /// Typed semantic analysis specification.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AnalysisSpec {
     pub name: String,
     pub year: Year,
@@ -24,7 +27,72 @@ pub struct AnalysisSpec {
 impl AnalysisSpec {
     /// Parse an analysis specification from the physics-facing YAML form.
     pub fn from_yaml_str(input: &str) -> Result<Self, ParseError> {
-        parse_analysis_spec(input)
+        parse_analysis_spec_with_format(input, SpecFormat::Yaml)
+    }
+
+    /// Parse an analysis specification from the physics-facing TOML form.
+    pub fn from_toml_str(input: &str) -> Result<Self, ParseError> {
+        parse_analysis_spec_with_format(input, SpecFormat::Toml)
+    }
+
+    /// Parse an analysis specification from the physics-facing JSON form.
+    pub fn from_json_str(input: &str) -> Result<Self, ParseError> {
+        parse_analysis_spec_with_format(input, SpecFormat::Json)
+    }
+
+    /// Load an analysis specification from a file, dispatching by extension.
+    ///
+    /// Supported extensions are `.toml`, `.yaml`, `.yml`, and `.json`.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ParseError> {
+        load_analysis_spec(path)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AnalysisSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = <RawAnalysisSpec as serde::Deserialize>::deserialize(deserializer)?;
+        analysis_spec_from_raw(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Physics-facing spec serialization format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecFormat {
+    Toml,
+    Yaml,
+    Json,
+}
+
+impl SpecFormat {
+    /// Infer the spec format from a path extension.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ParseError> {
+        let path = path.as_ref();
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+
+        match extension.as_deref() {
+            Some("toml") => Ok(Self::Toml),
+            Some("yaml" | "yml") => Ok(Self::Yaml),
+            Some("json") => Ok(Self::Json),
+            _ => Err(ParseError::UnsupportedFormat {
+                path: path.to_path_buf(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for SpecFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Toml => f.write_str("TOML"),
+            Self::Yaml => f.write_str("YAML"),
+            Self::Json => f.write_str("JSON"),
+        }
     }
 }
 
@@ -152,10 +220,42 @@ pub struct ResolvedPlan {
     pub read_branches: BranchSchema,
 }
 
+/// Load a physics-facing spec from a file, dispatching by extension.
+pub fn load_analysis_spec(path: impl AsRef<Path>) -> Result<AnalysisSpec, ParseError> {
+    let path = path.as_ref();
+    let format = SpecFormat::from_path(path)?;
+    let input = fs::read_to_string(path).map_err(|source| ParseError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    parse_analysis_spec_with_format(&input, format)
+}
+
 /// Parse the physics-facing YAML spec into typed IR.
 pub fn parse_analysis_spec(input: &str) -> Result<AnalysisSpec, ParseError> {
-    let raw = parse_raw_analysis_spec(input)?;
+    parse_analysis_spec_with_format(input, SpecFormat::Yaml)
+}
 
+/// Parse the physics-facing spec into typed IR using the requested serde format.
+pub fn parse_analysis_spec_with_format(
+    input: &str,
+    format: SpecFormat,
+) -> Result<AnalysisSpec, ParseError> {
+    match format {
+        SpecFormat::Toml => toml::from_str(input).map_err(|error| {
+            ParseError::InvalidSpec(format!("failed to parse TOML spec: {error}"))
+        }),
+        SpecFormat::Yaml => serde_yaml::from_str(input).map_err(|error| {
+            ParseError::InvalidSpec(format!("failed to parse YAML spec: {error}"))
+        }),
+        SpecFormat::Json => serde_json::from_str(input).map_err(|error| {
+            ParseError::InvalidSpec(format!("failed to parse JSON spec: {error}"))
+        }),
+    }
+}
+
+fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseError> {
+    validate_raw_analysis_spec(&raw)?;
     let mut objects = Vec::with_capacity(raw.objects.len());
     for (name, object) in raw.objects {
         let cuts = object
@@ -565,139 +665,27 @@ fn parse_catalogue_branch_type(value: &str) -> Option<BranchType> {
     }
 }
 
-fn parse_raw_analysis_spec(input: &str) -> Result<RawAnalysisSpec, ParseError> {
-    let mut analysis = None;
-    let mut objects = BTreeMap::new();
-    let mut regions = BTreeMap::new();
-    let mut outputs = Vec::new();
-    let mut section = Section::None;
-    let mut current_object: Option<String> = None;
-    let mut current_region: Option<String> = None;
-
-    for line in input.lines() {
-        let without_comment = strip_comment(line);
-        let trimmed = without_comment.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        match trimmed {
-            "objects:" => {
-                section = Section::Objects;
-                current_object = None;
-                current_region = None;
-                continue;
-            }
-            "regions:" => {
-                section = Section::Regions;
-                current_object = None;
-                current_region = None;
-                continue;
-            }
-            "outputs:" => {
-                section = Section::Outputs;
-                current_object = None;
-                current_region = None;
-                continue;
-            }
-            _ => {}
-        }
-
-        if let Some(rest) = trimmed.strip_prefix("analysis:") {
-            let fields = parse_inline_map(rest.trim())?;
-            let name = required_field(&fields, "name", "analysis")?.to_string();
-            let year = required_field(&fields, "year", "analysis")?.to_string();
-            analysis = Some(RawAnalysis { name, year });
-            continue;
-        }
-
-        match section {
-            Section::Objects => {
-                let indent = indentation(line);
-                if indent == 2 && trimmed.ends_with(':') {
-                    let name = trimmed.trim_end_matches(':').trim().to_string();
-                    validate_identifier(&name, trimmed)?;
-                    objects.insert(
-                        name.clone(),
-                        RawObject {
-                            source: String::new(),
-                            cuts: Vec::new(),
-                        },
-                    );
-                    current_object = Some(name);
-                    continue;
-                }
-
-                let object_name = current_object.as_deref().ok_or_else(|| {
-                    ParseError::InvalidSpec(format!("object field outside object: `{trimmed}`"))
-                })?;
-                let object = objects.get_mut(object_name).ok_or_else(|| {
-                    ParseError::InvalidSpec(format!(
-                        "internal parser error for object `{object_name}`"
-                    ))
-                })?;
-                if let Some(rest) = trimmed.strip_prefix("source:") {
-                    object.source = unquote(rest.trim()).to_string();
-                } else if let Some(rest) = trimmed.strip_prefix("cuts:") {
-                    object.cuts = parse_inline_list(rest.trim())?;
-                }
-            }
-            Section::Regions => {
-                let indent = indentation(line);
-                if indent == 2 && trimmed.ends_with(':') {
-                    let name = trimmed.trim_end_matches(':').trim().to_string();
-                    validate_identifier(&name, trimmed)?;
-                    regions.insert(
-                        name.clone(),
-                        RawRegion {
-                            require: Vec::new(),
-                        },
-                    );
-                    current_region = Some(name);
-                    continue;
-                }
-
-                let region_name = current_region.as_deref().ok_or_else(|| {
-                    ParseError::InvalidSpec(format!("region field outside region: `{trimmed}`"))
-                })?;
-                let region = regions.get_mut(region_name).ok_or_else(|| {
-                    ParseError::InvalidSpec(format!(
-                        "internal parser error for region `{region_name}`"
-                    ))
-                })?;
-                if let Some(rest) = trimmed.strip_prefix("require:") {
-                    region.require = parse_inline_list(rest.trim())?;
-                }
-            }
-            Section::Outputs => {
-                if let Some(rest) = trimmed.strip_prefix("- ") {
-                    let fields = parse_inline_map(rest.trim())?;
-                    outputs.push(RawOutput {
-                        name: required_field(&fields, "name", "output")?.to_string(),
-                        expr: required_field(&fields, "expr", "output")?.to_string(),
-                    });
-                }
-            }
-            Section::None => {}
-        }
+fn validate_raw_analysis_spec(raw: &RawAnalysisSpec) -> Result<(), ParseError> {
+    if raw.analysis.year.trim().is_empty() {
+        return Err(ParseError::InvalidSpec(
+            "analysis is missing non-empty `year`".to_string(),
+        ));
     }
 
-    let analysis =
-        analysis.ok_or_else(|| ParseError::InvalidSpec("missing analysis block".to_string()))?;
-    for (name, object) in &objects {
-        if object.source.is_empty() {
+    for (name, object) in &raw.objects {
+        validate_identifier(name, "objects")?;
+        if object.source.trim().is_empty() {
             return Err(ParseError::InvalidSpec(format!(
                 "object `{name}` is missing source"
             )));
         }
     }
 
-    Ok(RawAnalysisSpec {
-        analysis,
-        objects,
-        regions,
-        outputs,
-    })
+    for name in raw.regions.keys() {
+        validate_identifier(name, "regions")?;
+    }
+
+    Ok(())
 }
 
 fn parse_catalogue(input: &str, version: &str) -> Result<Catalogue, ParseError> {
@@ -782,69 +770,8 @@ fn parse_catalogue(input: &str, version: &str) -> Result<Catalogue, ParseError> 
     Ok(Catalogue { branches })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Section {
-    None,
-    Objects,
-    Regions,
-    Outputs,
-}
-
-fn strip_comment(line: &str) -> &str {
-    line.split_once('#').map_or(line, |(before, _)| before)
-}
-
 fn indentation(line: &str) -> usize {
     line.chars().take_while(|ch| *ch == ' ').count()
-}
-
-fn parse_inline_map(input: &str) -> Result<BTreeMap<String, String>, ParseError> {
-    let inner = input
-        .trim()
-        .strip_prefix('{')
-        .and_then(|value| value.strip_suffix('}'))
-        .ok_or_else(|| ParseError::InvalidSpec(format!("expected inline map, got `{input}`")))?;
-    let mut fields = BTreeMap::new();
-    for item in split_csv(inner) {
-        let (key, value) = item
-            .split_once(':')
-            .ok_or_else(|| ParseError::InvalidSpec(format!("expected key: value in `{item}`")))?;
-        fields.insert(key.trim().to_string(), unquote(value.trim()).to_string());
-    }
-    Ok(fields)
-}
-
-fn parse_inline_list(input: &str) -> Result<Vec<String>, ParseError> {
-    let inner = input
-        .trim()
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .ok_or_else(|| ParseError::InvalidSpec(format!("expected inline list, got `{input}`")))?;
-    if inner.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(split_csv(inner)
-        .into_iter()
-        .map(|item| unquote(item.trim()).to_string())
-        .collect())
-}
-
-fn split_csv(input: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut in_quote = false;
-
-    for (index, ch) in input.char_indices() {
-        if ch == '"' {
-            in_quote = !in_quote;
-        } else if ch == ',' && !in_quote {
-            parts.push(input[start..index].trim());
-            start = index + 1;
-        }
-    }
-
-    parts.push(input[start..].trim());
-    parts
 }
 
 fn unquote(input: &str) -> &str {
@@ -852,17 +779,6 @@ fn unquote(input: &str) -> &str {
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
         .unwrap_or(input)
-}
-
-fn required_field<'a>(
-    fields: &'a BTreeMap<String, String>,
-    key: &str,
-    context: &str,
-) -> Result<&'a str, ParseError> {
-    fields
-        .get(key)
-        .map(String::as_str)
-        .ok_or_else(|| ParseError::InvalidSpec(format!("{context} is missing `{key}`")))
 }
 
 fn parse_cut(input: &str, object_name: &str) -> Result<Cut, ParseError> {
@@ -1015,32 +931,37 @@ fn validate_identifier(value: &str, expression: &str) -> Result<(), ParseError> 
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct RawAnalysisSpec {
     analysis: RawAnalysis,
+    #[serde(default)]
     objects: BTreeMap<String, RawObject>,
+    #[serde(default)]
     regions: BTreeMap<String, RawRegion>,
+    #[serde(default)]
     outputs: Vec<RawOutput>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct RawAnalysis {
     name: String,
     year: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct RawObject {
     source: String,
+    #[serde(default)]
     cuts: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct RawRegion {
+    #[serde(default)]
     require: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct RawOutput {
     name: String,
     expr: String,
@@ -1050,19 +971,32 @@ struct RawOutput {
 #[derive(Debug)]
 pub enum ParseError {
     InvalidSpec(String),
+    UnsupportedFormat { path: PathBuf },
+    Io { path: PathBuf, source: io::Error },
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSpec(message) => f.write_str(message),
+            Self::UnsupportedFormat { path } => write!(
+                f,
+                "unsupported spec format for `{}`; expected .toml, .yaml, .yml, or .json",
+                path.display()
+            ),
+            Self::Io { path, source } => {
+                write!(f, "failed to read spec `{}`: {source}", path.display())
+            }
         }
     }
 }
 
 impl Error for ParseError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        None
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::InvalidSpec(_) | Self::UnsupportedFormat { .. } => None,
+        }
     }
 }
 
@@ -1183,7 +1117,28 @@ impl fmt::Display for Expr {
 mod tests {
     use super::*;
 
-    const MUON_SPEC: &str = include_str!("../examples/muon.yaml");
+    const MUON_SPEC_TOML: &str = include_str!("../examples/muon.toml");
+    const MUON_SPEC_YAML: &str = include_str!("../examples/muon.yaml");
+    const MUON_SPEC_JSON: &str = r#"
+{
+  "analysis": { "name": "muon_demo", "year": "Run2018" },
+  "objects": {
+    "good_muon": {
+      "source": "Muon",
+      "cuts": ["pt > 30 GeV", "abs(eta) < 2.4"]
+    }
+  },
+  "regions": {
+    "signal": {
+      "require": ["count(good_muon) >= 1"]
+    }
+  },
+  "outputs": [
+    { "name": "n_good_muon", "expr": "count(good_muon)" },
+    { "name": "lead_muon_pt", "expr": "leading(good_muon).pt" }
+  ]
+}
+"#;
     const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 
     fn catalogue() -> Catalogue {
@@ -1191,7 +1146,7 @@ mod tests {
     }
 
     fn parse_muon_spec() -> AnalysisSpec {
-        AnalysisSpec::from_yaml_str(MUON_SPEC).expect("parse muon spec")
+        AnalysisSpec::from_toml_str(MUON_SPEC_TOML).expect("parse muon spec")
     }
 
     #[test]
@@ -1247,8 +1202,58 @@ mod tests {
     }
 
     #[test]
+    fn muon_toml_and_yaml_parse_to_same_typed_ir_and_plan() {
+        let toml_spec = AnalysisSpec::from_toml_str(MUON_SPEC_TOML).expect("parse TOML spec");
+        let yaml_spec = AnalysisSpec::from_yaml_str(MUON_SPEC_YAML).expect("parse YAML spec");
+
+        assert_eq!(toml_spec, yaml_spec);
+
+        let catalogue = catalogue();
+        let toml_plan = validate(&toml_spec, &catalogue).expect("validate TOML spec");
+        let yaml_plan = validate(&yaml_spec, &catalogue).expect("validate YAML spec");
+
+        assert_eq!(toml_plan.spec, yaml_plan.spec);
+        assert_eq!(
+            toml_plan.read_branches.specs(),
+            yaml_plan.read_branches.specs()
+        );
+    }
+
+    #[test]
+    fn json_spec_uses_same_serde_surface() {
+        let toml_spec = AnalysisSpec::from_toml_str(MUON_SPEC_TOML).expect("parse TOML spec");
+        let json_spec = AnalysisSpec::from_json_str(MUON_SPEC_JSON).expect("parse JSON spec");
+
+        assert_eq!(json_spec, toml_spec);
+    }
+
+    #[test]
+    fn spec_format_dispatches_by_file_extension() {
+        assert_eq!(
+            SpecFormat::from_path("analysis.toml").unwrap(),
+            SpecFormat::Toml
+        );
+        assert_eq!(
+            SpecFormat::from_path("analysis.yaml").unwrap(),
+            SpecFormat::Yaml
+        );
+        assert_eq!(
+            SpecFormat::from_path("analysis.yml").unwrap(),
+            SpecFormat::Yaml
+        );
+        assert_eq!(
+            SpecFormat::from_path("analysis.json").unwrap(),
+            SpecFormat::Json
+        );
+        assert!(matches!(
+            SpecFormat::from_path("analysis.txt"),
+            Err(ParseError::UnsupportedFormat { .. })
+        ));
+    }
+
+    #[test]
     fn validation_rejects_nonexistent_branch() {
-        let yaml = MUON_SPEC.replace("abs(eta) < 2.4", "abs(nope) < 2.4");
+        let yaml = MUON_SPEC_YAML.replace("abs(eta) < 2.4", "abs(nope) < 2.4");
         let spec = AnalysisSpec::from_yaml_str(&yaml).expect("parse modified spec");
         let errors = validate(&spec, &catalogue()).expect_err("validation should fail");
 
@@ -1263,7 +1268,7 @@ mod tests {
 
     #[test]
     fn validation_rejects_missing_unit() {
-        let yaml = MUON_SPEC.replace("pt > 30 GeV", "pt > 30");
+        let yaml = MUON_SPEC_YAML.replace("pt > 30 GeV", "pt > 30");
         let spec = AnalysisSpec::from_yaml_str(&yaml).expect("parse modified spec");
         let errors = validate(&spec, &catalogue()).expect_err("validation should fail");
 
@@ -1279,7 +1284,7 @@ mod tests {
 
     #[test]
     fn validation_rejects_region_with_undefined_object() {
-        let yaml = MUON_SPEC.replace("count(good_muon) >= 1", "count(ghost_muon) >= 1");
+        let yaml = MUON_SPEC_YAML.replace("count(good_muon) >= 1", "count(ghost_muon) >= 1");
         let spec = AnalysisSpec::from_yaml_str(&yaml).expect("parse modified spec");
         let errors = validate(&spec, &catalogue()).expect_err("validation should fail");
 
@@ -1291,7 +1296,7 @@ mod tests {
 
     #[test]
     fn validation_rejects_wrong_branch_type() {
-        let yaml = MUON_SPEC.replace("abs(eta) < 2.4", "looseId > 0");
+        let yaml = MUON_SPEC_YAML.replace("abs(eta) < 2.4", "looseId > 0");
         let spec = AnalysisSpec::from_yaml_str(&yaml).expect("parse modified spec");
         let errors = validate(&spec, &catalogue()).expect_err("validation should fail");
 
