@@ -477,6 +477,15 @@ name = "nano-core"
 version = "0.0.0"
 
 [[package]]
+name = "nano-corrections"
+version = "0.0.0"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nano-io"
 version = "0.0.0"
 dependencies = [
