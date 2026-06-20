@@ -1,0 +1,14 @@
+[package]
+name = "nano-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Semantic analysis specification IR and validation for nano.rust"
+
+[dependencies]
+nano-core = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+
+[features]
+default = []

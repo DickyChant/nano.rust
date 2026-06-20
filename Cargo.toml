@@ -17,4 +17,5 @@ nano-analysis = { path = "crates/nano-analysis" }
 nano-core = { path = "crates/nano-core" }
 nano-io = { path = "crates/nano-io" }
 nano-producers = { path = "crates/nano-producers" }
+nano-spec = { path = "crates/nano-spec" }
 root-io = { path = "crates/root-io" }
