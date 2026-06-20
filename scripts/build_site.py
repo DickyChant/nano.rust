@@ -52,6 +52,10 @@ def build() -> None:
     shutil.copy(SITE_SRC / "index.html", PUBLIC / "index.html")
     shutil.copy(SITE_SRC / "style.css", PUBLIC / "style.css")
 
+    # static assets (asciinema casts, etc.) -> /
+    for asset in SITE_SRC.glob("*.cast"):
+        shutil.copy(asset, PUBLIC / asset.name)
+
     # rustdoc -> /api
     if RUSTDOC.exists():
         shutil.copytree(RUSTDOC, PUBLIC / "api")

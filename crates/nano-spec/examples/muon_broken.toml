@@ -1,0 +1,18 @@
+# DELIBERATELY BROKEN example for the demo / docs.
+# `etaa` is a typo for `eta`: in a dynamic framework this silently reads
+# nothing (or garbage) and biases the result. Here the validator rejects it
+# against the NanoAODv9 catalogue before any event is read.
+[analysis]
+name = "muon_broken"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = ["pt > 30 GeV", "abs(etaa) < 2.4"]   # <-- typo: Muon_etaa does not exist
+
+[regions.signal]
+require = ["count(good_muon) >= 1"]
+
+[[outputs]]
+name = "lead_muon_pt"
+expr = "leading(good_muon).pt"

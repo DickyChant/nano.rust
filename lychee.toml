@@ -12,6 +12,11 @@ exclude_path = ["target", "public", "external", "paper"]
 exclude = [
   "eospublic\\.cern\\.ch",
   "opendata\\.web\\.cern\\.ch",
+  # Rendered-site-only relative links: blog posts cross-link to each other's
+  # built .html and embed the screencast .cast — these resolve in ./public
+  # (after build_site.py), not next to the source .md the checker scans.
+  "\\d{4}-\\d{2}-\\d{2}-[a-z-]+\\.html",
+  "demo\\.cast",
 ]
 
 exclude_loopback = true
