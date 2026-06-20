@@ -44,9 +44,12 @@ flowchart LR
 - **Source / chunk** — each input (local path or HTTPS URL) is split into
   bounded entry ranges via the existing `events_chunked` / `events_url_chunked`,
   so memory is bounded regardless of dataset size. One chunk → one map node.
-- **Map** — runs the per-event kernel (the producer, or the generated one) over
-  one chunk, yielding a `PartialOutput` (skim rows + partial `Hist1D`s + a
-  cutflow). Map nodes are **independent** — the fan-out point.
+- **Map** — runs the per-event kernel over one chunk, yielding a
+  `PartialOutput` (skim rows + partial `Hist1D`s + a cutflow). The muon slice now
+  exercises the closed path: `nano-spec` emits a `nano-analysis` typestate
+  kernel, and `nano-workflow` runs that generated kernel through the same map
+  node shape as the hand-written reference. Map nodes are **independent** — the
+  fan-out point.
 - **Reduce** — merges partials associatively: rows concatenate, histograms and
   cutflows sum (a parallel-reduce, per `nano-analysis`). Systematics are a
   fan-out dimension here: one reduce per `Systematic`.
@@ -140,8 +143,10 @@ only decides *where/when* tasks run, never *what* they compute.
 ## How it connects to the rest
 
 - **Input:** a validated `ResolvedPlan` (`nano-spec`) gives `read_branches` and
-  (via codegen or a hand kernel) the per-event function; a dataset list gives
-  the source files/URLs.
+  codegen emits the per-event function as a `nano-analysis` typestate program; a
+  dataset list gives the source files/URLs. `MuonProducer` remains the golden
+  hand-written reference used by equivalence tests, not a separate scheduler
+  path.
 - **Output:** merged skim (`nano_io`) + histograms + the manifest. Eventually
   `nano run <spec> --inputs <list> [--systematics all]` builds and executes the
   DAG — the CLI/MCP "run" verb on top of the same compiler-gated action space.
@@ -162,7 +167,9 @@ Deliberately narrow, end-to-end, hermetic:
 5. Sink writes the merged skim via `nano_io::write_events`.
 6. Tests (hermetic): write a small ROOT file with `write_synthetic`, run the DAG
    over it serial vs parallel (identical), run twice (second run skips), and
-   check the merged skim equals the single-pass `MuonProducer` result.
+   check the merged skim equals the single-pass `MuonProducer` result. The
+   generated muon producer is also registered as a workflow kernel and its
+   `MergedOutput` is asserted equal to the `MuonProducer` workflow output.
 
 ## Slice 2 — portable IR + standalone task unit + Dask/Ray adapters
 

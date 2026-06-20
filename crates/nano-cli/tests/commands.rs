@@ -115,6 +115,12 @@ fn codegen_muon_toml_emits_generated_producer_source() {
     assert!(report.source.contains("pub struct GenRow"));
     assert!(report.source.contains("pub lead_muon_pt: f32"));
     assert!(report.source.contains("event.collection(\"Muon\")?"));
+    assert!(report
+        .source
+        .contains("impl nano_analysis::Region for SignalRegion"));
+    assert!(report
+        .source
+        .contains("baseline.select::<SignalRegion>(|_| n_good_muon >= 1_u32)"));
 }
 
 #[test]
@@ -137,7 +143,7 @@ fn codegen_muon_tagger_toml_emits_inference_producer_source() {
         .contains("muon_tagger_baseline.infer::<MuonTagger>"));
     assert!(report
         .source
-        .contains("if !(leading_good_muon_topscore > 0.5_f32)"));
+        .contains("muon_tagger_baseline.select::<SignalRegion>"));
 }
 
 #[test]

@@ -75,8 +75,10 @@ The hand-written wrappers above are the *target*. The semantic IR
 (`docs/semantic-layer.md`, Slice A) is the *source*: a `muon.yaml` spec lowers to
 a validated `AnalysisSpec`, from which we (a) derive the `read_branches` schema
 for the streaming reader, and (b) generate the per-region selection/weight calls
-expressed in these typed transitions. Until codegen exists, the muon producer is
-hand-written against the wrappers; the IR validates and plans.
+expressed in these typed transitions. The muon codegen slice now emits this
+typestate program directly and `nano-workflow` can run it as the scheduled
+kernel; the hand-written `MuonProducer` is the golden reference for behavioral
+equivalence.
 
 What the compiler enforces (hard): stage order, region typing, weight-before-
 fill, unit consistency, exhaustive systematics. What stays human/tested (soft):

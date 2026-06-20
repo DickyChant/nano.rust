@@ -63,6 +63,7 @@ impl<'a> Generator<'a> {
             self.spec().name
         )
         .unwrap();
+        self.emit_region_markers(&mut source)?;
         writeln!(source).unwrap();
         writeln!(source, "#[derive(Debug, Clone, Copy, PartialEq)]").unwrap();
         writeln!(source, "pub struct GenRow {{").unwrap();
@@ -90,17 +91,19 @@ impl<'a> Generator<'a> {
             self.emit_object_selection(&mut source, object)?;
         }
 
-        for region in &self.spec().regions {
-            for requirement in &region.require {
-                let condition = self.emit_region_requirement(
-                    &requirement.lhs,
-                    requirement.op,
-                    requirement.rhs,
-                )?;
-                writeln!(source, "        if !({condition}) {{").unwrap();
-                writeln!(source, "            return Ok(None);").unwrap();
-                writeln!(source, "        }}").unwrap();
-            }
+        if !self.spec().regions.is_empty() {
+            writeln!(
+                source,
+                "        let baseline = nano_analysis::Ev::new(event)"
+            )
+            .unwrap();
+            writeln!(source, "            .preselect(|_| true)").unwrap();
+            writeln!(
+                source,
+                "            .expect(\"true generated preselection should always pass\");"
+            )
+            .unwrap();
+            self.emit_region_selections(&mut source, "baseline")?;
         }
 
         for output in &self.spec().outputs {
@@ -135,6 +138,7 @@ impl<'a> Generator<'a> {
             self.spec().name
         )
         .unwrap();
+        self.emit_region_markers(&mut source)?;
         writeln!(source).unwrap();
         writeln!(
             source,
@@ -184,6 +188,13 @@ impl<'a> Generator<'a> {
         for model in &self.spec().models {
             self.emit_model_inference(&mut source, model)?;
         }
+        let baseline_ident = self
+            .spec()
+            .models
+            .first()
+            .map(|model| checked_ident(&model.name, "model name"))
+            .transpose()?
+            .map(|model_ident| format!("{model_ident}_baseline"));
 
         let leading_region_exprs = self.leading_region_exprs();
         for object in &self.spec().objects {
@@ -192,6 +203,7 @@ impl<'a> Generator<'a> {
 
         let mut unwrapped_leading = BTreeSet::new();
         for region in &self.spec().regions {
+            let mut conditions = Vec::with_capacity(region.require.len());
             for requirement in &region.require {
                 let condition = self.emit_model_region_requirement(
                     &requirement.lhs,
@@ -200,9 +212,10 @@ impl<'a> Generator<'a> {
                     &mut source,
                     &mut unwrapped_leading,
                 )?;
-                writeln!(source, "        if !({condition}) {{").unwrap();
-                writeln!(source, "            return Ok(None);").unwrap();
-                writeln!(source, "        }}").unwrap();
+                conditions.push(condition);
+            }
+            if let Some(baseline_ident) = &baseline_ident {
+                self.emit_region_selection(&mut source, &region.name, baseline_ident, &conditions)?;
             }
         }
 
@@ -292,6 +305,71 @@ impl<'a> Generator<'a> {
             }
         }
 
+        Ok(())
+    }
+
+    fn emit_region_markers(&self, source: &mut String) -> Result<(), CodegenError> {
+        for region in &self.spec().regions {
+            let type_ident = region_type_ident(&region.name)?;
+            writeln!(source).unwrap();
+            writeln!(
+                source,
+                "#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]"
+            )
+            .unwrap();
+            writeln!(source, "struct {type_ident};").unwrap();
+            writeln!(source).unwrap();
+            writeln!(source, "impl nano_analysis::Region for {type_ident} {{").unwrap();
+            writeln!(
+                source,
+                "    const NAME: &'static str = {};",
+                rust_string(&region.name)
+            )
+            .unwrap();
+            writeln!(source, "}}").unwrap();
+        }
+        Ok(())
+    }
+
+    fn emit_region_selections(
+        &self,
+        source: &mut String,
+        baseline_ident: &str,
+    ) -> Result<(), CodegenError> {
+        for region in &self.spec().regions {
+            let conditions = region
+                .require
+                .iter()
+                .map(|requirement| {
+                    self.emit_region_requirement(&requirement.lhs, requirement.op, requirement.rhs)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.emit_region_selection(source, &region.name, baseline_ident, &conditions)?;
+        }
+        Ok(())
+    }
+
+    fn emit_region_selection(
+        &self,
+        source: &mut String,
+        region_name: &str,
+        baseline_ident: &str,
+        conditions: &[String],
+    ) -> Result<(), CodegenError> {
+        let type_ident = region_type_ident(region_name)?;
+        let event_ident = checked_ident(region_name, "region event")?;
+        let predicate = if conditions.is_empty() {
+            "true".to_string()
+        } else {
+            conditions.join(" && ")
+        };
+        writeln!(
+            source,
+            "        let Some(_{event_ident}_event) = {baseline_ident}.select::<{type_ident}>(|_| {predicate}) else {{"
+        )
+        .unwrap();
+        writeln!(source, "            return Ok(None);").unwrap();
+        writeln!(source, "        }};").unwrap();
         Ok(())
     }
 
@@ -1045,6 +1123,13 @@ fn leading_attr_ident(object_name: &str, attr: &str) -> Result<String, CodegenEr
     ))
 }
 
+fn region_type_ident(region_name: &str) -> Result<String, CodegenError> {
+    Ok(format!(
+        "{}Region",
+        upper_camel_ident(region_name, "region type")?
+    ))
+}
+
 fn branch_ident(branch: &str) -> Result<String, CodegenError> {
     let ident = branch.to_ascii_lowercase();
     checked_ident(&ident, "branch identifier")
@@ -1161,8 +1246,12 @@ mod tests {
 
         assert!(source.contains("pub struct GenRow"));
         assert!(source.contains("pub struct GeneratedProducer;"));
+        assert!(source.contains("struct SignalRegion;"));
+        assert!(source.contains("impl nano_analysis::Region for SignalRegion"));
         assert!(source.contains("let good_muon_pt = good_muon_item.get::<f32>(\"pt\")?;"));
         assert!(source.contains("if (good_muon_pt > 30.0_f32) && (good_muon_eta.abs() < 2.4_f32)"));
+        assert!(source.contains("let baseline = nano_analysis::Ev::new(event)"));
+        assert!(source.contains("baseline.select::<SignalRegion>(|_| n_good_muon >= 1_u32)"));
         assert!(source.contains("n_good_muon: n_good_muon,"));
         assert!(source.contains("lead_muon_pt: lead_muon_pt,"));
     }
@@ -1184,6 +1273,8 @@ mod tests {
         ));
         assert!(source
             .contains("let Some(leading_good_muon_topscore) = leading_good_muon_topscore else"));
-        assert!(source.contains("if !(leading_good_muon_topscore > 0.5_f32)"));
+        assert!(source.contains(
+            "muon_tagger_baseline.select::<SignalRegion>(|_| n_good_muon >= 1_u32 && leading_good_muon_topscore > 0.5_f32)"
+        ));
     }
 }

@@ -8,10 +8,13 @@ description = "Build-time generated producer demo for nano.rust semantic specs"
 build = "build.rs"
 
 [dependencies]
+nano-analysis = { workspace = true }
 nano-core = { workspace = true }
 
 [dev-dependencies]
+nano-io = { workspace = true }
 nano-producers = { workspace = true }
+nano-workflow = { workspace = true }
 
 [build-dependencies]
 nano-spec = { workspace = true }
