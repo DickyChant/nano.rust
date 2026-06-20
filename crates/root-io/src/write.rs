@@ -398,9 +398,9 @@ fn build_tree_object(
     let mut tree = Vec::new();
     put_u16(&mut tree, 18);
     tree.extend(checked(tnamed(tree_name, tree_name)));
-    tree.extend(checked(vec![0]));
-    tree.extend(checked(vec![0]));
-    tree.extend(checked(vec![0]));
+    tree.extend(checked(tattline_v1()));
+    tree.extend(checked(tattfill_v1()));
+    tree.extend(checked(tattmarker_v2()));
     put_i64(&mut tree, entries as i64);
     let total_payload = baskets.iter().map(|b| b.payload_len as i64).sum::<i64>();
     let total_basket = baskets.iter().map(|b| b.bytes.len() as i64).sum::<i64>();
@@ -450,7 +450,7 @@ fn build_branch(branch: &Branch, basket: &BasketInfo, entries: usize) -> Vec<u8>
         &branch.name,
         &branch.data.leaf_title(&branch.name),
     )));
-    out.extend(checked(vec![0]));
+    out.extend(checked(tattfill_v1()));
     put_i32(&mut out, 0);
     put_i32(&mut out, 32000);
     put_i32(&mut out, 0);
@@ -473,7 +473,7 @@ fn build_branch(branch: &Branch, basket: &BasketInfo, entries: usize) -> Vec<u8>
     put_i32(&mut out, basket.bytes.len() as i32);
     put_u8(&mut out, 1);
     put_i64(&mut out, 0);
-    put_u8(&mut out, 1);
+    put_u8(&mut out, 2);
     put_u64(&mut out, basket.seek);
     put_string(&mut out, "");
     out
@@ -616,6 +616,32 @@ fn tnamed(name: &str, title: &str) -> Vec<u8> {
     out
 }
 
+fn tattline_v1() -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u16(&mut out, 1);
+    put_i16(&mut out, 1);
+    put_i16(&mut out, 1);
+    put_i16(&mut out, 1);
+    out
+}
+
+fn tattfill_v1() -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u16(&mut out, 1);
+    put_i16(&mut out, 0);
+    put_i16(&mut out, 1001);
+    out
+}
+
+fn tattmarker_v2() -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u16(&mut out, 2);
+    put_i16(&mut out, 1);
+    put_i16(&mut out, 1);
+    put_f32(&mut out, 1.0);
+    out
+}
+
 fn tobjarray(name: &str, objects: Vec<Vec<u8>>) -> Vec<u8> {
     let mut out = Vec::new();
     put_u16(&mut out, 3);
@@ -711,6 +737,10 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 
 fn put_i64(out: &mut Vec<u8>, value: i64) {
     out.extend(value.to_be_bytes());
+}
+
+fn put_f32(out: &mut Vec<u8>, value: f32) {
+    out.extend(value.to_bits().to_be_bytes());
 }
 
 fn put_f64(out: &mut Vec<u8>, value: f64) {
