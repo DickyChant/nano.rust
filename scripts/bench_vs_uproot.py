@@ -157,13 +157,19 @@ def nano_write_synthetic(repo: Path, output: Path, n_events: int, env: dict[str,
 
 
 def check_uproot_reads_nano(path: Path) -> None:
-    try:
-        with uproot.open(path) as root_file:
-            arrays = root_file["Events"].arrays(["nMuon", "Muon_pt", "MET_pt", "run", "event"], entry_stop=10, library="ak")
-        assert len(arrays["nMuon"]) == 10
-        print("writer interop: uproot read nano.rust output")
-    except Exception as exc:  # noqa: BLE001 - this is a known possible writer gap.
-        print(f"writer interop: uproot could not read nano.rust output (non-fatal): {type(exc).__name__}: {exc}")
+    # Writer interop is now a guarantee (not a known gap): uproot must read
+    # nano.rust output including JAGGED branches (fLeafCount read-order ref).
+    with uproot.open(path) as root_file:
+        arrays = root_file["Events"].arrays(
+            ["nMuon", "Muon_pt", "MET_pt", "run", "event"], entry_stop=10, library="ak"
+        )
+    counts = ak.to_list(arrays["nMuon"])
+    muon_pt = ak.to_list(arrays["Muon_pt"])
+    assert len(counts) == 10
+    assert all(len(pt) == n for n, pt in zip(counts, muon_pt)), (
+        "uproot jagged shape != nMuon: " + repr(list(zip(counts, [len(p) for p in muon_pt])))
+    )
+    print(f"writer interop: uproot read nano.rust output incl. jagged ({sum(counts)} muons / 10 events)")
 
 
 def uproot_write_synthetic(path: Path, n_events: int) -> None:
