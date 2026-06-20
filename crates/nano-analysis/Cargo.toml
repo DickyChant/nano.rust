@@ -1,0 +1,13 @@
+[package]
+name = "nano-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Typed analysis state-machine layer for nano.rust events"
+
+[dependencies]
+nano-core = { workspace = true }
+
+[features]
+default = []

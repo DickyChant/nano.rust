@@ -466,6 +466,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-analysis"
+version = "0.0.0"
+dependencies = [
+ "nano-core",
+]
+
+[[package]]
 name = "nano-core"
 version = "0.0.0"
 
