@@ -12,6 +12,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+mod adl;
 pub mod codegen;
 pub mod core;
 pub mod interpret;
@@ -50,9 +51,14 @@ impl AnalysisSpec {
         parse_analysis_spec_with_format(input, SpecFormat::Json)
     }
 
+    /// Parse an analysis specification from the physics-facing ADL form.
+    pub fn from_adl_str(input: &str) -> Result<Self, ParseError> {
+        parse_analysis_spec_with_format(input, SpecFormat::Adl)
+    }
+
     /// Load an analysis specification from a file, dispatching by extension.
     ///
-    /// Supported extensions are `.toml`, `.yaml`, `.yml`, and `.json`.
+    /// Supported extensions are `.toml`, `.yaml`, `.yml`, `.json`, and `.adl`.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ParseError> {
         load_analysis_spec(path)
     }
@@ -108,6 +114,7 @@ pub enum SpecFormat {
     Toml,
     Yaml,
     Json,
+    Adl,
 }
 
 impl SpecFormat {
@@ -123,6 +130,7 @@ impl SpecFormat {
             Some("toml") => Ok(Self::Toml),
             Some("yaml" | "yml") => Ok(Self::Yaml),
             Some("json") => Ok(Self::Json),
+            Some("adl") => Ok(Self::Adl),
             _ => Err(ParseError::UnsupportedFormat {
                 path: path.to_path_buf(),
             }),
@@ -136,6 +144,7 @@ impl fmt::Display for SpecFormat {
             Self::Toml => f.write_str("TOML"),
             Self::Yaml => f.write_str("YAML"),
             Self::Json => f.write_str("JSON"),
+            Self::Adl => f.write_str("ADL"),
         }
     }
 }
@@ -532,6 +541,7 @@ pub fn parse_analysis_spec_with_format(
         SpecFormat::Json => serde_json::from_str(input).map_err(|error| {
             ParseError::InvalidSpec(format!("failed to parse JSON spec: {error}"))
         }),
+        SpecFormat::Adl => adl::parse_adl(input),
     }
 }
 
@@ -3629,7 +3639,7 @@ impl fmt::Display for ParseError {
             Self::InvalidSpec(message) => f.write_str(message),
             Self::UnsupportedFormat { path } => write!(
                 f,
-                "unsupported spec format for `{}`; expected .toml, .yaml, .yml, or .json",
+                "unsupported spec format for `{}`; expected .toml, .yaml, .yml, .json, or .adl",
                 path.display()
             ),
             Self::Io { path, source } => {
@@ -3877,8 +3887,10 @@ mod tests {
     use super::*;
 
     const MUON_SPEC_TOML: &str = include_str!("../examples/muon.toml");
+    const MUON_SPEC_ADL: &str = include_str!("../examples/muon.adl");
     const MUON_TAGGER_SPEC_TOML: &str = include_str!("../examples/muon_tagger.toml");
     const DIMUON_SPEC_TOML: &str = include_str!("../examples/dimuon.toml");
+    const DIMUON_SPEC_ADL: &str = include_str!("../examples/dimuon.adl");
     const HIGGS4MU_MINIMAL_SPEC_TOML: &str = include_str!("../examples/higgs4mu_minimal.toml");
     const HIGGS2E2MU_MINIMAL_SPEC_TOML: &str = include_str!("../examples/higgs2e2mu_minimal.toml");
     const EXAMPLE_SPECS: &[(&str, &str)] = &[
@@ -4153,6 +4165,156 @@ mod tests {
                 ("Muon_pt", BranchType::VecF32),
             ]
         );
+    }
+
+    #[test]
+    fn adl_examples_desugar_to_same_ir_and_plan_as_toml() {
+        for (name, toml, adl) in [
+            ("muon", MUON_SPEC_TOML, MUON_SPEC_ADL),
+            ("dimuon", DIMUON_SPEC_TOML, DIMUON_SPEC_ADL),
+        ] {
+            let toml_spec =
+                AnalysisSpec::from_toml_str(toml).unwrap_or_else(|_| panic!("parse {name} TOML"));
+            let adl_spec =
+                AnalysisSpec::from_adl_str(adl).unwrap_or_else(|_| panic!("parse {name} ADL"));
+            assert_eq!(adl_spec, toml_spec, "{name} AnalysisSpec differs");
+
+            let catalogue = catalogue();
+            let toml_core =
+                lower(&toml_spec, &catalogue).unwrap_or_else(|_| panic!("lower {name} TOML"));
+            let adl_core =
+                lower(&adl_spec, &catalogue).unwrap_or_else(|_| panic!("lower {name} ADL"));
+            assert_eq!(adl_core, toml_core, "{name} Core IR differs");
+
+            let toml_plan =
+                validate(&toml_spec, &catalogue).unwrap_or_else(|_| panic!("validate {name} TOML"));
+            let adl_plan =
+                validate(&adl_spec, &catalogue).unwrap_or_else(|_| panic!("validate {name} ADL"));
+            assert_eq!(adl_plan.spec, toml_plan.spec, "{name} plan spec differs");
+            assert_eq!(
+                adl_plan.read_branches.specs(),
+                toml_plan.read_branches.specs(),
+                "{name} read branches differ"
+            );
+        }
+    }
+
+    #[test]
+    fn adl_and_toml_plans_interpret_same_synthetic_events() {
+        for (name, toml, adl) in [
+            ("muon", MUON_SPEC_TOML, MUON_SPEC_ADL),
+            ("dimuon", DIMUON_SPEC_TOML, DIMUON_SPEC_ADL),
+        ] {
+            let catalogue = catalogue();
+            let toml_spec =
+                AnalysisSpec::from_toml_str(toml).unwrap_or_else(|_| panic!("parse {name} TOML"));
+            let adl_spec =
+                AnalysisSpec::from_adl_str(adl).unwrap_or_else(|_| panic!("parse {name} ADL"));
+            let toml_plan =
+                validate(&toml_spec, &catalogue).unwrap_or_else(|_| panic!("validate {name} TOML"));
+            let adl_plan =
+                validate(&adl_spec, &catalogue).unwrap_or_else(|_| panic!("validate {name} ADL"));
+
+            for event in synthetic_muon_events() {
+                let toml_row =
+                    interpret::interpret(&toml_plan, &event).expect("interpret TOML plan");
+                let adl_row = interpret::interpret(&adl_plan, &event).expect("interpret ADL plan");
+                assert_eq!(adl_row, toml_row, "{name} interpreted row differs");
+            }
+        }
+    }
+
+    #[test]
+    fn adl_rejects_malformed_surface() {
+        let error = AnalysisSpec::from_adl_str("analysis bad year Run2018\nobject x : Muon {}")
+            .expect_err("missing semicolon should fail");
+
+        assert!(error.to_string().contains("expected `;`"));
+    }
+
+    #[test]
+    fn adl_rejects_bad_cut_unit() {
+        let error = AnalysisSpec::from_adl_str(
+            r#"
+analysis bad_unit year Run2018;
+object good_muon : Muon {
+  pt > 30 TeV;
+}
+"#,
+        )
+        .expect_err("bad unit should fail");
+
+        assert!(error.to_string().contains("unsupported unit `TeV`"));
+    }
+
+    #[test]
+    fn adl_rejects_undefined_output_alias() {
+        let error = AnalysisSpec::from_adl_str(
+            r#"
+analysis bad_alias year Run2018;
+object good_muon : Muon {}
+output missing_alias;
+"#,
+        )
+        .expect_err("undefined alias should fail");
+
+        assert!(error
+            .to_string()
+            .contains("undefined alias `missing_alias`"));
+    }
+
+    #[test]
+    fn adl_parses_histogram_declarations() {
+        let spec = AnalysisSpec::from_adl_str(
+            r#"
+analysis hist_demo year Run2018;
+object good_muon : Muon {
+  pt > 30 GeV;
+}
+define lead_muon_pt = leading(good_muon).pt;
+output lead_muon_pt;
+histogram lead_muon_pt_hist {
+  expr = lead_muon_pt;
+  bins = 20;
+  range = [0.0, 100.0];
+}
+"#,
+        )
+        .expect("parse ADL histogram");
+
+        assert_eq!(spec.histograms.len(), 1);
+        assert_eq!(spec.histograms[0].name, "lead_muon_pt_hist");
+        assert_eq!(spec.histograms[0].bins, 20);
+        assert_eq!(spec.histograms[0].range, [0.0, 100.0]);
+        assert_eq!(
+            spec.histograms[0].expr,
+            Expr::LeadingAttr {
+                object: "good_muon".to_string(),
+                attr: "pt".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn adl_undefined_object_reaches_existing_validator() {
+        let spec = AnalysisSpec::from_adl_str(
+            r#"
+analysis bad_object year Run2018;
+object good_muon : Muon {}
+region signal {
+  count(ghost_muon) >= 1;
+}
+define n_good_muon = count(good_muon);
+output n_good_muon;
+"#,
+        )
+        .expect("parse ADL with undefined region object");
+        let errors = validate(&spec, &catalogue()).expect_err("validation should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::UndefinedObject { object, .. } if object == "ghost_muon"
+        )));
     }
 
     #[test]
@@ -4445,6 +4607,10 @@ expr = "z_mu_remaining.mass"
             SpecFormat::from_path("analysis.json").unwrap(),
             SpecFormat::Json
         );
+        assert_eq!(
+            SpecFormat::from_path("analysis.adl").unwrap(),
+            SpecFormat::Adl
+        );
         assert!(matches!(
             SpecFormat::from_path("analysis.txt"),
             Err(ParseError::UnsupportedFormat { .. })
@@ -4508,5 +4674,59 @@ expr = "z_mu_remaining.mass"
                 ..
             } if branch == "Muon_looseId"
         )));
+    }
+
+    fn synthetic_muon_events() -> Vec<nano_core::Event> {
+        use nano_core::{BranchColumn, BranchSchema, BranchSpec};
+
+        let schema = BranchSchema::new([
+            BranchSpec::new("nMuon", BranchType::U32),
+            BranchSpec::new("Muon_charge", BranchType::VecI32),
+            BranchSpec::new("Muon_eta", BranchType::VecF32),
+            BranchSpec::new("Muon_mass", BranchType::VecF32),
+            BranchSpec::new("Muon_phi", BranchType::VecF32),
+            BranchSpec::new("Muon_pt", BranchType::VecF32),
+        ])
+        .expect("schema");
+        (0..3)
+            .map(|entry| {
+                nano_core::Event::from_columns(
+                    schema.clone(),
+                    [
+                        ("nMuon", BranchColumn::U32(vec![2, 1, 2])),
+                        (
+                            "Muon_charge",
+                            BranchColumn::VecI32(vec![vec![1, -1], vec![1], vec![1, 1]]),
+                        ),
+                        (
+                            "Muon_eta",
+                            BranchColumn::VecF32(vec![vec![0.1, 0.2], vec![2.5], vec![1.0, -1.0]]),
+                        ),
+                        (
+                            "Muon_mass",
+                            BranchColumn::VecF32(vec![
+                                vec![0.105, 0.105],
+                                vec![0.105],
+                                vec![0.105, 0.105],
+                            ]),
+                        ),
+                        (
+                            "Muon_phi",
+                            BranchColumn::VecF32(vec![vec![0.3, -0.4], vec![0.1], vec![1.0, -1.0]]),
+                        ),
+                        (
+                            "Muon_pt",
+                            BranchColumn::VecF32(vec![
+                                vec![40.0, 35.0],
+                                vec![29.0],
+                                vec![45.0, 20.0],
+                            ]),
+                        ),
+                    ],
+                    entry,
+                )
+                .expect("event")
+            })
+            .collect()
     }
 }

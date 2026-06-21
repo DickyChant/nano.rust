@@ -1,0 +1,13 @@
+analysis dimuon_demo year Run2012;
+
+object good_muon : Muon {
+}
+
+object dimuon : pair(good_muon) {
+  opposite_charge;
+  selection leading_pt;
+}
+
+define dimuon_mass = dimuon.mass;
+
+output dimuon_mass;
