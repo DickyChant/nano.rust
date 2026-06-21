@@ -1,0 +1,20 @@
+[package]
+name = "nano-gen-dimuon-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build-time generated dimuon producer demo for nano.rust semantic specs"
+build = "build.rs"
+
+[dependencies]
+nano-analysis = { workspace = true }
+nano-core = { workspace = true }
+nano-io = { workspace = true, optional = true }
+
+[build-dependencies]
+nano-spec = { workspace = true }
+
+[features]
+default = []
+http = ["dep:nano-io", "nano-io/http"]

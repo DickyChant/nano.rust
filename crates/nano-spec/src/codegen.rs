@@ -11,7 +11,10 @@ use std::fmt::Write as _;
 
 use nano_core::BranchType;
 
-use crate::{AnalysisSpec, CmpOp, Expr, ModelDef, ObjectDef, ResolvedPlan};
+use crate::{
+    AnalysisSpec, CmpOp, DerivedObjectDef, DerivedSource, Expr, ModelDef, ObjectDef,
+    PairConstraint, PairSelection, ResolvedPlan,
+};
 
 /// Generate compilable Rust producer source from a validated plan.
 ///
@@ -78,6 +81,8 @@ impl<'a> Generator<'a> {
         }
         writeln!(source, "}}").unwrap();
         writeln!(source).unwrap();
+        self.emit_derived_row_structs(&mut source)?;
+        self.emit_kinematic_helpers(&mut source)?;
         writeln!(source, "pub struct GeneratedProducer;").unwrap();
         writeln!(source).unwrap();
         writeln!(source, "impl GeneratedProducer {{").unwrap();
@@ -90,6 +95,7 @@ impl<'a> Generator<'a> {
         for object in &self.spec().objects {
             self.emit_object_selection(&mut source, object)?;
         }
+        self.emit_derived_objects(&mut source)?;
 
         if !self.spec().regions.is_empty() {
             writeln!(
@@ -107,12 +113,7 @@ impl<'a> Generator<'a> {
         }
 
         for output in &self.spec().outputs {
-            if matches!(output.expr, Expr::LeadingAttr { .. }) {
-                let name = checked_ident(&output.name, "leading output")?;
-                writeln!(source, "        let Some({name}) = {name} else {{").unwrap();
-                writeln!(source, "            return Ok(None);").unwrap();
-                writeln!(source, "        }};").unwrap();
-            }
+            self.emit_required_output_unwrap(&mut source, &output.expr, &output.name)?;
         }
 
         writeln!(source, "        Ok(Some(GenRow {{").unwrap();
@@ -212,7 +213,7 @@ impl<'a> Generator<'a> {
                 let condition = self.emit_model_region_requirement(
                     &requirement.lhs,
                     requirement.op,
-                    requirement.rhs,
+                    requirement.rhs.value,
                     &mut source,
                     &mut unwrapped_leading,
                 )?;
@@ -258,6 +259,12 @@ impl<'a> Generator<'a> {
     }
 
     fn validate_supported_spec(&self) -> Result<(), CodegenError> {
+        if !self.spec().models.is_empty() && !self.spec().derived_objects.is_empty() {
+            return Err(CodegenError::UnsupportedFeature(
+                "derived objects are not yet supported by model-aware codegen".to_string(),
+            ));
+        }
+
         for object in &self.spec().objects {
             checked_ident(&object.name, "object name")?;
             checked_ident(&object.source, "object source")?;
@@ -266,12 +273,19 @@ impl<'a> Generator<'a> {
             }
         }
 
+        for derived in &self.spec().derived_objects {
+            checked_ident(&derived.name, "derived object name")?;
+            self.validate_derived_object(derived)?;
+        }
+
         for region in &self.spec().regions {
             checked_ident(&region.name, "region name")?;
             for requirement in &region.require {
                 if self.spec().models.is_empty() {
-                    self.validate_count_expr(&requirement.lhs, "region requirement")?;
-                    checked_count_rhs(requirement.rhs, "region requirement")?;
+                    self.validate_region_expr(&requirement.lhs, "region requirement")?;
+                    if matches!(requirement.lhs, Expr::Count(_)) {
+                        checked_count_rhs(requirement.rhs.value, "region requirement")?;
+                    }
                 } else {
                     self.validate_model_region_expr(&requirement.lhs, "region requirement")?;
                 }
@@ -283,6 +297,9 @@ impl<'a> Generator<'a> {
             match &output.expr {
                 Expr::Count(object) => {
                     self.object(object)?;
+                }
+                Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
+                    self.validate_derived_attr(object, attr, "derived output")?;
                 }
                 Expr::LeadingAttr { object, attr } => {
                     if self.spec().models.is_empty() && attr != "pt" {
@@ -344,17 +361,70 @@ impl<'a> Generator<'a> {
         source: &mut String,
         baseline_ident: &str,
     ) -> Result<(), CodegenError> {
+        for derived_name in self.derived_region_objects() {
+            self.emit_derived_unwrap(source, &derived_name)?;
+        }
         for region in &self.spec().regions {
             let conditions = region
                 .require
                 .iter()
                 .map(|requirement| {
-                    self.emit_region_requirement(&requirement.lhs, requirement.op, requirement.rhs)
+                    self.emit_region_requirement(
+                        &requirement.lhs,
+                        requirement.op,
+                        requirement.rhs.value,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             self.emit_region_selection(source, &region.name, baseline_ident, &conditions)?;
         }
         Ok(())
+    }
+
+    fn emit_required_output_unwrap(
+        &self,
+        source: &mut String,
+        expr: &Expr,
+        output_name: &str,
+    ) -> Result<(), CodegenError> {
+        match expr {
+            Expr::LeadingAttr { .. } => {
+                let name = checked_ident(output_name, "leading output")?;
+                writeln!(source, "        let Some({name}) = {name} else {{").unwrap();
+                writeln!(source, "            return Ok(None);").unwrap();
+                writeln!(source, "        }};").unwrap();
+                Ok(())
+            }
+            Expr::Attr { object, .. }
+                if self.derived_object(object).is_ok()
+                    && !self.derived_region_objects().contains(object) =>
+            {
+                self.emit_derived_unwrap(source, object)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn emit_derived_unwrap(
+        &self,
+        source: &mut String,
+        derived_name: &str,
+    ) -> Result<(), CodegenError> {
+        let ident = checked_ident(derived_name, "derived object")?;
+        writeln!(source, "        let Some({ident}) = {ident} else {{").unwrap();
+        writeln!(source, "            return Ok(None);").unwrap();
+        writeln!(source, "        }};").unwrap();
+        Ok(())
+    }
+
+    fn derived_region_objects(&self) -> BTreeSet<String> {
+        let mut objects = BTreeSet::new();
+        for region in &self.spec().regions {
+            for requirement in &region.require {
+                collect_derived_objects_in_expr(&requirement.lhs, self.spec(), &mut objects);
+            }
+        }
+        objects
     }
 
     fn emit_region_selection(
@@ -389,8 +459,31 @@ impl<'a> Generator<'a> {
         let object_name = checked_ident(&object.name, "object name")?;
         let collection_ident = format!("{object_name}_collection");
         let item_ident = format!("{object_name}_item");
-        let count_ident = count_ident(&object.name)?;
+        let count_ident = if self.count_needed_for_object(&object.name) {
+            count_ident(&object.name)?
+        } else {
+            format!("_{}", count_ident(&object.name)?)
+        };
         let attrs = self.attrs_needed_for_object(&object.name)?;
+        let selected_attrs = self.selected_attrs_for_object(&object.name)?;
+        let selected_type = selected_type_ident(&object.name)?;
+        let selected_ident = selected_objects_ident(&object.name)?;
+
+        if !selected_attrs.is_empty() {
+            writeln!(source, "        #[derive(Debug, Clone, Copy)]").unwrap();
+            writeln!(source, "        struct {selected_type} {{").unwrap();
+            for attr in &selected_attrs {
+                writeln!(
+                    source,
+                    "            {}: {},",
+                    checked_ident(attr, "selected object attribute")?,
+                    self.object_attr_rust_type(&object.name, attr)?
+                )
+                .unwrap();
+            }
+            writeln!(source, "        }}").unwrap();
+            writeln!(source, "        let mut {selected_ident} = Vec::new();").unwrap();
+        }
 
         writeln!(
             source,
@@ -421,11 +514,12 @@ impl<'a> Generator<'a> {
         .unwrap();
 
         for attr in attrs {
-            self.require_f32_attr(&object.name, &attr, "object attribute")?;
+            self.require_supported_object_attr(&object.name, &attr, "object attribute")?;
             let attr_ident = attr_ident(&object.name, &attr)?;
+            let rust_type = self.object_attr_rust_type(&object.name, &attr)?;
             writeln!(
                 source,
-                "            let {attr_ident} = {item_ident}.get::<f32>({})?;",
+                "            let {attr_ident} = {item_ident}.get::<{rust_type}>({})?;",
                 rust_string(&attr)
             )
             .unwrap();
@@ -464,11 +558,41 @@ impl<'a> Generator<'a> {
                 }
             }
         }
+        if !selected_attrs.is_empty() {
+            writeln!(
+                source,
+                "                {selected_ident}.push({selected_type} {{"
+            )
+            .unwrap();
+            for attr in &selected_attrs {
+                let attr_ident = attr_ident(&object.name, attr)?;
+                writeln!(
+                    source,
+                    "                    {}: {attr_ident},",
+                    checked_ident(attr, "selected object attribute")?
+                )
+                .unwrap();
+            }
+            writeln!(source, "                }});").unwrap();
+        }
 
         writeln!(source, "            }}").unwrap();
         writeln!(source, "        }}").unwrap();
         writeln!(source).unwrap();
         Ok(())
+    }
+
+    fn count_needed_for_object(&self, object_name: &str) -> bool {
+        self.spec()
+            .outputs
+            .iter()
+            .any(|output| matches!(&output.expr, Expr::Count(object) if object == object_name))
+            || self.spec().regions.iter().any(|region| {
+                region
+                    .require
+                    .iter()
+                    .any(|requirement| expr_counts_object(&requirement.lhs, object_name))
+            })
     }
 
     fn attrs_needed_for_object(&self, object_name: &str) -> Result<BTreeSet<String>, CodegenError> {
@@ -484,6 +608,9 @@ impl<'a> Generator<'a> {
                 }
             }
         }
+        for attr in self.selected_attrs_for_object(object_name)? {
+            attrs.insert(attr);
+        }
         if !self.spec().models.is_empty() {
             for region in &self.spec().regions {
                 for requirement in &region.require {
@@ -496,6 +623,235 @@ impl<'a> Generator<'a> {
             }
         }
         Ok(attrs)
+    }
+
+    fn selected_attrs_for_object(
+        &self,
+        object_name: &str,
+    ) -> Result<BTreeSet<String>, CodegenError> {
+        let mut attrs = BTreeSet::new();
+        for derived in &self.spec().derived_objects {
+            match &derived.source {
+                DerivedSource::Pair(pair) => {
+                    if pair.object != object_name {
+                        continue;
+                    }
+
+                    attrs.insert("pt".to_string());
+                    attrs.insert("eta".to_string());
+                    attrs.insert("phi".to_string());
+                    attrs.insert("mass".to_string());
+                    for constraint in &pair.constraints {
+                        if matches!(constraint, PairConstraint::OppositeCharge) {
+                            attrs.insert("charge".to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(attrs)
+    }
+
+    fn emit_derived_row_structs(&self, source: &mut String) -> Result<(), CodegenError> {
+        if self.spec().derived_objects.is_empty() {
+            return Ok(());
+        }
+
+        for derived in &self.spec().derived_objects {
+            let type_ident = derived_type_ident(&derived.name)?;
+            writeln!(source, "#[derive(Debug, Clone, Copy, PartialEq)]").unwrap();
+            writeln!(source, "struct {type_ident} {{").unwrap();
+            writeln!(source, "    mass: f64,").unwrap();
+            writeln!(source, "    pt: f64,").unwrap();
+            writeln!(source, "}}").unwrap();
+            writeln!(source).unwrap();
+        }
+        Ok(())
+    }
+
+    fn emit_kinematic_helpers(&self, source: &mut String) -> Result<(), CodegenError> {
+        if self.spec().derived_objects.is_empty() {
+            return Ok(());
+        }
+
+        writeln!(
+            source,
+            "fn gen_four_vector(pt: f32, eta: f32, phi: f32, mass: f32) -> (f64, f64, f64, f64) {{"
+        )
+        .unwrap();
+        writeln!(source, "    let pt = f64::from(pt);").unwrap();
+        writeln!(source, "    let eta = f64::from(eta);").unwrap();
+        writeln!(source, "    let phi = f64::from(phi);").unwrap();
+        writeln!(source, "    let mass = f64::from(mass);").unwrap();
+        writeln!(source, "    let px = pt * phi.cos();").unwrap();
+        writeln!(source, "    let py = pt * phi.sin();").unwrap();
+        writeln!(source, "    let pz = pt * eta.sinh();").unwrap();
+        writeln!(
+            source,
+            "    let energy = (px * px + py * py + pz * pz + mass * mass).sqrt();"
+        )
+        .unwrap();
+        writeln!(source, "    (energy, px, py, pz)").unwrap();
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
+        Ok(())
+    }
+
+    fn emit_derived_objects(&self, source: &mut String) -> Result<(), CodegenError> {
+        for derived in &self.spec().derived_objects {
+            match &derived.source {
+                DerivedSource::Pair(pair) => {
+                    self.emit_pair_derived_object(source, derived, pair)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_pair_derived_object(
+        &self,
+        source: &mut String,
+        derived: &DerivedObjectDef,
+        pair: &crate::ObjectPairDef,
+    ) -> Result<(), CodegenError> {
+        let derived_ident = checked_ident(&derived.name, "derived object")?;
+        let derived_type = derived_type_ident(&derived.name)?;
+        let selected_ident = selected_objects_ident(&pair.object)?;
+        let order_ident = format!("{derived_ident}_order");
+        let best_diff_ident = format!("{derived_ident}_best_diff");
+        let target = match &pair.selection {
+            PairSelection::LeadingPt => None,
+            PairSelection::NearestMass { target } => Some(f64_literal(target.value)),
+        };
+
+        writeln!(
+            source,
+            "        let mut {order_ident} = (0..{selected_ident}.len()).collect::<Vec<_>>();"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "        {order_ident}.sort_by(|&left, &right| {selected_ident}[right].pt.total_cmp(&{selected_ident}[left].pt));"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "        let mut {derived_ident}: Option<{derived_type}> = None;"
+        )
+        .unwrap();
+        if target.is_some() {
+            writeln!(
+                source,
+                "        let mut {best_diff_ident}: Option<f64> = None;"
+            )
+            .unwrap();
+        }
+        let loop_label = format!("'{}_pairs", derived_ident);
+        writeln!(
+            source,
+            "        {loop_label}: for (left_pos, &left) in {order_ident}.iter().enumerate() {{"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "            for &right in &{order_ident}[left_pos + 1..] {{"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "                let first = {selected_ident}[left];"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "                let second = {selected_ident}[right];"
+        )
+        .unwrap();
+
+        for constraint in &pair.constraints {
+            match constraint {
+                PairConstraint::OppositeCharge => {
+                    writeln!(
+                        source,
+                        "                if first.charge * second.charge >= 0 {{"
+                    )
+                    .unwrap();
+                    writeln!(source, "                    continue;").unwrap();
+                    writeln!(source, "                }}").unwrap();
+                }
+                PairConstraint::SameFlavor => {}
+            }
+        }
+
+        writeln!(
+            source,
+            "                let (e1, px1, py1, pz1) = gen_four_vector(first.pt, first.eta, first.phi, first.mass);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "                let (e2, px2, py2, pz2) = gen_four_vector(second.pt, second.eta, second.phi, second.mass);"
+        )
+        .unwrap();
+        writeln!(source, "                let energy = e1 + e2;").unwrap();
+        writeln!(source, "                let px = px1 + px2;").unwrap();
+        writeln!(source, "                let py = py1 + py2;").unwrap();
+        writeln!(source, "                let pz = pz1 + pz2;").unwrap();
+        writeln!(
+            source,
+            "                let mass = (energy * energy - px * px - py * py - pz * pz).max(0.0).sqrt();"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "                if !mass.is_finite() || mass <= 0.0 {{"
+        )
+        .unwrap();
+        writeln!(source, "                    continue;").unwrap();
+        writeln!(source, "                }}").unwrap();
+        writeln!(
+            source,
+            "                let pt = (px * px + py * py).sqrt();"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "                let candidate = {derived_type} {{ mass, pt }};"
+        )
+        .unwrap();
+        match target {
+            None => {
+                writeln!(source, "                {derived_ident} = Some(candidate);").unwrap();
+                writeln!(source, "                break {loop_label};").unwrap();
+            }
+            Some(target) => {
+                writeln!(
+                    source,
+                    "                let diff = (mass - {target}).abs();"
+                )
+                .unwrap();
+                writeln!(
+                    source,
+                    "                if {best_diff_ident}.map_or(true, |best| diff < best) {{"
+                )
+                .unwrap();
+                writeln!(
+                    source,
+                    "                    {best_diff_ident} = Some(diff);"
+                )
+                .unwrap();
+                writeln!(
+                    source,
+                    "                    {derived_ident} = Some(candidate);"
+                )
+                .unwrap();
+                writeln!(source, "                }}").unwrap();
+            }
+        }
+        writeln!(source, "            }}").unwrap();
+        writeln!(source, "        }}").unwrap();
+        writeln!(source).unwrap();
+        Ok(())
     }
 
     fn emit_cut(&self, object: &ObjectDef, cut: &crate::Cut) -> Result<String, CodegenError> {
@@ -526,19 +882,28 @@ impl<'a> Generator<'a> {
         op: CmpOp,
         rhs: f64,
     ) -> Result<String, CodegenError> {
-        let Expr::Count(object) = lhs else {
-            return Err(CodegenError::UnsupportedFeature(format!(
-                "region requirement `{lhs}` is not supported by this slice"
-            )));
-        };
-        let lhs = count_ident(object)?;
-        let rhs = checked_count_rhs(rhs, "region requirement")?;
-        Ok(format!("{lhs} {} {rhs}_u32", cmp_op(op)))
+        match lhs {
+            Expr::Count(object) => {
+                let lhs = count_ident(object)?;
+                let rhs = checked_count_rhs(rhs, "region requirement")?;
+                Ok(format!("{lhs} {} {rhs}_u32", cmp_op(op)))
+            }
+            Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
+                let lhs = derived_attr_expr(object, attr)?;
+                Ok(format!("{lhs} {} {}", cmp_op(op), f64_literal(rhs)))
+            }
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "region requirement `{other}` is not supported by this slice"
+            ))),
+        }
     }
 
     fn emit_output_expr(&self, expr: &Expr, output_name: &str) -> Result<String, CodegenError> {
         match expr {
             Expr::Count(object) => count_ident(object),
+            Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
+                derived_attr_expr(object, attr)
+            }
             Expr::LeadingAttr { .. } => Ok(output_name.to_string()),
             other => Err(CodegenError::UnsupportedFeature(format!(
                 "output expression `{other}` is not supported by this slice"
@@ -549,6 +914,7 @@ impl<'a> Generator<'a> {
     fn output_type(&self, expr: &Expr) -> Result<&'static str, CodegenError> {
         match expr {
             Expr::Count(_) => Ok("u32"),
+            Expr::Attr { object, .. } if self.derived_object(object).is_ok() => Ok("f64"),
             Expr::LeadingAttr { .. } => Ok("f32"),
             other => Err(CodegenError::UnsupportedFeature(format!(
                 "output expression `{other}` is not supported by this slice"
@@ -572,14 +938,19 @@ impl<'a> Generator<'a> {
         }
     }
 
-    fn validate_count_expr(&self, expr: &Expr, context: &str) -> Result<(), CodegenError> {
-        let Expr::Count(object) = expr else {
-            return Err(CodegenError::UnsupportedFeature(format!(
-                "{context} expression `{expr}` is not supported by this slice"
-            )));
-        };
-        self.object(object)?;
-        Ok(())
+    fn validate_region_expr(&self, expr: &Expr, context: &str) -> Result<(), CodegenError> {
+        match expr {
+            Expr::Count(object) => {
+                self.object(object)?;
+                Ok(())
+            }
+            Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
+                self.validate_derived_attr(object, attr, context)
+            }
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "{context} expression `{other}` is not supported by this slice"
+            ))),
+        }
     }
 
     fn require_f32_attr(
@@ -612,6 +983,91 @@ impl<'a> Generator<'a> {
         Ok(())
     }
 
+    fn require_supported_object_attr(
+        &self,
+        object_name: &str,
+        attr: &str,
+        context: &str,
+    ) -> Result<(), CodegenError> {
+        let branch_type = self.object_attr_branch_type(object_name, attr)?;
+        if !matches!(branch_type, BranchType::VecF32 | BranchType::VecI32) {
+            let object = self.object(object_name)?;
+            let branch = format!("{}_{}", object.source, attr);
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "{context}: branch `{branch}` has type {:?}; this slice only emits f32/i32 object reads",
+                branch_type
+            )));
+        }
+        Ok(())
+    }
+
+    fn object_attr_rust_type(
+        &self,
+        object_name: &str,
+        attr: &str,
+    ) -> Result<&'static str, CodegenError> {
+        match self.object_attr_branch_type(object_name, attr)? {
+            BranchType::VecF32 => Ok("f32"),
+            BranchType::VecI32 => Ok("i32"),
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "object `{object_name}` attribute `{attr}` has unsupported type {other:?}"
+            ))),
+        }
+    }
+
+    fn object_attr_branch_type(
+        &self,
+        object_name: &str,
+        attr: &str,
+    ) -> Result<BranchType, CodegenError> {
+        let object = self.object(object_name)?;
+        let branch = format!("{}_{}", object.source, attr);
+        self.branch_type(&branch)
+    }
+
+    fn validate_derived_object(&self, derived: &DerivedObjectDef) -> Result<(), CodegenError> {
+        match &derived.source {
+            DerivedSource::Pair(pair) => {
+                self.object(&pair.object)?;
+                for attr in ["pt", "eta", "phi", "mass"] {
+                    if self.object_attr_branch_type(&pair.object, attr)? != BranchType::VecF32 {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "derived pair `{}` requires `{}`.{attr} as a f32 vector branch",
+                            derived.name, pair.object
+                        )));
+                    }
+                }
+                for constraint in &pair.constraints {
+                    if matches!(constraint, PairConstraint::OppositeCharge)
+                        && self.object_attr_branch_type(&pair.object, "charge")?
+                            != BranchType::VecI32
+                    {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "derived pair `{}` requires `{}`.charge as an i32 vector branch",
+                            derived.name, pair.object
+                        )));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_derived_attr(
+        &self,
+        object: &str,
+        attr: &str,
+        context: &str,
+    ) -> Result<(), CodegenError> {
+        self.derived_object(object)?;
+        match attr {
+            "mass" | "pt" => Ok(()),
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "{context}: derived object `{object}` has no supported attribute `{other}`"
+            ))),
+        }
+    }
+
     fn object(&self, name: &str) -> Result<&ObjectDef, CodegenError> {
         self.spec()
             .objects
@@ -620,6 +1076,18 @@ impl<'a> Generator<'a> {
             .ok_or_else(|| {
                 CodegenError::UnsupportedFeature(format!(
                     "object `{name}` is not defined in the analysis spec"
+                ))
+            })
+    }
+
+    fn derived_object(&self, name: &str) -> Result<&DerivedObjectDef, CodegenError> {
+        self.spec()
+            .derived_objects
+            .iter()
+            .find(|object| object.name == name)
+            .ok_or_else(|| {
+                CodegenError::UnsupportedFeature(format!(
+                    "derived object `{name}` is not defined in the analysis spec"
                 ))
             })
     }
@@ -1131,6 +1599,35 @@ fn leading_attr_ident(object_name: &str, attr: &str) -> Result<String, CodegenEr
     ))
 }
 
+fn selected_objects_ident(object_name: &str) -> Result<String, CodegenError> {
+    Ok(format!(
+        "{}_selected",
+        checked_ident(object_name, "selected object")?
+    ))
+}
+
+fn selected_type_ident(object_name: &str) -> Result<String, CodegenError> {
+    Ok(format!(
+        "{}Selected",
+        upper_camel_ident(object_name, "selected object type")?
+    ))
+}
+
+fn derived_type_ident(object_name: &str) -> Result<String, CodegenError> {
+    Ok(format!(
+        "{}Derived",
+        upper_camel_ident(object_name, "derived object type")?
+    ))
+}
+
+fn derived_attr_expr(object_name: &str, attr: &str) -> Result<String, CodegenError> {
+    Ok(format!(
+        "{}.{}",
+        checked_ident(object_name, "derived object")?,
+        checked_ident(attr, "derived attribute")?
+    ))
+}
+
 fn region_type_ident(region_name: &str) -> Result<String, CodegenError> {
     Ok(format!(
         "{}Region",
@@ -1222,6 +1719,10 @@ fn f32_literal(value: f64) -> String {
     format!("{value:?}_f32")
 }
 
+fn f64_literal(value: f64) -> String {
+    format!("{value:?}_f64")
+}
+
 fn checked_count_rhs(value: f64, context: &str) -> Result<u32, CodegenError> {
     if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= u32::MAX as f64 {
         Ok(value as u32)
@@ -1236,6 +1737,33 @@ fn rust_string(value: &str) -> String {
     format!("{value:?}")
 }
 
+fn collect_derived_objects_in_expr(
+    expr: &Expr,
+    spec: &AnalysisSpec,
+    objects: &mut BTreeSet<String>,
+) {
+    match expr {
+        Expr::Attr { object, .. }
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *object) =>
+        {
+            objects.insert(object.clone());
+        }
+        Expr::Abs(inner) => collect_derived_objects_in_expr(inner, spec, objects),
+        _ => {}
+    }
+}
+
+fn expr_counts_object(expr: &Expr, object_name: &str) -> bool {
+    match expr {
+        Expr::Count(object) => object == object_name,
+        Expr::Abs(inner) => expr_counts_object(inner, object_name),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1243,6 +1771,7 @@ mod tests {
 
     const MUON_SPEC: &str = include_str!("../examples/muon.toml");
     const MUON_TAGGER_SPEC: &str = include_str!("../examples/muon_tagger.toml");
+    const DIMUON_SPEC: &str = include_str!("../examples/dimuon.toml");
     const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 
     #[test]
@@ -1284,5 +1813,23 @@ mod tests {
         assert!(source.contains(
             "muon_tagger_baseline.select::<SignalRegion>(|_| n_good_muon >= 1_u32 && leading_good_muon_topscore > 0.5_f32)"
         ));
+    }
+
+    #[test]
+    fn generates_dimuon_pair_producer_source() {
+        let spec = AnalysisSpec::from_toml_str(DIMUON_SPEC).unwrap();
+        let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+        let plan = validate(&spec, &catalogue).unwrap();
+        let source = generate_producer_source(&plan).unwrap();
+
+        assert!(source.contains("struct DimuonDerived"));
+        assert!(source.contains("let mut good_muon_selected = Vec::new();"));
+        assert!(source.contains("let good_muon_charge = good_muon_item.get::<i32>(\"charge\")?;"));
+        assert!(source.contains(
+            "dimuon_order.sort_by(|&left, &right| good_muon_selected[right].pt.total_cmp(&good_muon_selected[left].pt));"
+        ));
+        assert!(source.contains("if first.charge * second.charge >= 0"));
+        assert!(source.contains("let Some(dimuon) = dimuon else"));
+        assert!(source.contains("dimuon_mass: dimuon.mass,"));
     }
 }

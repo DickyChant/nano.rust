@@ -136,7 +136,7 @@ pub fn interpret(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>
     for region in &plan.spec.regions {
         for requirement in &region.require {
             let lhs = eval_numeric_expr(&requirement.lhs, &selected, None)?;
-            if !compare(lhs.as_f64(), requirement.op, requirement.rhs) {
+            if !compare(lhs.as_f64(), requirement.op, requirement.rhs.value) {
                 return Ok(None);
             }
         }

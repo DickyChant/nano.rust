@@ -21,6 +21,7 @@ pub struct AnalysisSpec {
     pub name: String,
     pub year: Year,
     pub objects: Vec<ObjectDef>,
+    pub derived_objects: Vec<DerivedObjectDef>,
     pub models: Vec<ModelDef>,
     pub regions: Vec<RegionDef>,
     pub outputs: Vec<OutputDef>,
@@ -126,6 +127,43 @@ pub struct ObjectDef {
     pub cuts: Vec<Cut>,
 }
 
+/// Derived object definition, such as a selected dimuon pair built from muons.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DerivedObjectDef {
+    pub name: String,
+    pub source: DerivedSource,
+}
+
+/// Source operation for a derived object.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum DerivedSource {
+    Pair(ObjectPairDef),
+}
+
+/// Pair combinatorics over one selected object collection.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ObjectPairDef {
+    pub object: String,
+    pub constraints: Vec<PairConstraint>,
+    pub selection: PairSelection,
+}
+
+/// Pair-level constraints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PairConstraint {
+    OppositeCharge,
+    SameFlavor,
+}
+
+/// Rule used to choose one pair candidate from all valid combinations.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum PairSelection {
+    /// Sort selected objects by pT and take the first valid pair in that order.
+    LeadingPt,
+    /// Choose the valid pair whose invariant mass is closest to a target.
+    NearestMass { target: Quantity },
+}
+
 /// A numeric comparison cut.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Cut {
@@ -221,7 +259,7 @@ pub enum CmpOp {
 pub struct Requirement {
     pub lhs: Expr,
     pub op: CmpOp,
-    pub rhs: f64,
+    pub rhs: Quantity,
 }
 
 /// Named region definition.
@@ -325,6 +363,12 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
         });
     }
 
+    let derived_objects = raw
+        .derived
+        .into_iter()
+        .map(derived_object_def_from_raw)
+        .collect::<Result<Vec<_>, _>>()?;
+
     let models = raw
         .models
         .into_iter()
@@ -356,6 +400,7 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
         name: raw.analysis.name,
         year: Year::parse(&raw.analysis.year),
         objects,
+        derived_objects,
         models,
         regions,
         outputs,
@@ -372,6 +417,11 @@ pub fn validate(
         .iter()
         .map(|object| (object.name.as_str(), object.source.as_str()))
         .collect::<HashMap<_, _>>();
+    let derived_objects = spec
+        .derived_objects
+        .iter()
+        .map(|object| (object.name.as_str(), object))
+        .collect::<HashMap<_, _>>();
     let mut errors = Vec::new();
     let mut required = RequiredBranches::default();
     let model_outputs =
@@ -381,6 +431,7 @@ pub fn validate(
         let mut ctx = ValidationContext {
             catalogue,
             object_sources: &object_sources,
+            derived_objects: &derived_objects,
             model_outputs: &model_outputs,
             required: &mut required,
             errors: &mut errors,
@@ -391,6 +442,10 @@ pub fn validate(
             for (index, cut) in object.cuts.iter().enumerate() {
                 validate_cut(object, index, cut, &mut ctx);
             }
+        }
+
+        for derived in &spec.derived_objects {
+            validate_derived_object(derived, &mut ctx);
         }
 
         for region in &spec.regions {
@@ -426,6 +481,7 @@ pub fn validate(
 struct ValidationContext<'a> {
     catalogue: &'a Catalogue,
     object_sources: &'a HashMap<&'a str, &'a str>,
+    derived_objects: &'a HashMap<&'a str, &'a DerivedObjectDef>,
     model_outputs: &'a ModelOutputs,
     required: &'a mut RequiredBranches,
     errors: &'a mut Vec<SpecError>,
@@ -437,7 +493,7 @@ fn validate_cut(object: &ObjectDef, index: usize, cut: &Cut, ctx: &mut Validatio
 
     match lhs_type {
         Some(ExprType::Numeric(dimension)) => {
-            validate_quantity_unit(&context, &cut.lhs, dimension, cut, ctx.errors)
+            validate_quantity_unit(&context, &cut.lhs, dimension, &cut.rhs, ctx.errors)
         }
         Some(ExprType::Count) => ctx.errors.push(SpecError::InvalidExpression {
             context,
@@ -454,7 +510,73 @@ fn validate_requirement(
     ctx: &mut ValidationContext<'_>,
 ) {
     let context = format!("region `{}` requirement {}", region.name, index + 1);
-    validate_expr(&requirement.lhs, &context, ctx);
+    if let Some(expr_type) = validate_expr(&requirement.lhs, &context, ctx) {
+        match expr_type {
+            ExprType::Numeric(dimension) => validate_quantity_unit(
+                &context,
+                &requirement.lhs,
+                dimension,
+                &requirement.rhs,
+                ctx.errors,
+            ),
+            ExprType::Count => validate_quantity_unit(
+                &context,
+                &requirement.lhs,
+                Dimension::Dimensionless,
+                &requirement.rhs,
+                ctx.errors,
+            ),
+        }
+    }
+}
+
+fn validate_derived_object(derived: &DerivedObjectDef, ctx: &mut ValidationContext<'_>) {
+    let context = format!("derived object `{}`", derived.name);
+    match &derived.source {
+        DerivedSource::Pair(pair) => {
+            let Some(source) = ctx.object_sources.get(pair.object.as_str()) else {
+                ctx.errors.push(SpecError::UndefinedObject {
+                    context,
+                    object: pair.object.clone(),
+                });
+                return;
+            };
+
+            ctx.required.require_counter(source);
+            require_four_vector(source, &context, ctx);
+            for constraint in &pair.constraints {
+                match constraint {
+                    PairConstraint::OppositeCharge => {
+                        require_attr_branch_type(
+                            source,
+                            "charge",
+                            BranchType::VecI32,
+                            "i32 vector branch for opposite-charge pairing",
+                            &context,
+                            ctx,
+                        );
+                    }
+                    PairConstraint::SameFlavor => {}
+                }
+            }
+
+            match &pair.selection {
+                PairSelection::LeadingPt => {}
+                PairSelection::NearestMass { target } => {
+                    validate_quantity_unit(
+                        &context,
+                        &Expr::Attr {
+                            object: derived.name.clone(),
+                            attr: "mass".to_string(),
+                        },
+                        Dimension::Momentum,
+                        target,
+                        ctx.errors,
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn validate_expr(expr: &Expr, context: &str, ctx: &mut ValidationContext<'_>) -> Option<ExprType> {
@@ -473,10 +595,19 @@ fn validate_expr(expr: &Expr, context: &str, ctx: &mut ValidationContext<'_>) ->
         },
         Expr::Count(object) => {
             let Some(source) = ctx.object_sources.get(object.as_str()) else {
-                ctx.errors.push(SpecError::UndefinedObject {
-                    context: context.to_string(),
-                    object: object.clone(),
-                });
+                if ctx.derived_objects.contains_key(object.as_str()) {
+                    ctx.errors.push(SpecError::InvalidExpression {
+                        context: context.to_string(),
+                        detail: format!(
+                            "count({object}) is only defined for selected object collections, not derived objects"
+                        ),
+                    });
+                } else {
+                    ctx.errors.push(SpecError::UndefinedObject {
+                        context: context.to_string(),
+                        object: object.clone(),
+                    });
+                }
                 return None;
             };
             ctx.required.require_counter(source);
@@ -492,6 +623,10 @@ fn validate_attr(
     context: &str,
     ctx: &mut ValidationContext<'_>,
 ) -> Option<ExprType> {
+    if let Some(derived) = ctx.derived_objects.get(object) {
+        return validate_derived_attr(derived, attr, context, ctx);
+    }
+
     let Some(source) = ctx.object_sources.get(object) else {
         ctx.errors.push(SpecError::UndefinedObject {
             context: context.to_string(),
@@ -538,14 +673,119 @@ fn validate_attr(
     Some(ExprType::Numeric(attribute_dimension(attr)))
 }
 
+fn validate_derived_attr(
+    derived: &DerivedObjectDef,
+    attr: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) -> Option<ExprType> {
+    match &derived.source {
+        DerivedSource::Pair(pair) => {
+            let Some(source) = ctx.object_sources.get(pair.object.as_str()) else {
+                ctx.errors.push(SpecError::UndefinedObject {
+                    context: context.to_string(),
+                    object: pair.object.clone(),
+                });
+                return None;
+            };
+
+            match attr {
+                "mass" => {
+                    require_four_vector(source, context, ctx);
+                    Some(ExprType::Numeric(Dimension::Momentum))
+                }
+                "pt" => {
+                    require_attr_branch_type(
+                        source,
+                        "pt",
+                        BranchType::VecF32,
+                        "f32 vector branch for pair pT",
+                        context,
+                        ctx,
+                    );
+                    require_attr_branch_type(
+                        source,
+                        "phi",
+                        BranchType::VecF32,
+                        "f32 vector branch for pair pT",
+                        context,
+                        ctx,
+                    );
+                    Some(ExprType::Numeric(Dimension::Momentum))
+                }
+                other => {
+                    ctx.errors.push(SpecError::InvalidExpression {
+                        context: context.to_string(),
+                        detail: format!(
+                            "derived pair `{}` has no attribute `{other}`; supported attributes are `mass` and `pt`",
+                            derived.name
+                        ),
+                    });
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn require_four_vector(source: &str, context: &str, ctx: &mut ValidationContext<'_>) {
+    for attr in ["pt", "eta", "phi", "mass"] {
+        require_attr_branch_type(
+            source,
+            attr,
+            BranchType::VecF32,
+            "f32 vector branch for pt/eta/phi/mass four-vector",
+            context,
+            ctx,
+        );
+    }
+}
+
+fn require_attr_branch_type(
+    source: &str,
+    attr: &str,
+    expected_type: BranchType,
+    expected: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    let branch = format!("{source}_{attr}");
+    let Some(entry) = ctx.catalogue.branch(&branch) else {
+        ctx.errors.push(SpecError::MissingBranch {
+            context: context.to_string(),
+            branch,
+        });
+        return;
+    };
+    let Some(branch_type) = entry.branch_type else {
+        ctx.errors.push(SpecError::UnsupportedBranchType {
+            context: context.to_string(),
+            branch,
+            raw_type: entry.raw_type.clone(),
+        });
+        return;
+    };
+    if branch_type != expected_type {
+        ctx.errors.push(SpecError::WrongBranchType {
+            context: context.to_string(),
+            branch,
+            expected: expected.to_string(),
+            actual: branch_type,
+        });
+        return;
+    }
+    ctx.required.require_counter(source);
+    ctx.required.require_attr(source, attr);
+}
+
 fn validate_quantity_unit(
     context: &str,
     lhs: &Expr,
     dimension: Dimension,
-    cut: &Cut,
+    rhs: &Quantity,
     errors: &mut Vec<SpecError>,
 ) {
-    match (dimension, cut.rhs.unit) {
+    match (dimension, rhs.unit) {
         (Dimension::Momentum, Unit::GeV) | (Dimension::Dimensionless, Unit::Dimensionless) => {}
         (Dimension::Momentum, Unit::Dimensionless) => errors.push(SpecError::MissingUnit {
             context: context.to_string(),
@@ -969,6 +1209,15 @@ fn validate_raw_analysis_spec(raw: &RawAnalysisSpec) -> Result<(), ParseError> {
         }
     }
 
+    for name in raw.derived.keys() {
+        validate_identifier(name, "derived")?;
+        if raw.objects.contains_key(name) {
+            return Err(ParseError::InvalidSpec(format!(
+                "derived object `{name}` duplicates an object name"
+            )));
+        }
+    }
+
     for name in raw.regions.keys() {
         validate_identifier(name, "regions")?;
     }
@@ -1080,7 +1329,7 @@ fn parse_cut(input: &str, object_name: &str) -> Result<Cut, ParseError> {
 
 fn parse_requirement(input: &str) -> Result<Requirement, ParseError> {
     let (lhs, op, rhs) = split_comparison(input)?;
-    let rhs = parse_unitless_number(rhs)?;
+    let rhs = parse_quantity(rhs)?;
     Ok(Requirement {
         lhs: parse_expr(lhs, None)?,
         op,
@@ -1194,14 +1443,6 @@ fn parse_quantity(input: &str) -> Result<Quantity, ParseError> {
     Ok(Quantity { value, unit })
 }
 
-fn parse_unitless_number(input: &str) -> Result<f64, ParseError> {
-    let value = input
-        .trim()
-        .parse::<f64>()
-        .map_err(|_| ParseError::InvalidSpec(format!("expected unitless number, got `{input}`")))?;
-    Ok(value)
-}
-
 fn validate_identifier(value: &str, expression: &str) -> Result<(), ParseError> {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -1228,6 +1469,8 @@ struct RawAnalysisSpec {
     analysis: RawAnalysis,
     #[serde(default)]
     objects: BTreeMap<String, RawObject>,
+    #[serde(default, alias = "derived_objects")]
+    derived: BTreeMap<String, RawDerivedObject>,
     #[serde(default, rename = "model")]
     models: Vec<RawModel>,
     #[serde(default)]
@@ -1247,6 +1490,17 @@ struct RawObject {
     source: String,
     #[serde(default)]
     cuts: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawDerivedObject {
+    kind: String,
+    object: String,
+    #[serde(default)]
+    constraints: Vec<String>,
+    selection: String,
+    #[serde(default)]
+    target: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1284,6 +1538,78 @@ struct RawRegion {
 struct RawOutput {
     name: String,
     expr: String,
+}
+
+fn derived_object_def_from_raw(
+    (name, raw): (String, RawDerivedObject),
+) -> Result<DerivedObjectDef, ParseError> {
+    validate_identifier(&name, "derived object name")?;
+    validate_identifier(
+        &raw.object,
+        &format!("derived object `{name}` source object"),
+    )?;
+
+    let constraints = raw
+        .constraints
+        .iter()
+        .map(|constraint| pair_constraint_from_raw(&name, constraint))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selection = pair_selection_from_raw(&name, &raw.selection, raw.target.as_deref())?;
+
+    let source = match raw.kind.as_str() {
+        "pair" => DerivedSource::Pair(ObjectPairDef {
+            object: raw.object,
+            constraints,
+            selection,
+        }),
+        kind => {
+            return Err(ParseError::InvalidSpec(format!(
+                "derived object `{name}` has unsupported kind `{kind}`; expected `pair`"
+            )));
+        }
+    };
+
+    Ok(DerivedObjectDef { name, source })
+}
+
+fn pair_constraint_from_raw(name: &str, constraint: &str) -> Result<PairConstraint, ParseError> {
+    match constraint {
+        "opposite_charge" => Ok(PairConstraint::OppositeCharge),
+        "same_flavor" => Ok(PairConstraint::SameFlavor),
+        other => Err(ParseError::InvalidSpec(format!(
+            "derived object `{name}` has unsupported pair constraint `{other}`"
+        ))),
+    }
+}
+
+fn pair_selection_from_raw(
+    name: &str,
+    selection: &str,
+    target: Option<&str>,
+) -> Result<PairSelection, ParseError> {
+    match selection {
+        "leading_pt" => {
+            if target.is_some() {
+                return Err(ParseError::InvalidSpec(format!(
+                    "derived object `{name}` selection `leading_pt` does not accept `target`"
+                )));
+            }
+            Ok(PairSelection::LeadingPt)
+        }
+        "nearest_mass" => {
+            let Some(target) = target else {
+                return Err(ParseError::InvalidSpec(format!(
+                    "derived object `{name}` selection `nearest_mass` requires `target`"
+                )));
+            };
+            Ok(PairSelection::NearestMass {
+                target: parse_quantity(target)?,
+            })
+        }
+        other => Err(ParseError::InvalidSpec(format!(
+            "derived object `{name}` has unsupported pair selection `{other}`"
+        ))),
+    }
 }
 
 fn model_def_from_raw(raw: RawModel) -> Result<ModelDef, ParseError> {
@@ -1514,6 +1840,7 @@ mod tests {
 
     const MUON_SPEC_TOML: &str = include_str!("../examples/muon.toml");
     const MUON_TAGGER_SPEC_TOML: &str = include_str!("../examples/muon_tagger.toml");
+    const DIMUON_SPEC_TOML: &str = include_str!("../examples/dimuon.toml");
     const MUON_SPEC_YAML: &str = include_str!("../examples/muon.yaml");
     const MUON_SPEC_JSON: &str = r#"
 {
@@ -1595,6 +1922,92 @@ mod tests {
                 ("Muon_pt", BranchType::VecF32),
             ]
         );
+    }
+
+    #[test]
+    fn parses_dimuon_pair_into_typed_ir() {
+        let spec = AnalysisSpec::from_toml_str(DIMUON_SPEC_TOML).expect("parse dimuon spec");
+
+        assert_eq!(spec.derived_objects.len(), 1);
+        assert_eq!(spec.derived_objects[0].name, "dimuon");
+        assert_eq!(
+            spec.derived_objects[0].source,
+            DerivedSource::Pair(ObjectPairDef {
+                object: "good_muon".to_string(),
+                constraints: vec![PairConstraint::OppositeCharge],
+                selection: PairSelection::LeadingPt,
+            })
+        );
+        assert_eq!(
+            spec.outputs[0].expr,
+            Expr::Attr {
+                object: "dimuon".to_string(),
+                attr: "mass".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn validation_derives_dimuon_pair_read_branches() {
+        let spec = AnalysisSpec::from_toml_str(DIMUON_SPEC_TOML).expect("parse dimuon spec");
+        let plan = validate(&spec, &catalogue()).expect("validate dimuon spec");
+        let read_branches = plan
+            .read_branches
+            .specs()
+            .iter()
+            .map(|spec| (spec.name.as_str(), spec.branch_type))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            read_branches,
+            vec![
+                ("nMuon", BranchType::U32),
+                ("Muon_charge", BranchType::VecI32),
+                ("Muon_eta", BranchType::VecF32),
+                ("Muon_mass", BranchType::VecF32),
+                ("Muon_phi", BranchType::VecF32),
+                ("Muon_pt", BranchType::VecF32),
+            ]
+        );
+    }
+
+    #[test]
+    fn validation_rejects_pair_over_undefined_object() {
+        let spec_text = DIMUON_SPEC_TOML.replace("object = \"good_muon\"", "object = \"ghost\"");
+        let spec = AnalysisSpec::from_toml_str(&spec_text).expect("parse modified dimuon spec");
+        let errors = validate(&spec, &catalogue()).expect_err("validation should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::UndefinedObject { object, .. } if object == "ghost"
+        )));
+    }
+
+    #[test]
+    fn validation_rejects_unknown_derived_pair_attribute() {
+        let spec_text = DIMUON_SPEC_TOML.replace("dimuon.mass", "dimuon.energy");
+        let spec = AnalysisSpec::from_toml_str(&spec_text).expect("parse modified dimuon spec");
+        let errors = validate(&spec, &catalogue()).expect_err("validation should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidExpression { detail, .. }
+                if detail.contains("supported attributes are `mass` and `pt`")
+        )));
+    }
+
+    #[test]
+    fn validation_rejects_invariant_mass_without_four_vector_branch() {
+        let catalogue_text = NANOV9_CATALOGUE.replace("\"Muon_mass\":", "\"Muon_notmass\":");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(&catalogue_text, "v9").expect("parse catalogue");
+        let spec = AnalysisSpec::from_toml_str(DIMUON_SPEC_TOML).expect("parse dimuon spec");
+        let errors = validate(&spec, &catalogue).expect_err("validation should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::MissingBranch { branch, .. } if branch == "Muon_mass"
+        )));
     }
 
     #[test]

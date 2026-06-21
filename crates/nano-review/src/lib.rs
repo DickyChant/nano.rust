@@ -788,7 +788,7 @@ fn describe_requirement(requirement: &Requirement) -> String {
         "{} {} {}",
         requirement.lhs,
         describe_op(requirement.op),
-        fmt_f64(requirement.rhs)
+        describe_quantity(&requirement.rhs)
     )
 }
 

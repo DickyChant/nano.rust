@@ -1,0 +1,17 @@
+[analysis]
+name = "dimuon_demo"
+year = "Run2012"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[derived.dimuon]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "leading_pt"
+
+[[outputs]]
+name = "dimuon_mass"
+expr = "dimuon.mass"

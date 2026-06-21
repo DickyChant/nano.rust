@@ -25,6 +25,7 @@ nano-review = { path = "crates/nano-review" }
 nano-workflow = { path = "crates/nano-workflow" }
 nano-gen-demo = { path = "crates/nano-gen-demo" }
 nano-gen-tagger-demo = { path = "crates/nano-gen-tagger-demo" }
+nano-gen-dimuon-demo = { path = "crates/nano-gen-dimuon-demo" }
 nano-cli = { path = "crates/nano-cli" }
 nano-mcp = { path = "crates/nano-mcp" }
 rayon = "1"
