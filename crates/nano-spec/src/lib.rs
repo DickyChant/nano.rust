@@ -13,6 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub mod codegen;
+pub mod core;
 pub mod interpret;
 
 /// Typed semantic analysis specification.
@@ -522,6 +523,16 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
     })
 }
 
+/// Lower a typed surface spec into typed Core IR.
+pub fn lower(spec: &AnalysisSpec, catalogue: &Catalogue) -> Result<core::CoreIr, Vec<SpecError>> {
+    if !spec.channels.is_empty() {
+        return lower_union(spec, catalogue);
+    }
+
+    let (required, model_outputs) = validate_flat(spec, catalogue)?;
+    build_core_ir(spec, &required, &model_outputs)
+}
+
 /// Validate a typed spec against a branch catalogue and derive the read schema.
 pub fn validate(
     spec: &AnalysisSpec,
@@ -531,6 +542,25 @@ pub fn validate(
         return validate_union(spec, catalogue);
     }
 
+    let core = lower(spec, catalogue)?;
+    let branch_specs =
+        branch_specs_from_core_effects(&core, catalogue).map_err(|error| vec![error])?;
+    let read_branches = BranchSchema::new(branch_specs).map_err(|error| {
+        vec![SpecError::InvalidReadSchema {
+            detail: error.to_string(),
+        }]
+    })?;
+
+    Ok(ResolvedPlan {
+        spec: spec.clone(),
+        read_branches,
+    })
+}
+
+fn validate_flat(
+    spec: &AnalysisSpec,
+    catalogue: &Catalogue,
+) -> Result<(RequiredBranches, ModelOutputs), Vec<SpecError>> {
     let object_sources = spec
         .objects
         .iter()
@@ -586,19 +616,533 @@ pub fn validate(
         return Err(errors);
     }
 
-    let branch_specs = required
-        .to_branch_specs(catalogue)
-        .map_err(|error| vec![error])?;
-    let read_branches = BranchSchema::new(branch_specs).map_err(|error| {
-        vec![SpecError::InvalidReadSchema {
-            detail: error.to_string(),
-        }]
-    })?;
+    Ok((required, model_outputs))
+}
 
-    Ok(ResolvedPlan {
-        spec: spec.clone(),
-        read_branches,
-    })
+fn lower_union(spec: &AnalysisSpec, catalogue: &Catalogue) -> Result<core::CoreIr, Vec<SpecError>> {
+    let mut errors = Vec::new();
+    if !spec.models.is_empty() {
+        errors.push(SpecError::InvalidExpression {
+            context: "multi-channel union".to_string(),
+            detail: "model-aware union codegen is not yet supported".to_string(),
+        });
+    }
+    if !spec.objects.is_empty() || !spec.derived_objects.is_empty() || !spec.regions.is_empty() {
+        errors.push(SpecError::InvalidExpression {
+            context: "multi-channel union".to_string(),
+            detail: "declare objects, derived objects, and regions inside [[channel]] blocks"
+                .to_string(),
+        });
+    }
+
+    let Some(first) = spec.channels.first() else {
+        unreachable!("caller checks channels is non-empty");
+    };
+    let first_schema = output_schema(&first.outputs);
+    let mut builder = core::CoreBuilder::new(&spec.name);
+    for channel in &spec.channels {
+        if channel.outputs.is_empty() {
+            errors.push(SpecError::InvalidExpression {
+                context: format!("channel `{}`", channel.name),
+                detail: "channels in a union must declare at least one output".to_string(),
+            });
+        }
+        if output_schema(&channel.outputs) != first_schema {
+            errors.push(SpecError::InvalidExpression {
+                context: format!("channel `{}`", channel.name),
+                detail: "channel output schema must match the first channel by name and order"
+                    .to_string(),
+            });
+        }
+
+        let channel_spec = channel.as_spec(spec);
+        match lower(&channel_spec, catalogue) {
+            Ok(channel_core) => {
+                for effect in channel_core.effects {
+                    builder.add_effect(effect);
+                }
+            }
+            Err(channel_errors) => errors.extend(channel_errors),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(builder.finish())
+    } else {
+        Err(errors)
+    }
+}
+
+fn branch_specs_from_core_effects(
+    core: &core::CoreIr,
+    catalogue: &Catalogue,
+) -> Result<Vec<BranchSpec>, SpecError> {
+    let branches = core.read_branches_ordered();
+    let mut specs = Vec::with_capacity(branches.len());
+    let mut seen = BTreeSet::new();
+
+    for branch in branches {
+        if !seen.insert(branch.to_string()) {
+            continue;
+        }
+        let branch_type = catalogue_branch_type(catalogue, branch, "derived read_branches")?;
+        specs.push(BranchSpec::new(branch.to_string(), branch_type));
+    }
+
+    Ok(specs)
+}
+
+fn build_core_ir(
+    spec: &AnalysisSpec,
+    required: &RequiredBranches,
+    model_outputs: &ModelOutputs,
+) -> Result<core::CoreIr, Vec<SpecError>> {
+    let lowerer = CoreLowerer::new(spec, model_outputs);
+    lowerer.lower_spec(required)
+}
+
+struct CoreLowerer<'a> {
+    spec: &'a AnalysisSpec,
+    model_outputs: &'a ModelOutputs,
+    registry: core::PrimitiveRegistry,
+    builder: core::CoreBuilder,
+    object_ids: HashMap<&'a str, core::ObjectId>,
+    object_sources: HashMap<&'a str, &'a str>,
+    model_ids: HashMap<&'a str, core::ModelId>,
+    errors: Vec<SpecError>,
+}
+
+impl<'a> CoreLowerer<'a> {
+    fn new(spec: &'a AnalysisSpec, model_outputs: &'a ModelOutputs) -> Self {
+        Self {
+            spec,
+            model_outputs,
+            registry: core::PrimitiveRegistry::standard(),
+            builder: core::CoreBuilder::new(&spec.name),
+            object_ids: HashMap::new(),
+            object_sources: HashMap::new(),
+            model_ids: HashMap::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    fn lower_spec(mut self, required: &RequiredBranches) -> Result<core::CoreIr, Vec<SpecError>> {
+        for object in &self.spec.objects {
+            let id = self
+                .builder
+                .add_object(&object.name, Some(object.source.clone()));
+            self.object_ids.insert(&object.name, id);
+            self.object_sources.insert(&object.name, &object.source);
+        }
+        for derived in &self.spec.derived_objects {
+            let id = self.builder.add_object(&derived.name, None);
+            self.object_ids.insert(&derived.name, id);
+        }
+        for model in &self.spec.models {
+            let id = self.builder.add_model(&model.name, &model.output);
+            self.model_ids.insert(&model.name, id);
+            self.builder.add_effect(core::Effect::RequiresModel(id));
+            self.builder
+                .add_effect(core::Effect::ProducesScore(model.output.clone()));
+        }
+        for region in &self.spec.regions {
+            self.builder.add_region(&region.name);
+        }
+        self.add_required_branch_effects(required);
+
+        for object in &self.spec.objects {
+            for cut in &object.cuts {
+                self.lower_cut(cut, &format!("object `{}` cut", object.name));
+            }
+        }
+        for derived in &self.spec.derived_objects {
+            self.lower_derived_object(derived);
+        }
+        for region in &self.spec.regions {
+            for requirement in &region.require {
+                self.lower_requirement(requirement, &format!("region `{}`", region.name));
+            }
+        }
+        for output in &self.spec.outputs {
+            if let Some(expr) = self.lower_expr(&output.expr, &format!("output `{}`", output.name))
+            {
+                self.builder.add_output(&output.name, expr);
+            }
+        }
+        for histogram in &self.spec.histograms {
+            if let Some(expr) =
+                self.lower_expr(&histogram.expr, &format!("histogram `{}`", histogram.name))
+            {
+                self.builder.add_histogram(&histogram.name, expr);
+            }
+        }
+
+        if self.errors.is_empty() {
+            Ok(self.builder.finish())
+        } else {
+            Err(self.errors)
+        }
+    }
+
+    fn add_required_branch_effects(&mut self, required: &RequiredBranches) {
+        for source in &required.counters {
+            self.builder
+                .add_effect(core::Effect::ReadsBranch(format!("n{source}")));
+        }
+        for (source, attr) in &required.attrs {
+            self.builder
+                .add_effect(core::Effect::ReadsBranch(format!("{source}_{attr}")));
+        }
+        for branch in &required.branches {
+            self.builder
+                .add_effect(core::Effect::ReadsBranch(branch.clone()));
+        }
+    }
+
+    fn lower_derived_object(&mut self, derived: &DerivedObjectDef) {
+        let context = format!("derived object `{}`", derived.name);
+        match &derived.source {
+            DerivedSource::Pair(pair) => {
+                let Some(object) = self.object_ref(&pair.object, &context) else {
+                    return;
+                };
+                let primitive = match &pair.selection {
+                    PairSelection::LeadingPt => "pair",
+                    PairSelection::NearestMass { target } => {
+                        let target = self.quantity_node(target);
+                        self.call("nearest_mass", vec![object, target], &context);
+                        return;
+                    }
+                    PairSelection::NearestMassTruncated { target } => {
+                        let target = self.quantity_node(target);
+                        self.call("nearest_mass_truncated", vec![object, target], &context);
+                        return;
+                    }
+                };
+                self.call(primitive, vec![object], &context);
+                for filter in &pair.filters {
+                    self.lower_cut(filter, &context);
+                }
+            }
+            DerivedSource::Candidate(candidate) => {
+                let mut args = Vec::new();
+                for item in &candidate.items {
+                    if self.object_sources.contains_key(item.as_str()) {
+                        if let Some(object) = self.object_ref(item, &context) {
+                            args.push(object);
+                        }
+                    } else if let Some(candidate) = self.candidate_ref(item, &context) {
+                        args.push(candidate);
+                    }
+                }
+                self.call("combine", args, &context);
+                for filter in &candidate.filters {
+                    self.lower_cut(filter, &context);
+                }
+            }
+        }
+    }
+
+    fn lower_requirement(&mut self, requirement: &Requirement, context: &str) {
+        let Some(lhs) = self.lower_expr(&requirement.lhs, context) else {
+            return;
+        };
+        let rhs = self.quantity_node(&requirement.rhs);
+        self.compare(requirement.op, lhs, rhs, context);
+    }
+
+    fn lower_cut(&mut self, cut: &Cut, context: &str) {
+        let Some(lhs) = self.lower_expr(&cut.lhs, context) else {
+            return;
+        };
+        let rhs = self.quantity_node(&cut.rhs);
+        self.compare(cut.op, lhs, rhs, context);
+    }
+
+    fn lower_expr(&mut self, expr: &Expr, context: &str) -> Option<core::ExprId> {
+        match expr {
+            Expr::Attr { object, attr } => self.attr_node(object, attr, context),
+            Expr::Literal(value) => {
+                self.registry_call("literal", &[], context)?;
+                Some(self.builder.add_expr(
+                    core::ExprKind::Literal(*value),
+                    core::Type::Quantity(Dimension::Dimensionless),
+                    BTreeSet::new(),
+                ))
+            }
+            Expr::Binary { op, lhs, rhs } => {
+                let lhs = self.lower_expr(lhs, context)?;
+                let rhs = self.lower_expr(rhs, context)?;
+                self.call(
+                    core::primitive_name_for_arithmetic(*op),
+                    vec![lhs, rhs],
+                    context,
+                )
+            }
+            Expr::Abs(inner) => {
+                let inner = self.lower_expr(inner, context)?;
+                self.call("abs", vec![inner], context)
+            }
+            Expr::Sqrt(inner) => {
+                let inner = self.lower_expr(inner, context)?;
+                self.call("sqrt", vec![inner], context)
+            }
+            Expr::Count(object) => {
+                let object = self.object_ref(object, context)?;
+                self.call("count", vec![object], context)
+            }
+            Expr::CountWhere { object, predicate } => {
+                let object = self.object_ref(object, context)?;
+                let predicate = self.lower_cut_expr(predicate, context)?;
+                self.call("count_where", vec![object, predicate], context)
+            }
+            Expr::SumAttr { object, attr } => {
+                let object_ref = self.object_ref(object, context)?;
+                let attr = self.attr_node(object, attr, context)?;
+                self.call("sum", vec![object_ref, attr], context)
+            }
+            Expr::All { object, predicate } => {
+                let object = self.object_ref(object, context)?;
+                let predicate = self.lower_cut_expr(predicate, context)?;
+                self.call("all", vec![object, predicate], context)
+            }
+            Expr::Any { object, predicate } => {
+                let object = self.object_ref(object, context)?;
+                let predicate = self.lower_cut_expr(predicate, context)?;
+                self.call("any", vec![object, predicate], context)
+            }
+            Expr::EitherPairPt {
+                left,
+                right,
+                leading,
+                subleading,
+            } => {
+                let left = self.object_ref(left, context)?;
+                let right = self.object_ref(right, context)?;
+                let leading = self.quantity_node(leading);
+                let subleading = self.quantity_node(subleading);
+                self.call(
+                    "either_pair_pt",
+                    vec![left, right, leading, subleading],
+                    context,
+                )
+            }
+            Expr::ClosestMass {
+                left,
+                right,
+                target,
+            } => {
+                let left = self.candidate_ref(left, context)?;
+                let right = self.candidate_ref(right, context)?;
+                let target = self.quantity_node(target);
+                self.call("closest_mass", vec![left, right, target], context)
+            }
+            Expr::OtherMass {
+                left,
+                right,
+                target,
+            } => {
+                let left = self.candidate_ref(left, context)?;
+                let right = self.candidate_ref(right, context)?;
+                let target = self.quantity_node(target);
+                self.call("other_mass", vec![left, right, target], context)
+            }
+            Expr::LeadingAttr { object, attr } => {
+                let object_ref = self.object_ref(object, context)?;
+                let attr = self.attr_node(object, attr, context)?;
+                self.call("leading_attr", vec![object_ref, attr], context)
+            }
+            Expr::PairDeltaR => self.filter_call("pair_delta_r", context),
+            Expr::PairLeadingPt => self.filter_call("pair_leading_pt", context),
+            Expr::PairSubleadingPt => self.filter_call("pair_subleading_pt", context),
+            Expr::CandidateMinDeltaR => self.filter_call("min_delta_r", context),
+            Expr::CandidateLeadingPt => self.filter_call("candidate_leading_pt", context),
+            Expr::CandidateSubleadingPt => self.filter_call("candidate_subleading_pt", context),
+        }
+    }
+
+    fn lower_cut_expr(&mut self, cut: &Cut, context: &str) -> Option<core::ExprId> {
+        let lhs = self.lower_expr(&cut.lhs, context)?;
+        let rhs = self.quantity_node(&cut.rhs);
+        self.compare(cut.op, lhs, rhs, context)
+    }
+
+    fn object_ref(&mut self, object: &str, context: &str) -> Option<core::ExprId> {
+        let id = self.lookup_object(object, context)?;
+        self.call_ref(
+            "object",
+            id,
+            core::Type::ObjectSet,
+            BTreeSet::new(),
+            context,
+        )
+    }
+
+    fn candidate_ref(&mut self, object: &str, context: &str) -> Option<core::ExprId> {
+        let id = self.lookup_object(object, context)?;
+        self.call_ref(
+            "candidate",
+            id,
+            core::Type::Candidate,
+            BTreeSet::new(),
+            context,
+        )
+    }
+
+    fn lookup_object(&mut self, object: &str, context: &str) -> Option<core::ObjectId> {
+        self.object_ids.get(object).copied().or_else(|| {
+            self.errors.push(SpecError::UndefinedObject {
+                context: context.to_string(),
+                object: object.to_string(),
+            });
+            None
+        })
+    }
+
+    fn call_ref(
+        &mut self,
+        primitive: &'static str,
+        _object: core::ObjectId,
+        ty: core::Type,
+        effects: BTreeSet<core::Effect>,
+        context: &str,
+    ) -> Option<core::ExprId> {
+        self.registry_call(primitive, &[], context)?;
+        Some(self.builder.add_expr(
+            core::ExprKind::Call {
+                primitive,
+                args: Vec::new(),
+            },
+            ty,
+            effects,
+        ))
+    }
+
+    fn attr_node(&mut self, object: &str, attr: &str, context: &str) -> Option<core::ExprId> {
+        let object_id = self.lookup_object(object, context)?;
+        let branch = self
+            .object_sources
+            .get(object)
+            .map(|source| format!("{source}_{attr}"));
+        let ty = if let Some(branch) = branch.as_deref() {
+            self.model_outputs
+                .by_branch
+                .get(branch)
+                .map(|output| core::Type::Quantity(output.dimension))
+                .unwrap_or_else(|| core::Type::Quantity(attribute_dimension(attr)))
+        } else {
+            core::Type::Quantity(derived_attribute_dimension(attr))
+        };
+        let effects = branch
+            .as_ref()
+            .filter(|branch| !self.model_outputs.by_branch.contains_key(branch.as_str()))
+            .map(|branch| BTreeSet::from([core::Effect::ReadsBranch(branch.clone())]))
+            .unwrap_or_default();
+        let kind = if branch.is_some() {
+            core::ExprKind::Attr {
+                object: object_id,
+                attr: attr.to_string(),
+                branch,
+            }
+        } else {
+            core::ExprKind::DerivedAttr {
+                object: object_id,
+                attr: attr.to_string(),
+            }
+        };
+        Some(self.builder.add_expr(kind, ty, effects))
+    }
+
+    fn quantity_node(&mut self, quantity: &Quantity) -> core::ExprId {
+        let ty = match quantity.unit {
+            Unit::GeV => core::Type::Quantity(Dimension::Momentum),
+            Unit::Dimensionless => core::Type::Quantity(Dimension::Dimensionless),
+        };
+        self.builder.add_expr(
+            core::ExprKind::Quantity(quantity.clone()),
+            ty,
+            BTreeSet::new(),
+        )
+    }
+
+    fn filter_call(&mut self, primitive: &'static str, context: &str) -> Option<core::ExprId> {
+        let candidate = self.builder.add_expr(
+            core::ExprKind::Call {
+                primitive: "candidate",
+                args: Vec::new(),
+            },
+            core::Type::Candidate,
+            BTreeSet::new(),
+        );
+        self.call(primitive, vec![candidate], context)
+    }
+
+    fn compare(
+        &mut self,
+        op: CmpOp,
+        lhs: core::ExprId,
+        rhs: core::ExprId,
+        context: &str,
+    ) -> Option<core::ExprId> {
+        let primitive = core::primitive_name_for_cmp(op);
+        let call = self.registry_call(primitive, &[lhs, rhs], context)?;
+        Some(self.builder.add_expr(
+            core::ExprKind::Compare { op, lhs, rhs },
+            call.ty,
+            call.effects,
+        ))
+    }
+
+    fn call(
+        &mut self,
+        primitive: &'static str,
+        args: Vec<core::ExprId>,
+        context: &str,
+    ) -> Option<core::ExprId> {
+        let call = self.registry_call(primitive, &args, context)?;
+        Some(self.builder.add_expr(
+            core::ExprKind::Call { primitive, args },
+            call.ty,
+            call.effects,
+        ))
+    }
+
+    fn registry_call(
+        &mut self,
+        primitive: &'static str,
+        args: &[core::ExprId],
+        context: &str,
+    ) -> Option<core::PrimitiveCall> {
+        let args = args
+            .iter()
+            .map(|id| {
+                let node = self.builder_expr(*id);
+                core::PrimitiveArg::with_effects(node.ty.clone(), node.effects.clone())
+            })
+            .collect::<Vec<_>>();
+        match self.registry.validate_call(primitive, &args) {
+            Ok(call) => Some(call),
+            Err(error) => {
+                self.errors.push(SpecError::InvalidExpression {
+                    context: context.to_string(),
+                    detail: error.to_string(),
+                });
+                None
+            }
+        }
+    }
+
+    fn builder_expr(&self, id: core::ExprId) -> &core::ExprNode {
+        self.builder.expr(id)
+    }
+}
+
+fn derived_attribute_dimension(attr: &str) -> Dimension {
+    match attr {
+        "mass" | "pt" => Dimension::Momentum,
+        "min_delta_r" | "dR" | "dr" => Dimension::Dimensionless,
+        _ => attribute_dimension(attr),
+    }
 }
 
 fn validate_union(
@@ -1717,7 +2261,9 @@ enum ExprType {
     Bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum Dimension {
     Momentum,
     Dimensionless,
@@ -1749,37 +2295,6 @@ impl RequiredBranches {
 
     fn require_branch(&mut self, branch: &str) {
         self.branches.insert(branch.to_string());
-    }
-
-    fn to_branch_specs(&self, catalogue: &Catalogue) -> Result<Vec<BranchSpec>, SpecError> {
-        let mut specs =
-            Vec::with_capacity(self.counters.len() + self.attrs.len() + self.branches.len());
-        let mut seen = BTreeSet::new();
-
-        for source in &self.counters {
-            let branch = format!("n{source}");
-            let branch_type = catalogue_branch_type(catalogue, &branch, "derived read_branches")?;
-            if seen.insert(branch.clone()) {
-                specs.push(BranchSpec::new(branch, branch_type));
-            }
-        }
-
-        for (source, attr) in &self.attrs {
-            let branch = format!("{source}_{attr}");
-            let branch_type = catalogue_branch_type(catalogue, &branch, "derived read_branches")?;
-            if seen.insert(branch.clone()) {
-                specs.push(BranchSpec::new(branch, branch_type));
-            }
-        }
-
-        for branch in &self.branches {
-            let branch_type = catalogue_branch_type(catalogue, branch, "derived read_branches")?;
-            if seen.insert(branch.clone()) {
-                specs.push(BranchSpec::new(branch.clone(), branch_type));
-            }
-        }
-
-        Ok(specs)
     }
 }
 
@@ -3147,6 +3662,51 @@ mod tests {
     const DIMUON_SPEC_TOML: &str = include_str!("../examples/dimuon.toml");
     const HIGGS4MU_MINIMAL_SPEC_TOML: &str = include_str!("../examples/higgs4mu_minimal.toml");
     const HIGGS2E2MU_MINIMAL_SPEC_TOML: &str = include_str!("../examples/higgs2e2mu_minimal.toml");
+    const EXAMPLE_SPECS: &[(&str, &str)] = &[
+        ("dimuon.toml", include_str!("../examples/dimuon.toml")),
+        (
+            "higgs2e2mu_minimal.toml",
+            include_str!("../examples/higgs2e2mu_minimal.toml"),
+        ),
+        ("higgs4l.toml", include_str!("../examples/higgs4l.toml")),
+        (
+            "higgs4l_2e2mu.toml",
+            include_str!("../examples/higgs4l_2e2mu.toml"),
+        ),
+        (
+            "higgs4l_4e.toml",
+            include_str!("../examples/higgs4l_4e.toml"),
+        ),
+        (
+            "higgs4l_all.toml",
+            include_str!("../examples/higgs4l_all.toml"),
+        ),
+        (
+            "higgs4mu_minimal.toml",
+            include_str!("../examples/higgs4mu_minimal.toml"),
+        ),
+        ("muon.toml", include_str!("../examples/muon.toml")),
+        (
+            "muon_tagger.toml",
+            include_str!("../examples/muon_tagger.toml"),
+        ),
+        (
+            "selection_all.toml",
+            include_str!("../examples/selection_all.toml"),
+        ),
+        (
+            "selection_charge_balance.toml",
+            include_str!("../examples/selection_charge_balance.toml"),
+        ),
+        (
+            "selection_pair_dr.toml",
+            include_str!("../examples/selection_pair_dr.toml"),
+        ),
+        (
+            "selection_sip3d.toml",
+            include_str!("../examples/selection_sip3d.toml"),
+        ),
+    ];
     const MUON_SPEC_YAML: &str = include_str!("../examples/muon.yaml");
     const MUON_SPEC_JSON: &str = r#"
 {
@@ -3226,6 +3786,57 @@ mod tests {
                 ("nMuon", BranchType::U32),
                 ("Muon_eta", BranchType::VecF32),
                 ("Muon_pt", BranchType::VecF32),
+            ]
+        );
+    }
+
+    #[test]
+    fn lowering_all_example_specs_succeeds() {
+        let catalogue = catalogue();
+        for (name, input) in EXAMPLE_SPECS {
+            let spec =
+                AnalysisSpec::from_toml_str(input).unwrap_or_else(|_| panic!("parse {name}"));
+            lower(&spec, &catalogue).unwrap_or_else(|errors| panic!("lower {name}: {errors:?}"));
+        }
+    }
+
+    #[test]
+    fn lowering_muon_core_ir_has_stable_structure() {
+        let spec = parse_muon_spec();
+        let core = lower(&spec, &catalogue()).expect("lower muon spec");
+        let calls = core
+            .exprs
+            .iter()
+            .filter_map(|expr| match &expr.kind {
+                core::ExprKind::Call { primitive, .. } => Some(*primitive),
+                core::ExprKind::Literal(_)
+                | core::ExprKind::Quantity(_)
+                | core::ExprKind::Attr { .. }
+                | core::ExprKind::DerivedAttr { .. }
+                | core::ExprKind::Compare { .. } => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(core.name, "muon_demo");
+        assert_eq!(core.objects.len(), 1);
+        assert_eq!(core.objects[0].name, "good_muon");
+        assert_eq!(core.objects[0].source.as_deref(), Some("Muon"));
+        assert_eq!(core.regions.len(), 1);
+        assert_eq!(core.outputs.len(), 2);
+        assert_eq!(
+            core.read_branches_ordered(),
+            vec!["nMuon", "Muon_eta", "Muon_pt"]
+        );
+        assert_eq!(
+            calls,
+            vec![
+                "abs",
+                "object",
+                "count",
+                "object",
+                "count",
+                "object",
+                "leading_attr",
             ]
         );
     }
