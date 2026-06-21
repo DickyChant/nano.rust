@@ -172,6 +172,16 @@ fn inspect_bundled_root_file_lists_ttrees() {
     assert!(json.contains("\"name\": \"tree\""));
 }
 
+#[cfg(not(feature = "http"))]
+#[test]
+fn inspect_url_without_http_feature_reports_rebuild_hint() {
+    let error = run(["inspect", "https://example.invalid/file.root"]).expect_err("inspect error");
+
+    assert_eq!(error.kind, nano_cli::ErrorKind::Inspect);
+    assert!(error.message.contains("requires HTTP support"));
+    assert!(error.message.contains("--features http"));
+}
+
 #[test]
 fn run_muon_spec_writes_skim_matching_single_pass_producer() {
     let fixture = Fixture::new("run-muon");

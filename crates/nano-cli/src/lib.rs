@@ -243,7 +243,7 @@ where
     match parsed.command {
         Command::Validate { spec } => validate_command(&spec),
         Command::Branches { spec } => branches_command(&spec),
-        Command::Inspect { file } => inspect_command(&file),
+        Command::Inspect { source, insecure } => inspect_command(&source, insecure),
         Command::Codegen { spec } => codegen_command(&spec),
         Command::Diff { spec_a, spec_b } => diff_command(&spec_a, &spec_b),
         Command::Repair { spec, apply } => repair_command(&spec, apply),
@@ -669,18 +669,25 @@ fn run_interpreted(options: WorkflowRunOptions) -> Result<RunReport> {
     })
 }
 
-fn inspect_command(file: &Path) -> Result<Output> {
-    let root_file = RootFile::open(file).map_err(|error| CliError {
+fn inspect_command(source: &str, insecure: bool) -> Result<Output> {
+    let root_file = open_root_file_for_inspect(source, insecure).map_err(|error| CliError {
         status: ErrorStatus::Error,
         kind: ErrorKind::Inspect,
-        message: error.to_string(),
+        message: error,
         spec_path: None,
         validation_errors: Vec::new(),
     })?;
 
     let mut trees = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for object in root_file.objects() {
         if object.class() != "TTree" {
+            continue;
+        }
+        // A ROOT file can hold several keys for the same tree name (write
+        // cycles, e.g. `Events;1`/`Events;2`); opening by name reads one, so
+        // list each tree name once.
+        if !seen.insert(object.name().to_string()) {
             continue;
         }
         let tree = root_file.tree(object.name()).map_err(|error| CliError {
@@ -712,9 +719,39 @@ fn inspect_command(file: &Path) -> Result<Output> {
 
     Ok(Output::Inspect(InspectReport {
         status: Status::Ok,
-        file: file.to_path_buf(),
+        file: PathBuf::from(source),
         trees,
     }))
+}
+
+fn open_root_file_for_inspect(
+    source: &str,
+    insecure: bool,
+) -> std::result::Result<RootFile, String> {
+    if is_http_url(source) {
+        return open_url_for_inspect(source, insecure);
+    }
+    RootFile::open(Path::new(source)).map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "http")]
+fn open_url_for_inspect(source: &str, insecure: bool) -> std::result::Result<RootFile, String> {
+    let mut options = nano_rootio::HttpSourceOptions::from_env();
+    if insecure {
+        options = options.insecure(true);
+    }
+    RootFile::open_url_with_options(source, options).map_err(|error| error.to_string())
+}
+
+#[cfg(not(feature = "http"))]
+fn open_url_for_inspect(source: &str, _insecure: bool) -> std::result::Result<RootFile, String> {
+    Err(format!(
+        "`nano inspect {source}` requires HTTP support; rebuild with `--features http`"
+    ))
+}
+
+fn is_http_url(source: &str) -> bool {
+    source.starts_with("http://") || source.starts_with("https://")
 }
 
 fn load_validated_plan(spec_path: &Path) -> Result<(AnalysisSpec, nano_spec::ResolvedPlan)> {
@@ -1232,7 +1269,7 @@ struct ParsedArgs {
 enum Command {
     Validate { spec: PathBuf },
     Branches { spec: PathBuf },
-    Inspect { file: PathBuf },
+    Inspect { source: String, insecure: bool },
     Codegen { spec: PathBuf },
     Diff { spec_a: PathBuf, spec_b: PathBuf },
     Repair { spec: PathBuf, apply: bool },
@@ -1256,9 +1293,7 @@ impl ParsedArgs {
             "branches" => Command::Branches {
                 spec: one_operand(command, &positional[1..])?,
             },
-            "inspect" => Command::Inspect {
-                file: one_operand(command, &positional[1..])?,
-            },
+            "inspect" => parse_inspect_args(&positional[1..])?,
             "codegen" => Command::Codegen {
                 spec: one_operand(command, &positional[1..])?,
             },
@@ -1282,6 +1317,22 @@ where
     RunOptions {
         json: args.into_iter().any(|arg| arg.as_ref() == "--json"),
     }
+}
+
+fn parse_inspect_args(args: &[String]) -> Result<Command> {
+    let mut source = None;
+    let mut insecure = false;
+    for arg in args {
+        if arg == "--insecure" {
+            insecure = true;
+        } else if source.is_none() {
+            source = Some(arg.clone());
+        } else {
+            return Err(usage_error("`nano inspect` accepts one path or URL"));
+        }
+    }
+    let source = source.ok_or_else(|| usage_error("`nano inspect` needs one path or URL"))?;
+    Ok(Command::Inspect { source, insecure })
 }
 
 fn one_operand(command: &str, args: &[String]) -> Result<PathBuf> {
