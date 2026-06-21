@@ -8,6 +8,7 @@ use nano_core::{BranchSchema, BranchSpec, BranchType};
 use nano_io::read_events;
 use nano_io::writer::{write_events, OutputBranch};
 use nano_producers::{MuonProducer, MuonSkimRow};
+use nano_rootio::write::{write_tree, Branch};
 
 fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -180,6 +181,71 @@ fn inspect_url_without_http_feature_reports_rebuild_hint() {
     assert_eq!(error.kind, nano_cli::ErrorKind::Inspect);
     assert!(error.message.contains("requires HTTP support"));
     assert!(error.message.contains("--features http"));
+}
+
+#[test]
+fn compare_identical_root_files_reports_pass() {
+    let fixture = Fixture::new("compare-pass");
+    let reference = fixture.path("reference.root");
+    let candidate = fixture.path("candidate.root");
+    write_compare_file(&reference, vec![1.0, 2.0, 3.0]);
+    write_compare_file(&candidate, vec![1.0, 2.0, 3.0]);
+
+    let output = run([
+        "compare",
+        reference.to_str().unwrap(),
+        candidate.to_str().unwrap(),
+    ])
+    .expect("compare command");
+
+    let Output::Compare(report) = output else {
+        panic!("expected compare report");
+    };
+    assert!(report.passed());
+    assert!(report
+        .branches
+        .iter()
+        .all(|branch| branch.n_mismatched == 0));
+}
+
+#[test]
+fn compare_mismatch_json_is_well_formed_and_binary_exits_nonzero() {
+    let fixture = Fixture::new("compare-fail");
+    let reference = fixture.path("reference.root");
+    let candidate = fixture.path("candidate.root");
+    write_compare_file(&reference, vec![1.0, 2.0, 3.0]);
+    write_compare_file(&candidate, vec![1.0, 2.2, 3.0]);
+
+    let output = run([
+        "--json",
+        "compare",
+        reference.to_str().unwrap(),
+        candidate.to_str().unwrap(),
+    ])
+    .expect("compare command returns structured report");
+    let json = nano_cli::render_json_output(&output).expect("JSON compare");
+    let value = serde_json::from_str::<serde_json::Value>(&json).expect("well-formed JSON");
+    assert_eq!(value["command"], "compare");
+    assert_eq!(value["status"], "fail");
+    let pt = value["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| branch["name"] == "pt")
+        .expect("pt branch");
+    assert_eq!(pt["n_mismatched"], 1);
+
+    let binary = std::process::Command::new(env!("CARGO_BIN_EXE_nano"))
+        .arg("--json")
+        .arg("compare")
+        .arg(&reference)
+        .arg(&candidate)
+        .output()
+        .expect("run nano binary");
+    assert!(!binary.status.success());
+    let stdout = String::from_utf8(binary.stdout).expect("stdout utf8");
+    assert!(stdout.contains("\"command\": \"compare\""));
+    assert!(stdout.contains("\"status\": \"fail\""));
 }
 
 #[test]
@@ -480,6 +546,18 @@ fn write_synthetic_input(path: &Path) {
     )
     .unwrap();
     assert_eq!(read_events(path, input_schema()).unwrap().len(), 5);
+}
+
+fn write_compare_file(path: &Path, pt: Vec<f32>) {
+    write_tree(
+        path,
+        "Events",
+        &[
+            Branch::u64("event", vec![10, 11, 12]),
+            Branch::f32("pt", pt),
+        ],
+    )
+    .unwrap();
 }
 
 fn single_pass_rows(path: &Path) -> Vec<MuonSkimRow> {

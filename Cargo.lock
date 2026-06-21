@@ -1023,6 +1023,7 @@ dependencies = [
  "nano-review",
  "nano-rootio",
  "nano-spec",
+ "nano-validate",
  "nano-workflow",
  "serde",
  "serde_json",
@@ -1195,6 +1196,14 @@ dependencies = [
  "ratatui",
  "serde",
  "tokio",
+]
+
+[[package]]
+name = "nano-validate"
+version = "0.0.0"
+dependencies = [
+ "nano-rootio",
+ "serde",
 ]
 
 [[package]]

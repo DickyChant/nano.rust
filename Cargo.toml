@@ -23,6 +23,7 @@ nano-corrections = { path = "crates/nano-corrections" }
 nano-spec = { path = "crates/nano-spec" }
 nano-jit = { path = "crates/nano-jit" }
 nano-review = { path = "crates/nano-review" }
+nano-validate = { path = "crates/nano-validate" }
 nano-workflow = { path = "crates/nano-workflow" }
 nano-gen-demo = { path = "crates/nano-gen-demo" }
 nano-gen-tagger-demo = { path = "crates/nano-gen-tagger-demo" }

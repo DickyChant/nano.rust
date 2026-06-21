@@ -11,6 +11,7 @@ use nano_rootio::RootFile;
 use nano_spec::codegen;
 use nano_spec::interpret::{interpret, InterpretError, OutputRow, Value};
 use nano_spec::{AnalysisSpec, Catalogue, Expr, OutputDef, ParseError, SpecError};
+use nano_validate::{compare_root_files, CompareOptions, ComparisonReport};
 use nano_workflow::{
     plan_workflow_with_kernel_id, ExecutionMode, Executor, KernelBinding, KernelRegistry,
 };
@@ -34,6 +35,7 @@ pub enum Output {
     Validate(ValidateReport),
     Branches(BranchesReport),
     Inspect(InspectReport),
+    Compare(ComparisonReport),
     Codegen(CodegenReport),
     Diff(DiffReport),
     Repair(RepairReport),
@@ -191,6 +193,7 @@ pub enum ErrorKind {
     Parse,
     Catalogue,
     Validation,
+    Compare,
     Codegen,
     Inspect,
     Interpret,
@@ -246,6 +249,7 @@ where
         Command::Validate { spec } => validate_command(&spec),
         Command::Branches { spec } => branches_command(&spec),
         Command::Inspect { source, insecure } => inspect_command(&source, insecure),
+        Command::Compare(options) => compare_command(options).map(Output::Compare),
         Command::Codegen { spec } => codegen_command(&spec),
         Command::Diff { spec_a, spec_b } => diff_command(&spec_a, &spec_b),
         Command::Repair { spec, apply } => repair_command(&spec, apply),
@@ -302,6 +306,7 @@ pub fn render_text(output: &Output) -> String {
             }
             lines.join("\n")
         }
+        Output::Compare(report) => report.summary(),
         Output::Codegen(report) => report.source.clone(),
         Output::Diff(report) => {
             if !report.diff.ok {
@@ -394,6 +399,13 @@ pub fn render_text(output: &Output) -> String {
                 .unwrap_or_else(|| "(not written)".to_string())
         ),
     }
+}
+
+pub fn output_success(output: &Output) -> bool {
+    !matches!(
+        output,
+        Output::Compare(report) if !report.passed()
+    )
 }
 
 pub fn render_json_output(output: &Output) -> std::result::Result<String, serde_json::Error> {
@@ -724,6 +736,18 @@ fn inspect_command(source: &str, insecure: bool) -> Result<Output> {
         file: PathBuf::from(source),
         trees,
     }))
+}
+
+fn compare_command(options: CompareCommandOptions) -> Result<ComparisonReport> {
+    compare_root_files(&options.reference, &options.candidate, &options.options).map_err(|error| {
+        CliError {
+            status: ErrorStatus::Error,
+            kind: ErrorKind::Compare,
+            message: error.to_string(),
+            spec_path: None,
+            validation_errors: Vec::new(),
+        }
+    })
 }
 
 fn open_root_file_for_inspect(
@@ -1272,10 +1296,18 @@ enum Command {
     Validate { spec: PathBuf },
     Branches { spec: PathBuf },
     Inspect { source: String, insecure: bool },
+    Compare(CompareCommandOptions),
     Codegen { spec: PathBuf },
     Diff { spec_a: PathBuf, spec_b: PathBuf },
     Repair { spec: PathBuf, apply: bool },
     Run(WorkflowRunOptions),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CompareCommandOptions {
+    reference: PathBuf,
+    candidate: PathBuf,
+    options: CompareOptions,
 }
 
 impl ParsedArgs {
@@ -1296,6 +1328,7 @@ impl ParsedArgs {
                 spec: one_operand(command, &positional[1..])?,
             },
             "inspect" => parse_inspect_args(&positional[1..])?,
+            "compare" => Command::Compare(parse_compare_args(&positional[1..])?),
             "codegen" => Command::Codegen {
                 spec: one_operand(command, &positional[1..])?,
             },
@@ -1309,6 +1342,77 @@ impl ParsedArgs {
         };
         Ok(Self { command })
     }
+}
+
+fn parse_compare_args(args: &[String]) -> Result<CompareCommandOptions> {
+    let mut tree = "Events".to_string();
+    let mut rtol = 1e-6;
+    let mut atol = 1e-6;
+    let mut operands = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--tree" => {
+                tree = compare_flag_value(args, index, "--tree")?.to_string();
+                index += 2;
+            }
+            "--rtol" => {
+                rtol = compare_flag_value(args, index, "--rtol")?
+                    .parse::<f64>()
+                    .map_err(|error| {
+                        usage_error(format!("invalid `nano compare --rtol`: {error}"))
+                    })?;
+                index += 2;
+            }
+            "--atol" => {
+                atol = compare_flag_value(args, index, "--atol")?
+                    .parse::<f64>()
+                    .map_err(|error| {
+                        usage_error(format!("invalid `nano compare --atol`: {error}"))
+                    })?;
+                index += 2;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(usage_error(format!("unknown `nano compare` flag `{flag}`")));
+            }
+            operand => {
+                operands.push(PathBuf::from(operand));
+                index += 1;
+            }
+        }
+    }
+
+    let [reference, candidate] = operands.as_slice() else {
+        return Err(usage_error(
+            "`nano compare` needs <reference.root> <candidate.root>",
+        ));
+    };
+    if !rtol.is_finite() || rtol < 0.0 {
+        return Err(usage_error("`nano compare --rtol` must be finite and >= 0"));
+    }
+    if !atol.is_finite() || atol < 0.0 {
+        return Err(usage_error("`nano compare --atol` must be finite and >= 0"));
+    }
+    Ok(CompareCommandOptions {
+        reference: reference.clone(),
+        candidate: candidate.clone(),
+        options: CompareOptions {
+            tree,
+            rtol,
+            atol,
+            ..CompareOptions::default()
+        },
+    })
+}
+
+fn compare_flag_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str> {
+    let Some(value) = args.get(index + 1) else {
+        return Err(usage_error(format!("`nano compare {flag}` needs a value")));
+    };
+    if value.starts_with("--") {
+        return Err(usage_error(format!("`nano compare {flag}` needs a value")));
+    }
+    Ok(value)
 }
 
 pub fn parse_options<I, S>(args: I) -> RunOptions

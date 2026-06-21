@@ -12,7 +12,11 @@ fn main() -> ExitCode {
                 nano_cli::render_text(&output)
             };
             println!("{rendered}");
-            ExitCode::SUCCESS
+            if nano_cli::output_success(&output) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         Err(error) => {
             let rendered = if options.json {

@@ -1,7 +1,16 @@
 # Local Muon Validation Inputs
 
-The files under `inputs/` are local cached copies of the NanoAOD inputs used by
-`tests/muon_validation_test.py`.
+The matching NanoAOD input files for the frozen references are intentionally not
+tracked in git. Drop local cached copies under the gitignored `inputs/`
+directory, run the producer for the relevant channel, then compare the produced
+skim with:
+
+```sh
+nano compare references/<case>_reference.root <candidate.root> --tree Events
+```
+
+The table below records the expected local names and original source paths for
+the NanoAOD inputs used by `tests/muon_validation_test.py`.
 
 | Case | Local file | Original path |
 | --- | --- | --- |
@@ -14,5 +23,22 @@ The files under `inputs/` are local cached copies of the NanoAOD inputs used by
 | 2022EE mc | `inputs/ttbarfl_2022EE_nanov12_example.root` | `/store/mc/Run3Summer22EENanoAODv12/TTto2L2Nu_TuneCP5_13p6TeV_powheg-pythia8/NANOAODSIM/130X_mcRun3_2022_realistic_postEE_v6-v2/2540000/62aea484-cae5-4c41-8803-08969f44c116.root` |
 | 2024 mc | `inputs/ttbarfl_2024_nanov15_example.root` | `/store/mc/RunIII2024Summer24NanoAODv15/TTto2L2Nu_TuneCP5_13p6TeV_powheg-pythia8/NANOAODSIM/150X_mcRun3_2024_realistic_v2-v3/2810000/bf09158c-9766-4221-a400-be4ebad0f8b8.root` |
 
-The files under `references/` are fixed NanoHRT reference outputs used for
-branch and event-level comparisons.
+The files under `references/` are fixed NanoHRT full-analysis outputs used for
+branch and event-level comparisons by the golden-validation harness.
+
+Existing frozen references:
+
+- `singlemu_2018_nanov9_reference.root`
+- `ttbarfl_2022EE_nanov12_reference.root`
+- `ttbarfl_2024_nanov15_reference.root`
+- `ttbarsl_2016APV_nanov9_jer_down_reference.root`
+- `ttbarsl_2016APV_nanov9_jer_up_reference.root`
+- `ttbarsl_2016APV_nanov9_jes_down_reference.root`
+- `ttbarsl_2016APV_nanov9_jes_up_reference.root`
+- `ttbarsl_2016APV_nanov9_lheweight_reference.root`
+- `ttbarsl_2016APV_nanov9_met_down_reference.root`
+- `ttbarsl_2016APV_nanov9_met_up_reference.root`
+- `ttbarsl_2016APV_nanov9_reference.root`
+- `ttbarsl_2016_nanov9_reference.root`
+- `ttbarsl_2017_nanov9_reference.root`
+- `ttbarsl_2018_nanov9_reference.root`
