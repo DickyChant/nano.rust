@@ -95,6 +95,12 @@ impl From<nano_core::NanoError> for InterpretError {
     }
 }
 
+impl From<crate::kir::KirError> for InterpretError {
+    fn from(error: crate::kir::KirError) -> Self {
+        Self::InvalidExpression(format!("KIR verification failed: {error}"))
+    }
+}
+
 type Result<T> = std::result::Result<T, InterpretError>;
 type SelectedObjects = HashMap<String, Vec<SelectedObject>>;
 type DerivedObjects = HashMap<String, Option<DerivedObject>>;
@@ -168,6 +174,12 @@ pub fn interpret(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>
         ));
     }
 
+    let kir = crate::kir::lower_plan_to_kir(plan)?;
+    crate::kir::verify(&kir)?;
+    execute_verified_kir(plan, event)
+}
+
+fn execute_verified_kir(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>> {
     let selected = select_objects(plan, event)?;
     let derived = derive_objects(plan, &selected)?;
 

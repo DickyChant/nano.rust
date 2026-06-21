@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 pub mod codegen;
 pub mod core;
 pub mod interpret;
+pub mod kir;
 
 /// Typed semantic analysis specification.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
