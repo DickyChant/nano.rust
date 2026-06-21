@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use nano_spec::codegen::generate_producer_source;
-use nano_spec::{validate, AnalysisSpec, Catalogue};
+use nano_spec::{validate, AnalysisSpec, Catalogue, Expr};
 
 #[path = "fuzz_specs.rs"]
 mod fuzz_specs;
@@ -73,17 +73,31 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     let specs = fuzz_specs::generated_specs();
     let mut modules = String::new();
+    let derived_cases = specs.iter().filter(|case| case.has_derived_object).count();
+    let candidate_cases = specs
+        .iter()
+        .filter(|case| case.has_candidate_object)
+        .count();
+    writeln!(
+        modules,
+        "pub const FUZZ_DERIVED_CASES: usize = {derived_cases};"
+    )?;
+    writeln!(
+        modules,
+        "pub const FUZZ_CANDIDATE_CASES: usize = {candidate_cases};"
+    )?;
+    writeln!(modules)?;
     writeln!(modules, "#[derive(Debug, Clone, Copy, PartialEq)]")?;
+    writeln!(modules, "pub enum FuzzValue {{")?;
+    writeln!(modules, "    F64(f64),")?;
+    writeln!(modules, "    U32(u32),")?;
+    writeln!(modules, "    Bool(bool),")?;
+    writeln!(modules, "    I64(i64),")?;
+    writeln!(modules, "}}")?;
+    writeln!(modules)?;
+    writeln!(modules, "#[derive(Debug, Clone, PartialEq)]")?;
     writeln!(modules, "pub struct FuzzRow {{")?;
-    writeln!(modules, "    pub n_muon: u32,")?;
-    writeln!(modules, "    pub n_electron: u32,")?;
-    writeln!(modules, "    pub n_jet: u32,")?;
-    writeln!(modules, "    pub lead_muon_pt: f64,")?;
-    writeln!(modules, "    pub lead_electron_pt: f64,")?;
-    writeln!(modules, "    pub lead_jet_pt: f64,")?;
-    writeln!(modules, "    pub sum_muon_pt: f64,")?;
-    writeln!(modules, "    pub sum_electron_pt: f64,")?;
-    writeln!(modules, "    pub sum_jet_pt: f64,")?;
+    writeln!(modules, "    pub values: Vec<(String, FuzzValue)>,")?;
     writeln!(modules, "}}")?;
     writeln!(modules)?;
     writeln!(modules, "#[derive(Debug, Clone, PartialEq)]")?;
@@ -142,7 +156,7 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
             generated.index, module_name
         )?;
         writeln!(modules)?;
-        writeln!(modules, "#[allow(dead_code, non_snake_case, unused_parens, clippy::collapsible_if, clippy::double_parens, clippy::manual_range_contains, clippy::neg_cmp_op_on_partial_ord, clippy::unnecessary_cast)]")?;
+        writeln!(modules, "#[allow(dead_code, non_snake_case, unused_parens, clippy::approx_constant, clippy::collapsible_if, clippy::double_parens, clippy::manual_range_contains, clippy::neg_cmp_op_on_partial_ord, clippy::unnecessary_cast)]")?;
         writeln!(modules, "pub mod {module_name} {{")?;
         writeln!(
             modules,
@@ -150,12 +164,7 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
         )?;
         writeln!(modules, "}}")?;
         writeln!(modules)?;
-        emit_run_case(
-            &mut modules,
-            &module_name,
-            generated.has_histogram,
-            generated.has_weight_systematic,
-        )?;
+        emit_run_case(&mut modules, &module_name, generated)?;
     }
 
     writeln!(
@@ -178,9 +187,16 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
 fn emit_run_case(
     modules: &mut String,
     module_name: &str,
-    has_histogram: bool,
-    has_weight_systematic: bool,
+    generated: &fuzz_specs::GeneratedSpec,
 ) -> Result<(), Box<dyn Error>> {
+    let has_histogram = generated.has_histogram;
+    let has_histogram_systematic =
+        generated.has_weight_systematic || generated.has_shape_correction;
+    let histogram_name = generated
+        .spec
+        .histograms
+        .first()
+        .map(|histogram| histogram.name.as_str());
     writeln!(
         modules,
         "fn run_{module_name}(events: &[nano_core::Event]) -> nano_core::Result<FuzzCaseResult> {{"
@@ -194,13 +210,29 @@ fn emit_run_case(
             modules,
             "    let mut histograms = {module_name}::GenHistograms::new();"
         )?;
-        writeln!(modules, "    for event in events {{")?;
-        writeln!(
-            modules,
-            "        rows.push({module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, nano_analysis::Systematic::Nominal)?.map(normalize_{module_name}));"
-        )?;
-        writeln!(modules, "    }}")?;
-        if has_weight_systematic {
+        if generated.has_shape_correction && !generated.has_weight_systematic {
+            writeln!(modules, "    for event in events {{")?;
+            writeln!(
+                modules,
+                "        rows.push({module_name}::GeneratedProducer::analyze(event)?.map(normalize_{module_name}));"
+            )?;
+            for variant in ["Nominal", "JesUp", "JesDown"] {
+                writeln!(
+                    modules,
+                    "        let _ = {module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, nano_analysis::Systematic::{variant})?;"
+                )?;
+            }
+            writeln!(modules, "    }}")?;
+        } else {
+            writeln!(modules, "    for event in events {{")?;
+            writeln!(
+                modules,
+                "        rows.push({module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, nano_analysis::Systematic::Nominal)?.map(normalize_{module_name}));"
+            )?;
+            writeln!(modules, "    }}")?;
+        }
+        let histogram_name = histogram_name.expect("histogram exists when flag is set");
+        if has_histogram_systematic {
             writeln!(modules, "    let histogram = Some(vec![")?;
             for (name, variant) in [
                 ("Nominal", "Nominal"),
@@ -209,7 +241,7 @@ fn emit_run_case(
             ] {
                 writeln!(
                     modules,
-                    "        FuzzHistVariation {{ systematic: \"{name}\", hist: snapshot_hist(histograms.lead_muon_pt_hist.get(nano_analysis::Systematic::{variant})) }},"
+                    "        FuzzHistVariation {{ systematic: \"{name}\", hist: snapshot_hist(histograms.{histogram_name}.get(nano_analysis::Systematic::{variant})) }},"
                 )?;
             }
             writeln!(modules, "    ]);")?;
@@ -217,7 +249,7 @@ fn emit_run_case(
             writeln!(modules, "    let histogram = Some(vec![")?;
             writeln!(
                 modules,
-                "        FuzzHistVariation {{ systematic: \"Nominal\", hist: snapshot_hist(&histograms.lead_muon_pt_hist) }},"
+                "        FuzzHistVariation {{ systematic: \"Nominal\", hist: snapshot_hist(&histograms.{histogram_name}) }},"
             )?;
             writeln!(modules, "    ]);")?;
         }
@@ -238,23 +270,31 @@ fn emit_run_case(
         "fn normalize_{module_name}(row: {module_name}::GenRow) -> FuzzRow {{"
     )?;
     writeln!(modules, "    FuzzRow {{")?;
-    writeln!(modules, "        n_muon: row.n_muon,")?;
-    writeln!(modules, "        n_electron: row.n_electron,")?;
-    writeln!(modules, "        n_jet: row.n_jet,")?;
-    writeln!(
-        modules,
-        "        lead_muon_pt: f64::from(row.lead_muon_pt),"
-    )?;
-    writeln!(
-        modules,
-        "        lead_electron_pt: f64::from(row.lead_electron_pt),"
-    )?;
-    writeln!(modules, "        lead_jet_pt: f64::from(row.lead_jet_pt),")?;
-    writeln!(modules, "        sum_muon_pt: row.sum_muon_pt,")?;
-    writeln!(modules, "        sum_electron_pt: row.sum_electron_pt,")?;
-    writeln!(modules, "        sum_jet_pt: row.sum_jet_pt,")?;
+    writeln!(modules, "        values: vec![")?;
+    for output in &generated.spec.outputs {
+        writeln!(
+            modules,
+            "            ({}.to_string(), {}),",
+            format_args!("{:?}", output.name),
+            fuzz_value_expr(&output.expr, &output.name)
+        )?;
+    }
+    writeln!(modules, "        ],")?;
     writeln!(modules, "    }}")?;
     writeln!(modules, "}}")?;
     writeln!(modules)?;
     Ok(())
+}
+
+fn fuzz_value_expr(expr: &Expr, field: &str) -> String {
+    match expr {
+        Expr::Count(_) | Expr::CountWhere { .. } => {
+            format!("FuzzValue::U32(row.{field})")
+        }
+        Expr::All { .. } | Expr::Any { .. } | Expr::EitherPairPt { .. } => {
+            format!("FuzzValue::Bool(row.{field})")
+        }
+        Expr::LeadingAttr { .. } => format!("FuzzValue::F64(f64::from(row.{field}))"),
+        _ => format!("FuzzValue::F64(row.{field})"),
+    }
 }

@@ -132,6 +132,7 @@ pub mod muon_hist_shape_correction {
     dead_code,
     non_snake_case,
     unused_parens,
+    clippy::approx_constant,
     clippy::collapsible_if,
     clippy::double_parens,
     clippy::manual_range_contains,

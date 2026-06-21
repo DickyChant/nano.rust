@@ -1,10 +1,12 @@
 //! Differential/property evidence for valid specs on the compiled demo path.
 //!
-//! Seed: `0x4e414e4f5f444946`. Generated cases: 200.
-//! The shared generator emits deterministic flat single-channel specs over real
+//! Seed: `0x4e414e4f5f444946`. Generated cases: 400.
+//! The shared generator emits deterministic single-channel specs over real
 //! NanoAOD v9 Muon/Electron/Jet branches, with randomized f32 object cuts,
-//! one or two count-based regions, fixed count/leading-pt/sum-pt outputs, and
-//! optional `leading(good_muon).pt` histograms with optional weight
+//! two or three count/predicate/derived-object regions, count/count-where/
+//! leading-pt/sum-pt/bool/derived outputs, pair-derived objects, nested
+//! pair-plus-candidate objects, cross-collection candidate objects, and optional
+//! histograms over object or derived attributes with optional weight or pt-shape
 //! systematics.
 //!
 //! This test validates every generated spec, lowers it to KIR, verifies KIR,
@@ -12,12 +14,19 @@
 //! the build-time compiled generated producer for every generated spec over a
 //! deterministic synthetic event batch. Rows are normalized to one stable shape;
 //! histogram contents are compared for Nominal on nominal-only histograms and
-//! Nominal/JesUp/JesDown when a weight systematic is present.
+//! Nominal/JesUp/JesDown when a weight or shape systematic is present.
+//! Multi-channel union specs, model inference, and combined weight-plus-shape
+//! histogram systematics remain outside this dependency-free fuzz slice because
+//! both dynamic and compiled backends do not yet share one fully supported path
+//! for those combinations.
 
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
-use nano_gen_demo::fuzz::{FuzzCaseResult, FuzzHist1D, FuzzHistVariation, FuzzRow};
+use nano_gen_demo::fuzz::{FuzzCaseResult, FuzzHist1D, FuzzHistVariation, FuzzRow, FuzzValue};
 use nano_spec::codegen::generate_producer_source;
-use nano_spec::interpret::{interpret_and_fill, InterpretedHistograms, OutputRow, Value};
+use nano_spec::interpret::{
+    interpret_and_fill, interpret_and_fill_systematic, interpret_systematic, InterpretedHistograms,
+    OutputRow, Value,
+};
 use nano_spec::{validate, Catalogue};
 
 #[path = "../fuzz_specs.rs"]
@@ -38,6 +47,9 @@ fn generated_valid_specs_interpret_like_compiled_codegen() {
     let mut compiled_compared = 0_usize;
     let mut histogram_cases = 0_usize;
     let mut weight_systematic_cases = 0_usize;
+    let mut shape_systematic_cases = 0_usize;
+    let mut derived_cases = 0_usize;
+    let mut candidate_cases = 0_usize;
 
     for case in &cases {
         let plan = validate(&case.spec, &catalogue).unwrap_or_else(|errors| {
@@ -70,7 +82,7 @@ fn generated_valid_specs_interpret_like_compiled_codegen() {
         });
         codegen_emitted += 1;
 
-        let interpreted = interpret_case(&plan, &events, case.has_weight_systematic);
+        let interpreted = interpret_case(&plan, &events, case);
         let compiled = nano_gen_demo::fuzz::run_case(case.index, &events)
             .unwrap_or_else(|error| panic!("compiled fuzz case {} failed: {error}", case.index));
 
@@ -78,6 +90,9 @@ fn generated_valid_specs_interpret_like_compiled_codegen() {
         compiled_compared += 1;
         histogram_cases += usize::from(case.has_histogram);
         weight_systematic_cases += usize::from(case.has_weight_systematic);
+        shape_systematic_cases += usize::from(case.has_shape_correction);
+        derived_cases += usize::from(case.has_derived_object);
+        candidate_cases += usize::from(case.has_candidate_object);
     }
 
     assert_eq!(cases.len(), fuzz_specs::FUZZ_SPEC_COUNT);
@@ -93,34 +108,85 @@ fn generated_valid_specs_interpret_like_compiled_codegen() {
         weight_systematic_cases > 0,
         "deterministic generator should include weight-systematic histogram cases"
     );
+    assert!(
+        shape_systematic_cases > 0,
+        "deterministic generator should include shape-systematic histogram cases"
+    );
+    assert!(
+        derived_cases > 0,
+        "deterministic generator should include derived-object cases"
+    );
+    assert!(
+        candidate_cases > 0,
+        "deterministic generator should include candidate-object cases"
+    );
 
     eprintln!(
-        "differential fuzz seed=0x{seed:016x} generated={generated} validated={validated} kir_verified={kir_verified} codegen_emitted={codegen_emitted} compiled_compared={compiled_compared} histogram_cases={histogram_cases} weight_systematic_cases={weight_systematic_cases}",
+        "differential fuzz seed=0x{seed:016x} generated={generated} validated={validated} kir_verified={kir_verified} codegen_emitted={codegen_emitted} compiled_compared={compiled_compared} histogram_cases={histogram_cases} weight_systematic_cases={weight_systematic_cases} shape_systematic_cases={shape_systematic_cases} derived_cases={derived_cases} candidate_cases={candidate_cases}",
         seed = fuzz_specs::FUZZ_SEED,
         generated = cases.len(),
     );
 }
 
+#[test]
+fn generated_case_128_candidate_min_delta_r_regression() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let cases = fuzz_specs::generated_specs();
+    let events = synthetic_events();
+    let case = &cases[128];
+    assert!(case.has_candidate_object);
+    assert!(case
+        .spec
+        .outputs
+        .iter()
+        .any(|output| output.name == "emu_min_delta_r"));
+
+    let plan = validate(&case.spec, &catalogue).expect("validate regression spec");
+    let interpreted = interpret_case(&plan, &events, case);
+    let compiled = nano_gen_demo::fuzz::run_case(case.index, &events)
+        .expect("compiled regression case failed");
+
+    assert!(compiled.rows.iter().any(|row| row.is_some()));
+    assert_eq!(compiled, interpreted, "fuzz case {}", case.index);
+}
+
 fn interpret_case(
     plan: &nano_spec::ResolvedPlan,
     events: &[Event],
-    has_weight_systematic: bool,
+    case: &fuzz_specs::GeneratedSpec,
 ) -> FuzzCaseResult {
     let mut histograms = InterpretedHistograms::new(plan);
     let rows = events
         .iter()
         .enumerate()
         .map(|(entry, event)| {
-            interpret_and_fill(plan, event, &mut histograms)
-                .unwrap_or_else(|error| panic!("entry {entry} interpret failed: {error}"))
-                .map(normalize_interpreted_row)
+            if case.has_shape_correction && !case.has_weight_systematic && case.has_histogram {
+                let row = interpret_systematic(plan, event, nano_analysis::Systematic::Nominal)
+                    .unwrap_or_else(|error| panic!("entry {entry} interpret failed: {error}"))
+                    .map(normalize_interpreted_row);
+                for systematic in [
+                    nano_analysis::Systematic::Nominal,
+                    nano_analysis::Systematic::JesUp,
+                    nano_analysis::Systematic::JesDown,
+                ] {
+                    let _ = interpret_and_fill_systematic(plan, event, &mut histograms, systematic)
+                        .unwrap_or_else(|error| {
+                            panic!("entry {entry} interpret fill {systematic:?} failed: {error}")
+                        });
+                }
+                row
+            } else {
+                interpret_and_fill(plan, event, &mut histograms)
+                    .unwrap_or_else(|error| panic!("entry {entry} interpret failed: {error}"))
+                    .map(normalize_interpreted_row)
+            }
         })
         .collect::<Vec<_>>();
     let histogram = plan.spec.histograms.first().map(|histogram| {
         let hist = histograms
             .get(&histogram.name)
             .unwrap_or_else(|| panic!("missing interpreted histogram `{}`", histogram.name));
-        if has_weight_systematic {
+        if case.has_weight_systematic || case.has_shape_correction {
             vec![
                 hist_variation("Nominal", hist.get(nano_analysis::Systematic::Nominal)),
                 hist_variation("JesUp", hist.get(nano_analysis::Systematic::JesUp)),
@@ -150,35 +216,20 @@ fn hist_variation(systematic: &'static str, hist: &nano_analysis::Hist1D) -> Fuz
 
 fn normalize_interpreted_row(row: OutputRow) -> FuzzRow {
     FuzzRow {
-        n_muon: expect_u32(&row, "n_muon"),
-        n_electron: expect_u32(&row, "n_electron"),
-        n_jet: expect_u32(&row, "n_jet"),
-        lead_muon_pt: expect_f64(&row, "lead_muon_pt"),
-        lead_electron_pt: expect_f64(&row, "lead_electron_pt"),
-        lead_jet_pt: expect_f64(&row, "lead_jet_pt"),
-        sum_muon_pt: expect_f64(&row, "sum_muon_pt"),
-        sum_electron_pt: expect_f64(&row, "sum_electron_pt"),
-        sum_jet_pt: expect_f64(&row, "sum_jet_pt"),
+        values: row
+            .values
+            .into_iter()
+            .map(|(name, value)| (name, normalize_value(value)))
+            .collect(),
     }
 }
 
-fn expect_u32(row: &OutputRow, name: &str) -> u32 {
-    match row
-        .get(name)
-        .unwrap_or_else(|| panic!("missing output `{name}`"))
-    {
-        Value::U32(value) => value,
-        other => panic!("output `{name}` had unexpected value {other:?}"),
-    }
-}
-
-fn expect_f64(row: &OutputRow, name: &str) -> f64 {
-    match row
-        .get(name)
-        .unwrap_or_else(|| panic!("missing output `{name}`"))
-    {
-        Value::F64(value) => value,
-        other => panic!("output `{name}` had unexpected value {other:?}"),
+fn normalize_value(value: Value) -> FuzzValue {
+    match value {
+        Value::F64(value) => FuzzValue::F64(value),
+        Value::I64(value) => FuzzValue::I64(value),
+        Value::U32(value) => FuzzValue::U32(value),
+        Value::Bool(value) => FuzzValue::Bool(value),
     }
 }
 
@@ -193,18 +244,25 @@ fn schema() -> BranchSchema {
         BranchSpec::new("nMuon", BranchType::U32),
         BranchSpec::new("Muon_pt", BranchType::VecF32),
         BranchSpec::new("Muon_eta", BranchType::VecF32),
+        BranchSpec::new("Muon_phi", BranchType::VecF32),
+        BranchSpec::new("Muon_mass", BranchType::VecF32),
+        BranchSpec::new("Muon_charge", BranchType::VecI32),
         BranchSpec::new("Muon_dxy", BranchType::VecF32),
         BranchSpec::new("Muon_dz", BranchType::VecF32),
         BranchSpec::new("Muon_pfRelIso03_all", BranchType::VecF32),
         BranchSpec::new("nElectron", BranchType::U32),
         BranchSpec::new("Electron_pt", BranchType::VecF32),
         BranchSpec::new("Electron_eta", BranchType::VecF32),
+        BranchSpec::new("Electron_phi", BranchType::VecF32),
+        BranchSpec::new("Electron_mass", BranchType::VecF32),
+        BranchSpec::new("Electron_charge", BranchType::VecI32),
         BranchSpec::new("Electron_dxy", BranchType::VecF32),
         BranchSpec::new("Electron_dz", BranchType::VecF32),
         BranchSpec::new("Electron_pfRelIso03_all", BranchType::VecF32),
         BranchSpec::new("nJet", BranchType::U32),
         BranchSpec::new("Jet_pt", BranchType::VecF32),
         BranchSpec::new("Jet_eta", BranchType::VecF32),
+        BranchSpec::new("Jet_phi", BranchType::VecF32),
         BranchSpec::new("Jet_mass", BranchType::VecF32),
         BranchSpec::new("Jet_btagDeepFlavB", BranchType::VecF32),
         BranchSpec::new("Jet_area", BranchType::VecF32),
@@ -225,6 +283,18 @@ fn columns() -> Vec<(String, BranchColumn)> {
         (
             "Muon_eta".to_string(),
             BranchColumn::VecF32(vec_f32(&n_muon, "Muon", "eta")),
+        ),
+        (
+            "Muon_phi".to_string(),
+            BranchColumn::VecF32(vec_f32(&n_muon, "Muon", "phi")),
+        ),
+        (
+            "Muon_mass".to_string(),
+            BranchColumn::VecF32(vec_f32(&n_muon, "Muon", "mass")),
+        ),
+        (
+            "Muon_charge".to_string(),
+            BranchColumn::VecI32(vec_i32(&n_muon, "Muon", "charge")),
         ),
         (
             "Muon_dxy".to_string(),
@@ -251,6 +321,18 @@ fn columns() -> Vec<(String, BranchColumn)> {
             BranchColumn::VecF32(vec_f32(&n_electron, "Electron", "eta")),
         ),
         (
+            "Electron_phi".to_string(),
+            BranchColumn::VecF32(vec_f32(&n_electron, "Electron", "phi")),
+        ),
+        (
+            "Electron_mass".to_string(),
+            BranchColumn::VecF32(vec_f32(&n_electron, "Electron", "mass")),
+        ),
+        (
+            "Electron_charge".to_string(),
+            BranchColumn::VecI32(vec_i32(&n_electron, "Electron", "charge")),
+        ),
+        (
             "Electron_dxy".to_string(),
             BranchColumn::VecF32(vec_f32(&n_electron, "Electron", "dxy")),
         ),
@@ -270,6 +352,10 @@ fn columns() -> Vec<(String, BranchColumn)> {
         (
             "Jet_eta".to_string(),
             BranchColumn::VecF32(vec_f32(&n_jet, "Jet", "eta")),
+        ),
+        (
+            "Jet_phi".to_string(),
+            BranchColumn::VecF32(vec_f32(&n_jet, "Jet", "phi")),
         ),
         (
             "Jet_mass".to_string(),
@@ -304,18 +390,46 @@ fn vec_f32(counts: &[u32], object: &str, attr: &str) -> Vec<Vec<f32>> {
         .collect()
 }
 
+fn vec_i32(counts: &[u32], object: &str, attr: &str) -> Vec<Vec<i32>> {
+    counts
+        .iter()
+        .enumerate()
+        .map(|(entry, count)| {
+            (0..*count as usize)
+                .map(|index| i32_value_for(object, attr, entry, index))
+                .collect()
+        })
+        .collect()
+}
+
 fn value_for(object: &str, attr: &str, entry: usize, index: usize) -> f32 {
     let seed = (entry * 37 + index * 29 + object_offset(object) + attr_offset(attr)) as u32;
     match attr {
         "pt" => 4.0 + (seed % 220) as f32,
         "eta" => -5.0 + (seed % 101) as f32 * 0.1,
+        "phi" => -3.2 + (seed % 129) as f32 * 0.05,
         "dxy" => -0.45 + (seed % 91) as f32 * 0.01,
         "dz" => -0.9 + (seed % 181) as f32 * 0.01,
         "pfRelIso03_all" => (seed % 90) as f32 * 0.01,
+        "mass" if object == "Muon" => 0.105,
+        "mass" if object == "Electron" => 0.0005,
         "mass" => 1.0 + (seed % 90) as f32,
         "btagDeepFlavB" => (seed % 101) as f32 * 0.01,
         "area" => 0.2 + (seed % 130) as f32 * 0.01,
         other => panic!("unsupported synthetic attr `{other}`"),
+    }
+}
+
+fn i32_value_for(object: &str, attr: &str, entry: usize, index: usize) -> i32 {
+    match attr {
+        "charge" => {
+            if (entry + index + object_offset(object)).is_multiple_of(2) {
+                1
+            } else {
+                -1
+            }
+        }
+        other => panic!("unsupported synthetic i32 attr `{other}`"),
     }
 }
 
@@ -332,6 +446,7 @@ fn attr_offset(attr: &str) -> usize {
     match attr {
         "pt" => 3,
         "eta" => 5,
+        "phi" => 6,
         "dxy" => 7,
         "dz" => 13,
         "pfRelIso03_all" => 17,

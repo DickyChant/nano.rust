@@ -272,8 +272,11 @@ pub fn interpret_and_fill_systematic(
             "KIR program completed without returning outputs".to_string(),
         )),
         BlockOutcome::Return(row) => {
-            if row.is_some() && !plan.spec.has_weight_systematic() {
-                evaluator.fill_current_histograms()?;
+            if row.is_some()
+                && !plan.spec.has_weight_systematic()
+                && !evaluator.fill_current_histograms()?
+            {
+                return Ok(None);
             }
             Ok(row)
         }
@@ -435,15 +438,18 @@ impl<'a> KirEvaluator<'a> {
         Ok(())
     }
 
-    fn fill_current_histograms(&mut self) -> Result<()> {
+    fn fill_current_histograms(&mut self) -> Result<bool> {
         let systematic = self.systematic;
         let weight = self.weight_for(systematic);
         for histogram in &self.program.histograms {
+            if expr_has_missing_value(&histogram.def.expr, &self.selected, &self.derived)? {
+                return Ok(false);
+            }
             let value =
                 eval_numeric_expr(&histogram.def.expr, &self.selected, &self.derived, None)?
                     .as_f64();
             let Some(histograms) = &mut self.histograms else {
-                return Ok(());
+                return Ok(true);
             };
             let Some(output) = histograms.get_mut(&histogram.name) else {
                 return Err(InterpretError::InvalidExpression(format!(
@@ -455,7 +461,7 @@ impl<'a> KirEvaluator<'a> {
                 .get_mut(systematic)
                 .fill_weighted(value, weight.value());
         }
-        Ok(())
+        Ok(true)
     }
 
     fn eval_rvalue(&mut self, expr: &Rvalue) -> Result<RuntimeValue> {
@@ -471,6 +477,9 @@ impl<'a> KirEvaluator<'a> {
                 Ok(RuntimeValue::Candidate)
             }
             Rvalue::Requirement { requirement } => {
+                if expr_has_missing_value(&requirement.lhs, &self.selected, &self.derived)? {
+                    return Ok(RuntimeValue::Bool(false));
+                }
                 let lhs = eval_numeric_expr(&requirement.lhs, &self.selected, &self.derived, None)?;
                 Ok(RuntimeValue::Bool(compare(
                     lhs.as_f64(),
@@ -484,9 +493,14 @@ impl<'a> KirEvaluator<'a> {
                 &self.derived,
             )?)),
             Rvalue::Histogram { histogram } => Ok(RuntimeValue::Histogram(histogram.name.clone())),
-            Rvalue::HistogramValue { expr, .. } => Ok(RuntimeValue::Numeric(
-                eval_numeric_expr(expr, &self.selected, &self.derived, None)?.as_f64(),
-            )),
+            Rvalue::HistogramValue { expr, .. } => {
+                if expr_has_missing_value(expr, &self.selected, &self.derived)? {
+                    return Ok(RuntimeValue::Output(None));
+                }
+                Ok(RuntimeValue::Numeric(
+                    eval_numeric_expr(expr, &self.selected, &self.derived, None)?.as_f64(),
+                ))
+            }
             Rvalue::Weight { systematic } => {
                 let RuntimeValue::Systematic(systematic) = self.value(*systematic)? else {
                     return Err(InterpretError::InvalidExpression(format!(
@@ -1236,6 +1250,37 @@ fn shape_factor(program: &KirProgram, collection: &str, attr: &str, systematic: 
         .unwrap_or(1.0)
 }
 
+fn expr_has_missing_value(
+    expr: &Expr,
+    selected: &SelectedObjects,
+    derived: &DerivedObjects,
+) -> Result<bool> {
+    match expr {
+        Expr::Attr { object, .. } if derived.contains_key(object) => {
+            Ok(derived_object(derived, object)?.is_none())
+        }
+        Expr::Attr { .. } | Expr::Literal(_) | Expr::Count(_) | Expr::SumAttr { .. } => Ok(false),
+        Expr::Binary { lhs, rhs, .. } => Ok(expr_has_missing_value(lhs, selected, derived)?
+            || expr_has_missing_value(rhs, selected, derived)?),
+        Expr::Abs(inner) | Expr::Sqrt(inner) => expr_has_missing_value(inner, selected, derived),
+        Expr::CountWhere { predicate, .. }
+        | Expr::All { predicate, .. }
+        | Expr::Any { predicate, .. } => expr_has_missing_value(&predicate.lhs, selected, derived),
+        Expr::EitherPairPt { .. } => Ok(false),
+        Expr::ClosestMass { left, right, .. } | Expr::OtherMass { left, right, .. } => {
+            Ok(derived_object(derived, left)?.is_none()
+                || derived_object(derived, right)?.is_none())
+        }
+        Expr::LeadingAttr { object, attr } => Ok(leading_value(selected, object, attr)?.is_none()),
+        Expr::PairDeltaR
+        | Expr::PairLeadingPt
+        | Expr::PairSubleadingPt
+        | Expr::CandidateMinDeltaR
+        | Expr::CandidateLeadingPt
+        | Expr::CandidateSubleadingPt => Ok(false),
+    }
+}
+
 fn eval_output_expr(
     expr: &Expr,
     selected: &SelectedObjects,
@@ -1686,11 +1731,129 @@ mod tests {
         assert_eq!(interpreted, handwritten);
     }
 
+    #[test]
+    fn missing_derived_requirement_rejects_event_without_error() {
+        let plan = derived_absence_plan(
+            r#"
+[analysis]
+name = "missing_derived_requirement"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[derived.z1]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "leading_pt"
+
+[derived.z2]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "leading_pt"
+exclude = ["z1"]
+
+[regions.signal]
+require = ["z2.mass > 5 GeV"]
+
+[[outputs]]
+name = "z2_mass"
+expr = "z2.mass"
+"#,
+        );
+        let event = two_muon_event();
+
+        assert_eq!(interpret(&plan, &event).expect("interpret"), None);
+    }
+
+    #[test]
+    fn missing_derived_histogram_value_rejects_event_without_error() {
+        let plan = derived_absence_plan(
+            r#"
+[analysis]
+name = "missing_derived_histogram"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[derived.z1]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "leading_pt"
+
+[derived.z2]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "leading_pt"
+exclude = ["z1"]
+
+[regions.signal]
+require = ["count(good_muon) >= 1"]
+
+[[outputs]]
+name = "n_muon"
+expr = "count(good_muon)"
+
+[[histogram]]
+name = "z2_mass"
+expr = "z2.mass"
+bins = 10
+range = [0.0, 100.0]
+"#,
+        );
+        let event = two_muon_event();
+        let mut histograms = InterpretedHistograms::new(&plan);
+
+        assert_eq!(
+            interpret_and_fill(&plan, &event, &mut histograms).expect("interpret and fill"),
+            None
+        );
+    }
+
     fn muon_plan() -> ResolvedPlan {
         let spec = AnalysisSpec::from_toml_str(MUON_SPEC_TOML).expect("parse muon spec");
         let catalogue =
             Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
         validate(&spec, &catalogue).expect("validate muon spec")
+    }
+
+    fn derived_absence_plan(input: &str) -> ResolvedPlan {
+        let spec = AnalysisSpec::from_toml_str(input).expect("parse derived absence spec");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+        validate(&spec, &catalogue).expect("validate derived absence spec")
+    }
+
+    fn two_muon_event() -> Event {
+        let schema = BranchSchema::new([
+            BranchSpec::new("nMuon", BranchType::U32),
+            BranchSpec::new("Muon_charge", BranchType::VecI32),
+            BranchSpec::new("Muon_eta", BranchType::VecF32),
+            BranchSpec::new("Muon_mass", BranchType::VecF32),
+            BranchSpec::new("Muon_phi", BranchType::VecF32),
+            BranchSpec::new("Muon_pt", BranchType::VecF32),
+        ])
+        .expect("schema");
+        Event::from_columns(
+            schema,
+            [
+                ("nMuon", BranchColumn::U32(vec![2])),
+                ("Muon_charge", BranchColumn::VecI32(vec![vec![1, -1]])),
+                ("Muon_eta", BranchColumn::VecF32(vec![vec![0.1, -0.2]])),
+                ("Muon_mass", BranchColumn::VecF32(vec![vec![0.105, 0.105]])),
+                ("Muon_phi", BranchColumn::VecF32(vec![vec![0.3, -0.4]])),
+                ("Muon_pt", BranchColumn::VecF32(vec![vec![40.0, 35.0]])),
+            ],
+            0,
+        )
+        .expect("event")
     }
 
     fn synthetic_events() -> Vec<Event> {

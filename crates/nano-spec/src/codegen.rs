@@ -1654,10 +1654,14 @@ impl<'a> Generator<'a> {
             "fn gen_delta_r(left_eta: f32, left_phi: f32, right_eta: f32, right_phi: f32) -> f64 {{"
         )
         .unwrap();
-        writeln!(source, "    let deta = f64::from(left_eta - right_eta);").unwrap();
         writeln!(
             source,
-            "    let mut dphi = f64::from(left_phi - right_phi);"
+            "    let deta = f64::from(left_eta) - f64::from(right_eta);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    let mut dphi = f64::from(left_phi) - f64::from(right_phi);"
         )
         .unwrap();
         writeln!(
@@ -3669,6 +3673,8 @@ mod tests {
             "dimuon_order.sort_by(|&left, &right| good_muon_selected[right].pt.total_cmp(&good_muon_selected[left].pt));"
         ));
         assert!(source.contains("if first.charge * second.charge >= 0"));
+        assert!(source.contains("let deta = f64::from(left_eta) - f64::from(right_eta);"));
+        assert!(source.contains("let mut dphi = f64::from(left_phi) - f64::from(right_phi);"));
         assert!(source.contains("let Some(dimuon) = dimuon else"));
         assert!(source.contains("dimuon_mass: dimuon.mass,"));
     }
