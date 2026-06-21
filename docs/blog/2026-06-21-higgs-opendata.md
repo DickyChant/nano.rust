@@ -27,6 +27,18 @@ analysis (`--plot`).*
 
 *(No player? Raw cast: [`demo-higgs.cast`](../demo-higgs.cast).)*
 
+> **What this demo proves (and what it doesn't, yet).** This validates the
+> pure-Rust **I/O and physics** against ROOT — bit-identical — and externalizes
+> the analysis *knobs* to a [config](#the-config-that-steers-it). But the
+> selection/reconstruction here is still hand-written Rust
+> (`examples/higgs4l_opendata.rs`). The framework's deeper promise —
+> *physicist writes a spec, the compiler-enforced kernel is **generated***, with
+> no hand-written `.rs` to review — is demonstrated today on the
+> [muon channel](2026-06-21-spec-to-code.html) (spec → validate → codegen →
+> typestate kernel, proven equal to the reference). Making **this** Higgs
+> analysis spec-driven (extending the semantic IR with 4ℓ combinatorics so the
+> kernel is generated from a spec and proven bit-identical) is in progress.
+
 ## The analysis
 
 For each of the **4μ**, **4e**, and **2e2μ** channels (`examples/higgs4l_opendata.rs`):
