@@ -1,0 +1,27 @@
+[analysis]
+name = "muon_hist_shape_nominal"
+year = "Run2018"
+
+[weight]
+nominal = []
+
+[objects.good_muon]
+source = "Muon"
+cuts = ["pt > 30 GeV", "abs(eta) < 2.4"]
+
+[regions.signal]
+require = ["count(good_muon) >= 1"]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"
+
+[[outputs]]
+name = "lead_muon_pt"
+expr = "leading(good_muon).pt"
+
+[[histogram]]
+name = "n_good_muon_hist"
+expr = "count(good_muon)"
+bins = 5
+range = [0.0, 5.0]

@@ -265,11 +265,12 @@ impl<'a> Generator<'a> {
             )
             .unwrap();
             writeln!(source, "    }}").unwrap();
-            let systematic_param = if self.spec().has_weight_systematic() {
-                "_systematic"
-            } else {
-                "systematic"
-            };
+            let systematic_param =
+                if self.spec().has_weight_systematic() && !self.spec().has_shape_correction() {
+                    "_systematic"
+                } else {
+                    "systematic"
+                };
             writeln!(
                 source,
                 "    fn analyze_impl(event: &nano_core::Event, histograms: Option<&mut GenHistograms>, {systematic_param}: nano_analysis::Systematic) -> nano_core::Result<Option<GenRow>> {{"
@@ -304,6 +305,8 @@ impl<'a> Generator<'a> {
         let mut emitted_baseline = false;
         let mut emitted_derived_region_unwraps = false;
         let mut unwrapped_required = BTreeSet::new();
+
+        self.emit_shape_factor_bindings(source)?;
 
         for stmt in &kir.block.stmts {
             match stmt {
@@ -688,6 +691,11 @@ impl<'a> Generator<'a> {
                 "derived objects are not yet supported by model-aware codegen".to_string(),
             ));
         }
+        if !self.spec().models.is_empty() && self.spec().has_shape_correction() {
+            return Err(CodegenError::UnsupportedFeature(
+                "shape corrections are not yet supported by model-aware codegen".to_string(),
+            ));
+        }
 
         for object in &self.spec().objects {
             checked_ident(&object.name, "object name")?;
@@ -819,7 +827,7 @@ impl<'a> Generator<'a> {
         writeln!(source, "#[derive(Debug, Clone, PartialEq)]").unwrap();
         writeln!(source, "pub struct GenHistograms {{").unwrap();
         for histogram in &self.spec().histograms {
-            let hist_type = if self.spec().has_weight_systematic() {
+            let hist_type = if self.spec().has_histogram_systematic() {
                 "nano_analysis::HistSet1D"
             } else {
                 "nano_analysis::Hist1D"
@@ -837,7 +845,7 @@ impl<'a> Generator<'a> {
         writeln!(source, "    pub fn new() -> Self {{").unwrap();
         writeln!(source, "        Self {{").unwrap();
         for histogram in &self.spec().histograms {
-            let constructor = if self.spec().has_weight_systematic() {
+            let constructor = if self.spec().has_histogram_systematic() {
                 "nano_analysis::HistSet1D::new"
             } else {
                 "nano_analysis::Hist1D::new"
@@ -1035,22 +1043,65 @@ impl<'a> Generator<'a> {
         let region_type = region_type_ident(&region.name)?;
         writeln!(source, "        if let Some(histograms) = histograms {{").unwrap();
         self.emit_weight_match(source)?;
-        writeln!(
-            source,
-            "            let weighted = {region_event}_event.weight(weight);"
-        )
-        .unwrap();
-        for histogram in &self.spec().histograms {
-            let field = checked_ident(&histogram.name, "histogram field")?;
-            let value = self.histogram_fill_value_expr(
-                &histogram.expr,
-                &self.emit_output_expr(&histogram.expr, &field)?,
-            )?;
+        if self.spec().has_shape_correction() {
+            writeln!(source, "            match systematic {{").unwrap();
+            for (variant, marker) in [
+                ("Nominal", "Nominal"),
+                ("JesUp", "JesUp"),
+                ("JesDown", "JesDown"),
+            ] {
+                writeln!(
+                    source,
+                    "                nano_analysis::Systematic::{variant} => {{"
+                )
+                .unwrap();
+                if marker == "Nominal" {
+                    writeln!(
+                        source,
+                        "                    let weighted = {region_event}_event.weight(weight);"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        source,
+                        "                    let weighted = {region_event}_event.weight_for::<nano_analysis::{marker}>(weight);"
+                    )
+                    .unwrap();
+                }
+                for histogram in &self.spec().histograms {
+                    let field = checked_ident(&histogram.name, "histogram field")?;
+                    let value = self.histogram_fill_value_expr(
+                        &histogram.expr,
+                        &self.emit_output_expr(&histogram.expr, &field)?,
+                    )?;
+                    writeln!(
+                        source,
+                        "                    nano_analysis::fill_set::<{region_type}, nano_analysis::{marker}>(&mut histograms.{field}, &weighted, {value});"
+                    )
+                    .unwrap();
+                }
+                writeln!(source, "                }}").unwrap();
+            }
+            writeln!(source, "                _ => {{}}").unwrap();
+            writeln!(source, "            }}").unwrap();
+        } else {
             writeln!(
                 source,
-                "            nano_analysis::fill::<{region_type}, nano_analysis::Nominal>(&mut histograms.{field}, &weighted, {value});"
+                "            let weighted = {region_event}_event.weight(weight);"
             )
             .unwrap();
+            for histogram in &self.spec().histograms {
+                let field = checked_ident(&histogram.name, "histogram field")?;
+                let value = self.histogram_fill_value_expr(
+                    &histogram.expr,
+                    &self.emit_output_expr(&histogram.expr, &field)?,
+                )?;
+                writeln!(
+                    source,
+                    "            nano_analysis::fill::<{region_type}, nano_analysis::Nominal>(&mut histograms.{field}, &weighted, {value});"
+                )
+                .unwrap();
+            }
         }
         writeln!(source, "        }}").unwrap();
         Ok(())
@@ -1100,6 +1151,28 @@ impl<'a> Generator<'a> {
         Ok(())
     }
 
+    fn emit_shape_factor_bindings(&self, source: &mut String) -> Result<(), CodegenError> {
+        for correction in self.spec().shape_corrections() {
+            let factor = shape_factor_ident(&correction.collection, &correction.attr)?;
+            writeln!(source, "        let {factor} = match systematic {{").unwrap();
+            writeln!(
+                source,
+                "            nano_analysis::Systematic::JesUp => {},",
+                f64_literal(correction.up)
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "            nano_analysis::Systematic::JesDown => {},",
+                f64_literal(correction.down)
+            )
+            .unwrap();
+            writeln!(source, "            _ => 1.0_f64,").unwrap();
+            writeln!(source, "        }};").unwrap();
+        }
+        Ok(())
+    }
+
     fn histogram_fill_value_expr(
         &self,
         expr: &Expr,
@@ -1144,7 +1217,7 @@ impl<'a> Generator<'a> {
     }
 
     fn active_systematic_exprs(&self) -> Vec<&'static str> {
-        if self.spec().has_weight_systematic() {
+        if self.spec().has_weight_systematic() || self.spec().has_shape_correction() {
             vec![
                 "nano_analysis::Systematic::Nominal",
                 "nano_analysis::Systematic::JesUp",
@@ -1319,12 +1392,22 @@ impl<'a> Generator<'a> {
             self.require_supported_object_attr(&object.name, &attr, "object attribute")?;
             let attr_ident = attr_ident(&object.name, &attr)?;
             let rust_type = self.object_attr_rust_type(&object.name, &attr)?;
-            writeln!(
-                source,
-                "            let {attr_ident} = {item_ident}.get::<{rust_type}>({})?;",
-                rust_string(&attr)
-            )
-            .unwrap();
+            if self.shape_correction_for(&object.name, &attr).is_some() {
+                let factor = shape_factor_ident(&object.name, &attr)?;
+                writeln!(
+                    source,
+                    "            let {attr_ident} = (f64::from({item_ident}.get::<{rust_type}>({})?) * {factor}) as {rust_type};",
+                    rust_string(&attr)
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    source,
+                    "            let {attr_ident} = {item_ident}.get::<{rust_type}>({})?;",
+                    rust_string(&attr)
+                )
+                .unwrap();
+            }
         }
 
         let condition = if object.cuts.is_empty() {
@@ -1405,6 +1488,11 @@ impl<'a> Generator<'a> {
     fn attrs_needed_for_object(&self, object_name: &str) -> Result<BTreeSet<String>, CodegenError> {
         let mut attrs = BTreeSet::new();
         let object = self.object(object_name)?;
+        for correction in self.spec().shape_corrections() {
+            if correction.collection == object_name {
+                attrs.insert(correction.attr.clone());
+            }
+        }
         for cut in &object.cuts {
             collect_attr_names_for_current_object(&cut.lhs, object_name, &mut attrs)?;
         }
@@ -2521,6 +2609,17 @@ impl<'a> Generator<'a> {
         self.branch_type(&branch)
     }
 
+    fn shape_correction_for(
+        &self,
+        object_name: &str,
+        attr: &str,
+    ) -> Option<&crate::ShapeCorrectionDef> {
+        self.spec()
+            .shape_corrections()
+            .iter()
+            .find(|correction| correction.collection == object_name && correction.attr == attr)
+    }
+
     fn validate_derived_object(&self, derived: &DerivedObjectDef) -> Result<(), CodegenError> {
         match &derived.source {
             DerivedSource::Pair(pair) => {
@@ -3243,6 +3342,14 @@ fn selected_type_ident(object_name: &str) -> Result<String, CodegenError> {
     Ok(format!(
         "{}Selected",
         upper_camel_ident(object_name, "selected object type")?
+    ))
+}
+
+fn shape_factor_ident(object_name: &str, attr: &str) -> Result<String, CodegenError> {
+    Ok(format!(
+        "{}_{}_shape_factor",
+        checked_ident(object_name, "shape correction object")?,
+        checked_ident(attr, "shape correction attribute")?
     ))
 }
 

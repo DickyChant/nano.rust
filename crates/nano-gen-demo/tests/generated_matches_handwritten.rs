@@ -6,7 +6,9 @@ use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
 use nano_gen_demo::GeneratedProducer;
 use nano_io::writer::{write_events, OutputBranch};
 use nano_producers::{MuonProducer, MuonSkimRow};
-use nano_spec::interpret::{interpret, interpret_and_fill, InterpretedHistograms, Value};
+use nano_spec::interpret::{
+    interpret, interpret_and_fill, interpret_and_fill_systematic, InterpretedHistograms, Value,
+};
 use nano_spec::{validate, AnalysisSpec, Catalogue};
 use nano_workflow::{
     merge_partials, muon_schema, plan_workflow_with_kernel_id, run_chunk, ExecutionMode, Executor,
@@ -19,6 +21,10 @@ const MUON_HIST_NOMINAL_SPEC: &str =
     include_str!("../../nano-spec/examples/muon_hist_nominal.toml");
 const MUON_HIST_WEIGHT_SYSTEMATIC_SPEC: &str =
     include_str!("../../nano-spec/examples/muon_hist_weight_systematic.toml");
+const MUON_HIST_SHAPE_NOMINAL_SPEC: &str =
+    include_str!("../../nano-spec/examples/muon_hist_shape_nominal.toml");
+const MUON_HIST_SHAPE_CORRECTION_SPEC: &str =
+    include_str!("../../nano-spec/examples/muon_hist_shape_correction.toml");
 
 #[test]
 fn generated_muon_producer_matches_handwritten_producer_on_synthetic_events() {
@@ -182,6 +188,154 @@ fn weight_systematic_histogram_fanout_matches_interpreter_and_preserves_nominal(
         generated.get(nano_analysis::Systematic::JesDown).sumw(),
         1.5
     );
+}
+
+#[test]
+fn shape_correction_recomputes_rows_and_histograms_per_variation() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let nominal_spec = AnalysisSpec::from_toml_str(MUON_HIST_SHAPE_NOMINAL_SPEC).unwrap();
+    let shape_spec = AnalysisSpec::from_toml_str(MUON_HIST_SHAPE_CORRECTION_SPEC).unwrap();
+    validate(&nominal_spec, &catalogue).unwrap();
+    let shape_plan = validate(&shape_spec, &catalogue).unwrap();
+    let mut generated_nominal = nano_gen_demo::muon_hist_shape_nominal::GenHistograms::new();
+    let mut generated_shape = nano_gen_demo::muon_hist_shape_correction::GenHistograms::new();
+    let mut interpreted_shape = InterpretedHistograms::new(&shape_plan);
+
+    let mut generated_rows = Vec::new();
+    let mut interpreted_rows = Vec::new();
+    let mut nominal_rows = Vec::new();
+    for entry in 0..5 {
+        let event = synthetic_event(entry);
+        let nominal_row =
+            nano_gen_demo::muon_hist_shape_nominal::GeneratedProducer::analyze_and_fill(
+                &event,
+                &mut generated_nominal,
+                nano_analysis::Systematic::Nominal,
+            )
+            .unwrap()
+            .map(|row| (row.n_good_muon, row.lead_muon_pt.to_bits()));
+        nominal_rows.push(nominal_row);
+
+        for systematic in [
+            nano_analysis::Systematic::Nominal,
+            nano_analysis::Systematic::JesUp,
+            nano_analysis::Systematic::JesDown,
+        ] {
+            let generated =
+                nano_gen_demo::muon_hist_shape_correction::GeneratedProducer::analyze_and_fill(
+                    &event,
+                    &mut generated_shape,
+                    systematic,
+                )
+                .unwrap()
+                .map(|row| (row.n_good_muon, row.lead_muon_pt.to_bits()));
+            let interpreted = interpret_and_fill_systematic(
+                &shape_plan,
+                &event,
+                &mut interpreted_shape,
+                systematic,
+            )
+            .unwrap()
+            .map(|row| {
+                let n_good_muon = match row.get("n_good_muon").unwrap() {
+                    Value::U32(value) => value,
+                    value => panic!("unexpected interpreted count {value:?}"),
+                };
+                let lead_muon_pt = match row.get("lead_muon_pt").unwrap() {
+                    Value::F64(value) => (value as f32).to_bits(),
+                    value => panic!("unexpected interpreted leading pt {value:?}"),
+                };
+                (n_good_muon, lead_muon_pt)
+            });
+            assert_eq!(generated, interpreted, "entry {entry} {systematic:?}");
+            generated_rows.push((entry, systematic, generated));
+            interpreted_rows.push((entry, systematic, interpreted));
+        }
+    }
+
+    for systematic in [
+        nano_analysis::Systematic::Nominal,
+        nano_analysis::Systematic::JesUp,
+        nano_analysis::Systematic::JesDown,
+    ] {
+        assert_eq!(
+            generated_shape.n_good_muon_hist.get(systematic),
+            interpreted_shape
+                .get("n_good_muon_hist")
+                .expect("interpreted histogram")
+                .get(systematic),
+            "{systematic:?}"
+        );
+    }
+
+    let shape_nominal_rows = generated_rows
+        .iter()
+        .filter_map(|(entry, systematic, row)| {
+            (*systematic == nano_analysis::Systematic::Nominal).then_some((*entry, *row))
+        })
+        .collect::<Vec<_>>();
+    for (entry, row) in shape_nominal_rows {
+        assert_eq!(row, nominal_rows[entry], "nominal row entry {entry}");
+    }
+    assert_eq!(
+        generated_shape
+            .n_good_muon_hist
+            .get(nano_analysis::Systematic::Nominal),
+        &generated_nominal.n_good_muon_hist
+    );
+
+    let entry_one_nominal = generated_rows
+        .iter()
+        .find(|(entry, systematic, _)| {
+            *entry == 1 && *systematic == nano_analysis::Systematic::Nominal
+        })
+        .and_then(|(_, _, row)| *row);
+    let entry_one_up = generated_rows
+        .iter()
+        .find(|(entry, systematic, _)| {
+            *entry == 1 && *systematic == nano_analysis::Systematic::JesUp
+        })
+        .and_then(|(_, _, row)| *row);
+    let entry_zero_nominal = generated_rows
+        .iter()
+        .find(|(entry, systematic, _)| {
+            *entry == 0 && *systematic == nano_analysis::Systematic::Nominal
+        })
+        .and_then(|(_, _, row)| *row);
+    let entry_zero_down = generated_rows
+        .iter()
+        .find(|(entry, systematic, _)| {
+            *entry == 0 && *systematic == nano_analysis::Systematic::JesDown
+        })
+        .and_then(|(_, _, row)| *row);
+
+    assert_eq!(entry_one_nominal, None);
+    assert!(
+        entry_one_up.is_some(),
+        "JesUp should migrate entry 1 above threshold"
+    );
+    assert!(entry_zero_nominal.is_some());
+    assert_eq!(
+        entry_zero_down, None,
+        "JesDown should migrate entry 0 below threshold"
+    );
+    assert_ne!(
+        generated_shape
+            .n_good_muon_hist
+            .get(nano_analysis::Systematic::JesUp),
+        generated_shape
+            .n_good_muon_hist
+            .get(nano_analysis::Systematic::Nominal)
+    );
+    assert_ne!(
+        generated_shape
+            .n_good_muon_hist
+            .get(nano_analysis::Systematic::JesDown),
+        generated_shape
+            .n_good_muon_hist
+            .get(nano_analysis::Systematic::Nominal)
+    );
+    assert_eq!(generated_rows, interpreted_rows);
 }
 
 #[test]

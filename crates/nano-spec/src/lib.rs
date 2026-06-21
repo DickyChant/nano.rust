@@ -30,6 +30,7 @@ pub struct AnalysisSpec {
     pub histograms: Vec<HistogramDef>,
     pub weight: WeightDef,
     pub systematics: Vec<SystematicDef>,
+    pub shape_corrections: Vec<ShapeCorrectionDef>,
     pub channels: Vec<ChannelDef>,
 }
 
@@ -73,6 +74,21 @@ impl AnalysisSpec {
     /// Whether histogram fills should fan out over nominal/up/down weights.
     pub fn has_weight_systematic(&self) -> bool {
         self.weight_systematic().is_some()
+    }
+
+    /// The declared collection-attribute shape corrections.
+    pub fn shape_corrections(&self) -> &[ShapeCorrectionDef] {
+        &self.shape_corrections
+    }
+
+    /// Whether any systematic variation changes selected object kinematics.
+    pub fn has_shape_correction(&self) -> bool {
+        !self.shape_corrections.is_empty()
+    }
+
+    /// Whether histogram storage must keep a systematic axis.
+    pub fn has_histogram_systematic(&self) -> bool {
+        self.has_weight_systematic() || self.has_shape_correction()
     }
 }
 
@@ -409,6 +425,16 @@ pub struct WeightSystematicDef {
     pub down: f64,
 }
 
+/// A two-sided shape correction that scales one selected collection attribute.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ShapeCorrectionDef {
+    pub name: String,
+    pub collection: String,
+    pub attr: String,
+    pub up: f64,
+    pub down: f64,
+}
+
 /// One channel inside a multi-channel union spec.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChannelDef {
@@ -432,6 +458,7 @@ impl ChannelDef {
             histograms: parent.histograms.clone(),
             weight: parent.weight.clone(),
             systematics: parent.systematics.clone(),
+            shape_corrections: parent.shape_corrections.clone(),
             channels: Vec::new(),
         }
     }
@@ -521,6 +548,11 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
     let outputs = output_defs_from_raw(&raw.outputs)?;
     let histograms = histogram_defs_from_raw(&raw.histograms)?;
     let weight = raw.weight.map(weight_def_from_raw).unwrap_or_default();
+    let shape_corrections = raw
+        .corrections
+        .into_iter()
+        .map(shape_correction_def_from_raw)
+        .collect::<Result<Vec<_>, _>>()?;
     let mut systematics = raw
         .systematics
         .iter()
@@ -532,9 +564,11 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
     let systematics = if systematics.is_empty() {
         vec![SystematicDef::Nominal]
     } else {
-        if systematics
+        let needs_nominal = systematics
             .iter()
             .any(|systematic| matches!(systematic, SystematicDef::Weight(_)))
+            || !shape_corrections.is_empty();
+        if needs_nominal
             && !systematics
                 .iter()
                 .any(|systematic| matches!(systematic, SystematicDef::Nominal))
@@ -560,6 +594,7 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
         histograms,
         weight,
         systematics,
+        shape_corrections,
         channels,
     })
 }
@@ -634,6 +669,8 @@ fn validate_flat(
                 validate_cut(object, index, cut, &mut ctx);
             }
         }
+
+        validate_shape_corrections(spec, &mut ctx);
 
         for derived in &spec.derived_objects {
             validate_derived_object(derived, &mut ctx);
@@ -1300,6 +1337,27 @@ fn validate_histogram(histogram: &HistogramDef, ctx: &mut ValidationContext<'_>)
             detail: "histogram expression must be numeric".to_string(),
         }),
         None => {}
+    }
+}
+
+fn validate_shape_corrections(spec: &AnalysisSpec, ctx: &mut ValidationContext<'_>) {
+    for correction in &spec.shape_corrections {
+        let context = format!("correction `{}`", correction.name);
+        let Some(source) = ctx.object_sources.get(correction.collection.as_str()) else {
+            ctx.errors.push(SpecError::UndefinedObject {
+                context,
+                object: correction.collection.clone(),
+            });
+            continue;
+        };
+        require_attr_branch_type(
+            source,
+            &correction.attr,
+            BranchType::VecF32,
+            "f32 vector branch for shape scaling",
+            &context,
+            ctx,
+        );
     }
 }
 
@@ -2483,6 +2541,22 @@ fn validate_raw_analysis_spec(raw: &RawAnalysisSpec) -> Result<(), ParseError> {
         ));
     }
 
+    let mut shape_corrections = BTreeSet::new();
+    for correction in &raw.corrections {
+        validate_identifier(&correction.name, "correction name")?;
+        if !shape_corrections.insert(correction.name.as_str()) {
+            return Err(ParseError::InvalidSpec(format!(
+                "duplicate correction `{}`",
+                correction.name
+            )));
+        }
+    }
+    if raw.corrections.len() > 1 {
+        return Err(ParseError::InvalidSpec(
+            "this compiler slice supports at most one shape correction".to_string(),
+        ));
+    }
+
     let mut channel_names = BTreeSet::new();
     for channel in &raw.channels {
         validate_identifier(&channel.name, "channel name")?;
@@ -3097,6 +3171,8 @@ struct RawAnalysisSpec {
     systematics: Vec<String>,
     #[serde(default, rename = "systematic")]
     systematic: Vec<RawSystematic>,
+    #[serde(default, rename = "correction")]
+    corrections: Vec<RawCorrection>,
     #[serde(default, rename = "channel")]
     channels: Vec<RawChannel>,
 }
@@ -3188,6 +3264,16 @@ struct RawWeight {
 struct RawSystematic {
     name: String,
     kind: String,
+    up: f64,
+    down: f64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawCorrection {
+    name: String,
+    kind: String,
+    collection: String,
+    attr: String,
     up: f64,
     down: f64,
 }
@@ -3315,6 +3401,37 @@ fn weight_systematic_def_from_raw(raw: RawSystematic) -> Result<SystematicDef, P
         up: raw.up,
         down: raw.down,
     }))
+}
+
+fn shape_correction_def_from_raw(raw: RawCorrection) -> Result<ShapeCorrectionDef, ParseError> {
+    validate_identifier(&raw.name, "correction name")?;
+    validate_identifier(&raw.collection, "correction collection")?;
+    validate_identifier(&raw.attr, "correction attribute")?;
+    if raw.kind != "scale" {
+        return Err(ParseError::InvalidSpec(format!(
+            "correction `{}` has unsupported kind `{}`; expected `scale`",
+            raw.name, raw.kind
+        )));
+    }
+    if raw.attr != "pt" {
+        return Err(ParseError::InvalidSpec(format!(
+            "correction `{}` scales `{}`; this compiler slice only supports `pt`",
+            raw.name, raw.attr
+        )));
+    }
+    if !(raw.up.is_finite() && raw.down.is_finite()) {
+        return Err(ParseError::InvalidSpec(format!(
+            "shape correction `{}` has non-finite up/down scale factor",
+            raw.name
+        )));
+    }
+    Ok(ShapeCorrectionDef {
+        name: raw.name,
+        collection: raw.collection,
+        attr: raw.attr,
+        up: raw.up,
+        down: raw.down,
+    })
 }
 
 fn channel_def_from_raw(raw: RawChannel) -> Result<ChannelDef, ParseError> {
@@ -3797,6 +3914,14 @@ mod tests {
             include_str!("../examples/muon_hist_weight_systematic.toml"),
         ),
         (
+            "muon_hist_shape_nominal.toml",
+            include_str!("../examples/muon_hist_shape_nominal.toml"),
+        ),
+        (
+            "muon_hist_shape_correction.toml",
+            include_str!("../examples/muon_hist_shape_correction.toml"),
+        ),
+        (
             "muon_tagger.toml",
             include_str!("../examples/muon_tagger.toml"),
         ),
@@ -3912,6 +4037,22 @@ mod tests {
         assert_eq!(systematic.name, "muon_weight");
         assert_eq!(systematic.up, 2.0);
         assert_eq!(systematic.down, 0.5);
+    }
+
+    #[test]
+    fn parses_shape_correction_surface() {
+        let spec = AnalysisSpec::from_toml_str(include_str!(
+            "../examples/muon_hist_shape_correction.toml"
+        ))
+        .expect("parse shape correction spec");
+
+        assert_eq!(spec.shape_corrections.len(), 1);
+        let correction = &spec.shape_corrections[0];
+        assert_eq!(correction.name, "jes");
+        assert_eq!(correction.collection, "good_muon");
+        assert_eq!(correction.attr, "pt");
+        assert_eq!(correction.up, 1.05);
+        assert_eq!(correction.down, 0.95);
     }
 
     #[test]

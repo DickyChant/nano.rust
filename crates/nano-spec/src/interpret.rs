@@ -211,6 +211,15 @@ impl NumericValue {
 /// `leading(...)` output had no selected object. Model specs are deliberately
 /// unsupported in this runtime until inference is implemented for this path.
 pub fn interpret(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>> {
+    interpret_systematic(plan, event, Systematic::Nominal)
+}
+
+/// Interpret one event for a concrete systematic variation.
+pub fn interpret_systematic(
+    plan: &ResolvedPlan,
+    event: &Event,
+    systematic: Systematic,
+) -> Result<Option<OutputRow>> {
     if !plan.spec.channels.is_empty() {
         return Err(InterpretError::Unsupported(
             "use interpret_union for multi-channel union specs".to_string(),
@@ -224,7 +233,7 @@ pub fn interpret(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>
 
     let kir = crate::kir::lower_plan_to_kir(plan)?;
     crate::kir::verify(&kir)?;
-    execute_verified_kir(&kir, event)
+    execute_verified_kir(&kir, event, systematic)
 }
 
 /// Interpret one event and execute KIR histogram fills into `histograms`.
@@ -232,6 +241,16 @@ pub fn interpret_and_fill(
     plan: &ResolvedPlan,
     event: &Event,
     histograms: &mut InterpretedHistograms,
+) -> Result<Option<OutputRow>> {
+    interpret_and_fill_systematic(plan, event, histograms, Systematic::Nominal)
+}
+
+/// Interpret one event for a concrete systematic variation and fill histograms.
+pub fn interpret_and_fill_systematic(
+    plan: &ResolvedPlan,
+    event: &Event,
+    histograms: &mut InterpretedHistograms,
+    systematic: Systematic,
 ) -> Result<Option<OutputRow>> {
     if !plan.spec.channels.is_empty() {
         return Err(InterpretError::Unsupported(
@@ -246,7 +265,7 @@ pub fn interpret_and_fill(
 
     let kir = crate::kir::lower_plan_to_kir(plan)?;
     crate::kir::verify(&kir)?;
-    let mut evaluator = KirEvaluator::new(&kir, event);
+    let mut evaluator = KirEvaluator::new(&kir, event, systematic);
     evaluator.histograms = Some(&mut histograms.histograms);
     match evaluator.execute_block(&kir.block)? {
         BlockOutcome::Continue => Err(InterpretError::InvalidExpression(
@@ -254,15 +273,19 @@ pub fn interpret_and_fill(
         )),
         BlockOutcome::Return(row) => {
             if row.is_some() && !plan.spec.has_weight_systematic() {
-                evaluator.fill_nominal_histograms()?;
+                evaluator.fill_current_histograms()?;
             }
             Ok(row)
         }
     }
 }
 
-fn execute_verified_kir(program: &KirProgram, event: &Event) -> Result<Option<OutputRow>> {
-    let mut evaluator = KirEvaluator::new(program, event);
+fn execute_verified_kir(
+    program: &KirProgram,
+    event: &Event,
+    systematic: Systematic,
+) -> Result<Option<OutputRow>> {
+    let mut evaluator = KirEvaluator::new(program, event, systematic);
     match evaluator.execute_block(&program.block)? {
         BlockOutcome::Continue => Err(InterpretError::InvalidExpression(
             "KIR program completed without returning outputs".to_string(),
@@ -274,6 +297,7 @@ fn execute_verified_kir(program: &KirProgram, event: &Event) -> Result<Option<Ou
 struct KirEvaluator<'a> {
     program: &'a KirProgram,
     event: &'a Event,
+    systematic: Systematic,
     values: RuntimeValues,
     selected: SelectedObjects,
     derived: DerivedObjects,
@@ -281,10 +305,11 @@ struct KirEvaluator<'a> {
 }
 
 impl<'a> KirEvaluator<'a> {
-    fn new(program: &'a KirProgram, event: &'a Event) -> Self {
+    fn new(program: &'a KirProgram, event: &'a Event, systematic: Systematic) -> Self {
         Self {
             program,
             event,
+            systematic,
             values: HashMap::new(),
             selected: HashMap::with_capacity(program.objects.len()),
             derived: HashMap::with_capacity(program.derived_objects.len()),
@@ -410,8 +435,9 @@ impl<'a> KirEvaluator<'a> {
         Ok(())
     }
 
-    fn fill_nominal_histograms(&mut self) -> Result<()> {
-        let weight = self.weight_for(Systematic::Nominal);
+    fn fill_current_histograms(&mut self) -> Result<()> {
+        let systematic = self.systematic;
+        let weight = self.weight_for(systematic);
         for histogram in &self.program.histograms {
             let value =
                 eval_numeric_expr(&histogram.def.expr, &self.selected, &self.derived, None)?
@@ -426,7 +452,7 @@ impl<'a> KirEvaluator<'a> {
                 )));
             };
             output
-                .get_mut(Systematic::Nominal)
+                .get_mut(systematic)
                 .fill_weighted(value, weight.value());
         }
         Ok(())
@@ -435,7 +461,7 @@ impl<'a> KirEvaluator<'a> {
     fn eval_rvalue(&mut self, expr: &Rvalue) -> Result<RuntimeValue> {
         match expr {
             Rvalue::SelectObjects { object } => {
-                let selected = select_object(self.program, self.event, object)?;
+                let selected = select_object(self.program, self.event, object, self.systematic)?;
                 self.selected.insert(object.name.clone(), selected);
                 Ok(RuntimeValue::ObjectSet)
             }
@@ -488,6 +514,7 @@ impl<'a> KirEvaluator<'a> {
             .systematics
             .iter()
             .any(|systematic| matches!(systematic, crate::SystematicDef::Weight(_)))
+            || !self.program.shape_corrections.is_empty()
         {
             vec![Systematic::Nominal, Systematic::JesUp, Systematic::JesDown]
         } else {
@@ -496,17 +523,14 @@ impl<'a> KirEvaluator<'a> {
     }
 
     fn current_systematic(&self) -> Result<Systematic> {
-        self.values
+        Ok(self
+            .values
             .values()
             .find_map(|value| match value {
                 RuntimeValue::Systematic(systematic) => Some(*systematic),
                 _ => None,
             })
-            .ok_or_else(|| {
-                InterpretError::InvalidExpression(
-                    "KIR fill executed outside systematic context".to_string(),
-                )
-            })
+            .unwrap_or(self.systematic))
     }
 
     fn weight_for(&self, systematic: Systematic) -> EventWeight {
@@ -573,9 +597,17 @@ fn passes_object_cuts(
     program: &KirProgram,
     object: &KirObject,
     item: &ObjectView<'_>,
+    systematic: Systematic,
 ) -> Result<bool> {
     for cut in &object.cuts {
-        let lhs = eval_object_numeric_expr(program, &object.name, &object.source, &cut.lhs, item)?;
+        let lhs = eval_object_numeric_expr(
+            program,
+            &object.name,
+            &object.source,
+            &cut.lhs,
+            item,
+            systematic,
+        )?;
         if !compare(lhs.as_f64(), cut.op, cut.rhs.value) {
             return Ok(false);
         }
@@ -587,15 +619,23 @@ fn select_object(
     program: &KirProgram,
     event: &Event,
     object: &KirObject,
+    systematic: Systematic,
 ) -> Result<Vec<SelectedObject>> {
     let collection = event.collection(&object.source)?;
     let mut objects = Vec::new();
 
     for item in collection.iter() {
         let mut leading_values = HashMap::new();
-        if passes_object_cuts(program, object, item)? {
+        if passes_object_cuts(program, object, item, systematic)? {
             for attr in leading_attrs_for_object(program, &object.name) {
-                let value = read_object_attr(program, &object.source, item, &attr)?;
+                let value = read_object_attr(
+                    program,
+                    &object.name,
+                    &object.source,
+                    item,
+                    &attr,
+                    systematic,
+                )?;
                 leading_values.insert(attr, value);
             }
             objects.push(SelectedObject {
@@ -1104,10 +1144,11 @@ fn eval_object_numeric_expr(
     source: &str,
     expr: &Expr,
     item: &ObjectView<'_>,
+    systematic: Systematic,
 ) -> Result<NumericValue> {
     match expr {
         Expr::Attr { object, attr } if object == current_object => {
-            read_object_attr(program, source, item, attr)
+            read_object_attr(program, current_object, source, item, attr, systematic)
         }
         Expr::Attr { object, .. } => Err(InterpretError::Unsupported(format!(
             "object `{current_object}` cut references `{object}`; this slice only supports cuts on the object being selected"
@@ -1115,9 +1156,11 @@ fn eval_object_numeric_expr(
         Expr::Literal(value) => Ok(NumericValue::F64(*value)),
         Expr::Binary { op, lhs, rhs } => {
             let lhs =
-                eval_object_numeric_expr(program, current_object, source, lhs, item)?.as_f64();
+                eval_object_numeric_expr(program, current_object, source, lhs, item, systematic)?
+                    .as_f64();
             let rhs =
-                eval_object_numeric_expr(program, current_object, source, rhs, item)?.as_f64();
+                eval_object_numeric_expr(program, current_object, source, rhs, item, systematic)?
+                    .as_f64();
             Ok(NumericValue::F64(eval_arithmetic(*op, lhs, rhs)))
         }
         Expr::Abs(inner) => Ok(eval_object_numeric_expr(
@@ -1126,10 +1169,11 @@ fn eval_object_numeric_expr(
             source,
             inner,
             item,
+            systematic,
         )?
         .abs()),
         Expr::Sqrt(inner) => Ok(NumericValue::F64(
-            eval_object_numeric_expr(program, current_object, source, inner, item)?
+            eval_object_numeric_expr(program, current_object, source, inner, item, systematic)?
                 .as_f64()
                 .sqrt(),
         )),
@@ -1141,9 +1185,11 @@ fn eval_object_numeric_expr(
 
 fn read_object_attr(
     program: &KirProgram,
+    collection: &str,
     source: &str,
     item: &ObjectView<'_>,
     attr: &str,
+    systematic: Systematic,
 ) -> Result<NumericValue> {
     let branch = format!("{source}_{attr}");
     let branch_type = program
@@ -1162,13 +1208,32 @@ fn read_object_attr(
         BranchType::VecU32 => Ok(NumericValue::U64(u64::from(item.get::<u32>(attr)?))),
         BranchType::VecI64 => Ok(NumericValue::I64(item.get::<i64>(attr)?)),
         BranchType::VecU64 => Ok(NumericValue::U64(item.get::<u64>(attr)?)),
-        BranchType::VecF32 => Ok(NumericValue::F64(f64::from(item.get::<f32>(attr)?))),
+        BranchType::VecF32 => {
+            let value = item.get::<f32>(attr)?;
+            let factor = shape_factor(program, collection, attr, systematic);
+            Ok(NumericValue::F64(f64::from(
+                (f64::from(value) * factor) as f32,
+            )))
+        }
         other => Err(InterpretError::TypeMismatch {
             branch,
             branch_type: other,
             expected: "numeric vector branch",
         }),
     }
+}
+
+fn shape_factor(program: &KirProgram, collection: &str, attr: &str, systematic: Systematic) -> f64 {
+    program
+        .shape_corrections
+        .iter()
+        .find(|correction| correction.collection == collection && correction.attr == attr)
+        .map(|correction| match systematic {
+            Systematic::JesUp => correction.up,
+            Systematic::JesDown => correction.down,
+            _ => 1.0,
+        })
+        .unwrap_or(1.0)
 }
 
 fn eval_output_expr(

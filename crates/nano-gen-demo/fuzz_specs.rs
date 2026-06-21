@@ -304,6 +304,7 @@ fn generated_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
             histograms,
             weight,
             systematics,
+            shape_corrections: Vec::new(),
             channels: Vec::new(),
         },
         has_histogram,

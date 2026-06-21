@@ -41,6 +41,7 @@ pub struct KirProgram {
     pub outputs: Vec<KirOutput>,
     pub histograms: Vec<KirHistogram>,
     pub systematics: Vec<SystematicDef>,
+    pub shape_corrections: Vec<KirShapeCorrection>,
     pub weight: WeightDef,
 }
 
@@ -174,6 +175,15 @@ pub struct KirOutput {
 pub struct KirHistogram {
     pub name: String,
     pub def: HistogramDef,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KirShapeCorrection {
+    pub name: String,
+    pub collection: String,
+    pub attr: String,
+    pub up: f64,
+    pub down: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,6 +341,7 @@ pub fn lower_to_kir(core: &CoreIr) -> Result<KirProgram, KirError> {
             })
             .collect(),
         systematics: vec![SystematicDef::Nominal],
+        shape_corrections: Vec::new(),
         weight: WeightDef::default(),
     };
     verify(&program)?;
@@ -398,6 +409,18 @@ pub fn lower_plan_to_kir(plan: &ResolvedPlan) -> Result<KirProgram, KirError> {
         })
         .collect();
     program.systematics = plan.spec.systematics.clone();
+    program.shape_corrections = plan
+        .spec
+        .shape_corrections
+        .iter()
+        .map(|correction| KirShapeCorrection {
+            name: correction.name.clone(),
+            collection: correction.collection.clone(),
+            attr: correction.attr.clone(),
+            up: correction.up,
+            down: correction.down,
+        })
+        .collect();
     program.weight = plan.spec.weight.clone();
     program.read_branches = plan.read_branches.specs().to_vec();
     program.block = executable_block(&program)?;
@@ -587,9 +610,38 @@ fn output_expr_type(expr: &Expr) -> Type {
 }
 
 pub fn verify(program: &KirProgram) -> Result<(), KirError> {
+    verify_shape_corrections(program)?;
     let registry = PrimitiveRegistry::standard();
     let mut values = BTreeMap::new();
     verify_block(&program.block, &registry, &mut values)
+}
+
+fn verify_shape_corrections(program: &KirProgram) -> Result<(), KirError> {
+    for correction in &program.shape_corrections {
+        if !program
+            .objects
+            .iter()
+            .any(|object| object.name == correction.collection)
+        {
+            return Err(KirError::Lower(format!(
+                "shape correction `{}` references unknown collection `{}`",
+                correction.name, correction.collection
+            )));
+        }
+        if correction.attr != "pt" {
+            return Err(KirError::Unsupported(format!(
+                "shape correction `{}` scales `{}`; this KIR slice only supports `pt`",
+                correction.name, correction.attr
+            )));
+        }
+        if !(correction.up.is_finite() && correction.down.is_finite()) {
+            return Err(KirError::Lower(format!(
+                "shape correction `{}` has non-finite up/down scale factor",
+                correction.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn verify_block(
@@ -820,6 +872,8 @@ mod tests {
     const MUON_SPEC: &str = include_str!("../examples/muon.toml");
     const MUON_WEIGHT_SYSTEMATIC_SPEC: &str =
         include_str!("../examples/muon_hist_weight_systematic.toml");
+    const MUON_SHAPE_CORRECTION_SPEC: &str =
+        include_str!("../examples/muon_hist_shape_correction.toml");
     const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 
     #[test]
@@ -856,5 +910,20 @@ mod tests {
                 .iter()
                 .any(|stmt| matches!(stmt, Stmt::Fill { .. }))
         )));
+    }
+
+    #[test]
+    fn lowers_shape_correction_metadata_to_kir() {
+        let spec =
+            AnalysisSpec::from_toml_str(MUON_SHAPE_CORRECTION_SPEC).expect("parse muon spec");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+        let plan = crate::validate(&spec, &catalogue).expect("validate spec");
+        let kir = lower_plan_to_kir(&plan).expect("lower executable kir");
+
+        verify(&kir).expect("verify kir");
+        assert_eq!(kir.shape_corrections.len(), 1);
+        assert_eq!(kir.shape_corrections[0].collection, "good_muon");
+        assert_eq!(kir.shape_corrections[0].attr, "pt");
     }
 }
