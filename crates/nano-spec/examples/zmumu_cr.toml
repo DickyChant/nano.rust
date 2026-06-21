@@ -1,0 +1,42 @@
+[analysis]
+name = "zmumu_cr"
+year = "Run2012"
+
+[objects.good_muon]
+source = "Muon"
+cuts = [
+  "pt > 25 GeV",
+  "abs(eta) < 2.4",
+]
+
+[derived.zmumu]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "nearest_mass"
+target = "91.1876 GeV"
+
+[regions.control]
+require = [
+  "zmumu.mass >= 70 GeV",
+  "zmumu.mass <= 110 GeV",
+  "zmumu.pt > 15 GeV",
+]
+
+[[outputs]]
+name = "dimuon_mass"
+expr = "zmumu.mass"
+
+[[outputs]]
+name = "dimuon_pt"
+expr = "zmumu.pt"
+
+[[outputs]]
+name = "leading_muon_pt"
+expr = "leading(good_muon).pt"
+
+[[histogram]]
+name = "dimuon_mass"
+expr = "zmumu.mass"
+bins = 40
+range = [70.0, 110.0]

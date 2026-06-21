@@ -1,0 +1,18 @@
+[package]
+name = "nano-gen-zmumu-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build-time generated Z to dimuon control-region demo for nano.rust semantic specs"
+build = "build.rs"
+
+[dependencies]
+nano-analysis = { workspace = true }
+nano-core = { workspace = true }
+
+[build-dependencies]
+nano-spec = { workspace = true }
+
+[dev-dependencies]
+nano-spec = { workspace = true }

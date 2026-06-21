@@ -1,0 +1,31 @@
+analysis zmumu_cr year Run2012;
+
+object good_muon : Muon {
+  pt > 25 GeV;
+  abs(eta) < 2.4;
+}
+
+object zmumu : pair(good_muon) {
+  opposite_charge;
+  nearest_mass 91.1876 GeV;
+}
+
+region control {
+  zmumu.mass >= 70 GeV;
+  zmumu.mass <= 110 GeV;
+  zmumu.pt > 15 GeV;
+}
+
+define dimuon_mass = zmumu.mass;
+define dimuon_pt = zmumu.pt;
+define leading_muon_pt = leading(good_muon).pt;
+
+output dimuon_mass;
+output dimuon_pt;
+output leading_muon_pt;
+
+histogram dimuon_mass {
+  expr = zmumu.mass;
+  bins = 40;
+  range = [70.0, 110.0];
+}
