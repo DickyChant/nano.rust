@@ -5,12 +5,17 @@ const DEFAULT_EVENTS: usize = 1_000;
 
 use std::error::Error;
 
+#[cfg(all(feature = "http", feature = "plot"))]
+#[path = "plot_hist/mod.rs"]
+mod plot_hist;
+
 #[cfg(feature = "http")]
 fn main() -> Result<(), Box<dyn Error>> {
     use nano_core::{BranchSchema, BranchSpec, BranchType};
     use nano_io::events_url_chunked;
 
     let options = Options::parse()?;
+    ensure_plot_feature(&options.plot)?;
     if options.insecure {
         std::env::set_var("NANO_HTTP_INSECURE", "1");
     }
@@ -75,7 +80,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!("low_mass_2_12_gev: {}", count_range(&masses, 2.0, 12.0));
     println!("z_window_60_120_gev: {}", count_range(&masses, 60.0, 120.0));
-    print_histogram(&masses);
+    write_or_print_mass_histogram(&options.plot, &masses)?;
     println!("bytes_fetched: {} / {}", events.bytes_fetched(), file_size);
 
     Ok(())
@@ -92,6 +97,7 @@ struct Options {
     url: String,
     events: usize,
     insecure: bool,
+    plot: Option<String>,
 }
 
 #[cfg(feature = "http")]
@@ -100,6 +106,7 @@ impl Options {
         let mut url = DEFAULT_URL.to_string();
         let mut events = DEFAULT_EVENTS;
         let mut insecure = env_flag("NANO_HTTP_INSECURE");
+        let mut plot = None;
         let mut positional = Vec::new();
 
         let mut args = std::env::args().skip(1);
@@ -114,9 +121,12 @@ impl Options {
                         .map_err(|err| format!("invalid event count: {err}"))?;
                     events = value;
                 }
+                "--plot" => {
+                    plot = Some(args.next().ok_or("missing value after --plot")?);
+                }
                 "-h" | "--help" => {
                     return Err(format!(
-                        "usage: dimuon_opendata [url] [n] [--events n] [--insecure]\ndefault URL: {DEFAULT_URL}"
+                        "usage: dimuon_opendata [url] [n] [--events n] [--insecure] [--plot path]\ndefault URL: {DEFAULT_URL}"
                     )
                     .into());
                 }
@@ -149,8 +159,63 @@ impl Options {
             url,
             events,
             insecure,
+            plot,
         })
     }
+}
+
+#[cfg(all(feature = "http", not(feature = "plot")))]
+fn ensure_plot_feature(plot: &Option<String>) -> Result<(), Box<dyn Error>> {
+    if plot.is_some() {
+        Err("--plot requires plotting support; rebuild with --features plot".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "http", feature = "plot"))]
+fn ensure_plot_feature(_plot: &Option<String>) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+#[cfg(all(feature = "http", feature = "plot"))]
+fn write_or_print_mass_histogram(
+    plot: &Option<String>,
+    masses: &[f64],
+) -> Result<(), Box<dyn Error>> {
+    if let Some(path) = plot.as_deref() {
+        write_mass_plot(path, masses)?;
+        println!("mass_plot: {path}");
+    } else {
+        print_histogram(masses);
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "http", not(feature = "plot")))]
+fn write_or_print_mass_histogram(
+    plot: &Option<String>,
+    masses: &[f64],
+) -> Result<(), Box<dyn Error>> {
+    let _ = plot;
+    print_histogram(masses);
+    Ok(())
+}
+
+#[cfg(all(feature = "http", feature = "plot"))]
+fn write_mass_plot(path: &str, masses: &[f64]) -> Result<(), Box<dyn Error>> {
+    plot_hist::write_histogram(
+        path,
+        masses,
+        plot_hist::HistogramSpec {
+            title: "Dimuon invariant mass (CMS Open Data)",
+            x_label: "m(mu+mu-) [GeV]",
+            y_label: "Candidates",
+            bins: 10,
+            range: (0.0, 200.0),
+            color: "#2b6cb0",
+        },
+    )
 }
 
 #[cfg(feature = "http")]

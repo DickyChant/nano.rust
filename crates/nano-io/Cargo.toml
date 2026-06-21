@@ -7,12 +7,17 @@ repository.workspace = true
 description = "NanoAOD ROOT input reading and skim output writing for nano.rust"
 
 [dependencies]
+kuva = { version = "0.1", optional = true, default-features = false }
 nano-core = { workspace = true }
 nano-rootio = { workspace = true }
 
 [features]
 default = []
 http = ["nano-rootio/http"]
+# To test unreleased kuva fixes, repoint `kuva` to a git fork here or with
+# a workspace-level [patch.crates-io] entry.
+plot = ["dep:kuva"]
+plot-png = ["plot", "kuva/png"]
 
 [dev-dependencies]
 nano-producers = { workspace = true }

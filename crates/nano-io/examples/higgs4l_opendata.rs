@@ -8,9 +8,14 @@ const Z_MASS: f64 = 91.2;
 
 use std::error::Error;
 
+#[cfg(all(feature = "http", feature = "plot"))]
+#[path = "plot_hist/mod.rs"]
+mod plot_hist;
+
 #[cfg(feature = "http")]
 fn main() -> Result<(), Box<dyn Error>> {
     let options = Options::parse()?;
+    ensure_plot_feature(&options.plot)?;
     if options.insecure {
         std::env::set_var("NANO_HTTP_INSECURE", "1");
     }
@@ -25,7 +30,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         report.count_2e2mu,
         report.total_selected()
     );
-    print_histogram(&report.h_masses);
+    write_or_print_mass_histogram(&options.plot, &report.h_masses)?;
     if let Some(path) = options.dump_selected.as_deref() {
         write_selected_dump(path, &report.selected)?;
         println!("selected_dump: {}", path);
@@ -49,6 +54,7 @@ struct Options {
     events: Option<usize>,
     insecure: bool,
     dump_selected: Option<String>,
+    plot: Option<String>,
 }
 
 #[cfg(feature = "http")]
@@ -58,6 +64,7 @@ impl Options {
         let mut events = None;
         let mut insecure = env_flag("NANO_HTTP_INSECURE");
         let mut dump_selected = None;
+        let mut plot = None;
         let mut positional = Vec::new();
 
         let mut args = std::env::args().skip(1);
@@ -75,9 +82,12 @@ impl Options {
                 "--dump-selected" => {
                     dump_selected = Some(args.next().ok_or("missing value after --dump-selected")?);
                 }
+                "--plot" => {
+                    plot = Some(args.next().ok_or("missing value after --plot")?);
+                }
                 "-h" | "--help" => {
                     return Err(format!(
-                        "usage: higgs4l_opendata [url-or-file] [n] [--events n] [--insecure] [--dump-selected path]\ndefault URL: {DEFAULT_URL}"
+                        "usage: higgs4l_opendata [url-or-file] [n] [--events n] [--insecure] [--dump-selected path] [--plot path]\ndefault URL: {DEFAULT_URL}"
                     )
                     .into());
                 }
@@ -104,8 +114,63 @@ impl Options {
             events,
             insecure,
             dump_selected,
+            plot,
         })
     }
+}
+
+#[cfg(all(feature = "http", not(feature = "plot")))]
+fn ensure_plot_feature(plot: &Option<String>) -> Result<(), Box<dyn Error>> {
+    if plot.is_some() {
+        Err("--plot requires plotting support; rebuild with --features plot".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "http", feature = "plot"))]
+fn ensure_plot_feature(_plot: &Option<String>) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+#[cfg(all(feature = "http", feature = "plot"))]
+fn write_or_print_mass_histogram(
+    plot: &Option<String>,
+    masses: &[f64],
+) -> Result<(), Box<dyn Error>> {
+    if let Some(path) = plot.as_deref() {
+        write_mass_plot(path, masses)?;
+        println!("h_mass_plot: {path}");
+    } else {
+        print_histogram(masses);
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "http", not(feature = "plot")))]
+fn write_or_print_mass_histogram(
+    plot: &Option<String>,
+    masses: &[f64],
+) -> Result<(), Box<dyn Error>> {
+    let _ = plot;
+    print_histogram(masses);
+    Ok(())
+}
+
+#[cfg(all(feature = "http", feature = "plot"))]
+fn write_mass_plot(path: &str, masses: &[f64]) -> Result<(), Box<dyn Error>> {
+    plot_hist::write_histogram(
+        path,
+        masses,
+        plot_hist::HistogramSpec {
+            title: "Higgs -> ZZ -> 4l (CMS Open Data)",
+            x_label: "m(4l) [GeV]",
+            y_label: "Candidates",
+            bins: histogram_bins().len(),
+            range: (70.0, 180.0),
+            color: "#9b2c2c",
+        },
+    )
 }
 
 #[cfg(feature = "http")]
