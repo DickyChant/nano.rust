@@ -42,6 +42,7 @@
   <section class="status">
     <h2>What works today</h2>
     <ul>
+      <li><strong>Validated on real physics</strong> — reproduces ROOT's Higgs→ZZ→4ℓ analysis (df103, three channels) on <strong>CMS Open Data</strong>, read remotely on-demand in pure Rust, and the full stacked discovery plot is <strong>bit-identical to ROOT</strong> (the dimuon spectrum too). <a href="blog/2026-06-21-higgs-opendata.html">See the post →</a></li>
       <li><strong>Semantic compiler</strong> — a physics spec (TOML/YAML) is statically validated against a NanoAOD catalogue (missing branch, wrong type, missing unit, undefined object are rejected) and <strong>generates</strong> the typed event loop; codegen is proven equal to the hand-written reference in CI.</li>
       <li><strong>Compile-enforced state machine</strong> — <code>Raw → Baseline → Scored&lt;M&gt; → InRegion&lt;R&gt; → Weighted&lt;R&gt;</code>; wrong-stage fills, score-before-inference, and unit mismatches are <em>compile errors</em> (proven by compile-fail tests).</li>
       <li><strong>Pure-Rust ROOT I/O</strong> — reads &amp; writes <code>TTree</code> (zlib/LZMA/lz4/zstd), reads real CMS NanoAODv9 locally and <strong>remotely on-demand</strong> over HTTPS byte-range; bounded-memory streaming; value-validated against uproot in CI.</li>
@@ -49,6 +50,13 @@
       <li><strong>Agent action space</strong> — the same verified operations exposed over a <code>nano</code> CLI and an MCP server, so an orchestrating agent drives validate / derive / inspect / codegen through typed, compiler-gated tools.</li>
       <li><strong>Parallelism for free</strong> — the verified per-event kernel runs serial or chunk-parallel from one source; ~8× on 16 cores, bit-identical results.</li>
     </ul>
+  </section>
+
+  <section class="figure">
+    <a href="blog/2026-06-21-higgs-opendata.html">
+      <img src="plots/higgs_stack.png" alt="CMS Higgs to ZZ to 4 leptons discovery plot reconstructed by nano.rust from open data: ZZ background, m_H=125 signal, and 2012 data" style="max-width:100%;border:1px solid var(--border);border-radius:12px;" />
+    </a>
+    <p class="tag">The CMS Higgs→ZZ→4ℓ discovery plot, reconstructed by nano.rust from CMS Open Data and bit-identical to ROOT's df103 — signal + ZZ background stacked, 2012 data overlaid (11.6&nbsp;fb⁻¹).</p>
   </section>
 </main>
 

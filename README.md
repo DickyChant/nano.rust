@@ -29,6 +29,11 @@ orchestration. Full rationale: [`docs/vision.md`](docs/vision.md).
 
 ## What works today
 
+- **Validated on a real analysis** — reproduces ROOT's **Higgs→ZZ→4ℓ** (df103,
+  three channels: 4μ/4e/2e2μ) on **CMS Open Data**, read remotely on-demand in
+  pure Rust. The full stacked discovery plot (signal + ZZ background + 2012 data,
+  11.6 fb⁻¹) is **bit-identical to ROOT** (and the df102 dimuon spectrum). Plots
+  are in [`docs/site/plots/`](docs/site/plots/); see the blog.
 - **Owned, pure-Rust ROOT I/O** (`nano-rootio`, no ROOT/C++ dependency):
   - reads real **CMS NanoAODv9** — scalars, jagged collections, windowed reads,
     **bounded-memory streaming** (~3 MB to stream a skim of any-size file);
@@ -38,7 +43,7 @@ orchestration. Full rationale: [`docs/vision.md`](docs/vision.md).
   - validated A/B against the upstream reader and cross-checked against
     **`uproot`** in CI, both read and write.
 - **Typed event model** (`nano-core`): collections, attributes, the
-  `Prefix_attr` grouping rule, `Rc`-shared per-event columns.
+  `Prefix_attr` grouping rule, `Arc`-shared per-event columns (Send + Sync).
 - **Compile-enforced state machine** (`nano-analysis`):
   `Ev<Raw> → Baseline → InRegion<R> → Weighted<R>`; filling a histogram
   *requires* a `Weighted<R>`, so wrong-stage / wrong-region / unweighted fills are
