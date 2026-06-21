@@ -30,6 +30,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
         ("selection_sip3d.toml", "generated_selection_sip3d.rs"),
         ("selection_pair_dr.toml", "generated_selection_pair_dr.rs"),
+        ("muon_hist_nominal.toml", "generated_muon_hist_nominal.rs"),
+        (
+            "muon_hist_weight_systematic.toml",
+            "generated_muon_hist_weight_systematic.rs",
+        ),
     ] {
         let spec_path = repo_root.join("crates/nano-spec/examples").join(spec_file);
         println!("cargo:rerun-if-changed={}", spec_path.display());

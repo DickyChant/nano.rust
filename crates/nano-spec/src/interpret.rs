@@ -4,16 +4,17 @@
 //! object cuts, region requirements, and output expressions directly over an
 //! event instead of requiring a compiled producer.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 
+use nano_analysis::{EventWeight, HistSet1D, Systematic};
 use nano_core::{BranchType, Event, ObjectView};
 
-use crate::kir::{Block, KirObject, KirProgram, Rvalue, Stmt, ValueId};
+use crate::kir::{Block, ForEachAxis, KirObject, KirProgram, Rvalue, Stmt, ValueId};
 use crate::{
-    ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ObjectCandidateDef,
-    ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
+    ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ObjectCandidateDef, ObjectPairDef,
+    PairConstraint, PairSelection, ResolvedPlan,
 };
 
 /// One typed output cell produced by the interpreter.
@@ -49,6 +50,33 @@ impl OutputRow {
 pub struct ChannelOutputRow {
     pub channel: String,
     pub row: OutputRow,
+}
+
+/// Interpreter-owned histogram outputs keyed by histogram name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterpretedHistograms {
+    histograms: BTreeMap<String, HistSet1D>,
+}
+
+impl InterpretedHistograms {
+    pub fn new(plan: &ResolvedPlan) -> Self {
+        let histograms = plan
+            .spec
+            .histograms
+            .iter()
+            .map(|histogram| {
+                (
+                    histogram.name.clone(),
+                    HistSet1D::new(histogram.bins, histogram.range[0], histogram.range[1]),
+                )
+            })
+            .collect();
+        Self { histograms }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&HistSet1D> {
+        self.histograms.get(name)
+    }
 }
 
 /// Errors reported while interpreting a validated plan.
@@ -147,6 +175,10 @@ enum RuntimeValue {
     Candidate,
     Bool(bool),
     Output(Option<Value>),
+    Histogram(String),
+    Systematic(Systematic),
+    Weight(EventWeight),
+    Numeric(f64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,6 +227,35 @@ pub fn interpret(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>
     execute_verified_kir(&kir, event)
 }
 
+/// Interpret one event and execute KIR histogram fills into `histograms`.
+pub fn interpret_and_fill(
+    plan: &ResolvedPlan,
+    event: &Event,
+    histograms: &mut InterpretedHistograms,
+) -> Result<Option<OutputRow>> {
+    if !plan.spec.channels.is_empty() {
+        return Err(InterpretError::Unsupported(
+            "interpret_and_fill currently supports flat specs".to_string(),
+        ));
+    }
+    if !plan.spec.models.is_empty() {
+        return Err(InterpretError::Unsupported(
+            "models not yet interpreted; use the compiled path".to_string(),
+        ));
+    }
+
+    let kir = crate::kir::lower_plan_to_kir(plan)?;
+    crate::kir::verify(&kir)?;
+    let mut evaluator = KirEvaluator::new(&kir, event);
+    evaluator.histograms = Some(&mut histograms.histograms);
+    match evaluator.execute_block(&kir.block)? {
+        BlockOutcome::Continue => Err(InterpretError::InvalidExpression(
+            "KIR program completed without returning outputs".to_string(),
+        )),
+        BlockOutcome::Return(row) => Ok(row),
+    }
+}
+
 fn execute_verified_kir(program: &KirProgram, event: &Event) -> Result<Option<OutputRow>> {
     let mut evaluator = KirEvaluator::new(program, event);
     match evaluator.execute_block(&program.block)? {
@@ -211,6 +272,7 @@ struct KirEvaluator<'a> {
     values: RuntimeValues,
     selected: SelectedObjects,
     derived: DerivedObjects,
+    histograms: Option<&'a mut BTreeMap<String, HistSet1D>>,
 }
 
 impl<'a> KirEvaluator<'a> {
@@ -221,6 +283,7 @@ impl<'a> KirEvaluator<'a> {
             values: HashMap::new(),
             selected: HashMap::with_capacity(program.objects.len()),
             derived: HashMap::with_capacity(program.derived_objects.len()),
+            histograms: None,
         }
     }
 
@@ -260,14 +323,86 @@ impl<'a> KirEvaluator<'a> {
                     }
                     return Ok(BlockOutcome::Return(Some(OutputRow::new(row))));
                 }
-                Stmt::ForEach { .. } | Stmt::If { .. } | Stmt::Fill { .. } => {
+                Stmt::ForEach { axis, item, body } => {
+                    self.execute_for_each(*axis, item.id, body)?;
+                }
+                Stmt::Fill {
+                    histogram,
+                    value,
+                    weight,
+                } => {
+                    self.execute_fill(*histogram, *value, *weight)?;
+                }
+                Stmt::If { .. } => {
                     return Err(InterpretError::Unsupported(
-                        "this interpreter move executes flat analysis KIR; loop/fill control is reserved for the emitter move".to_string(),
+                        "KIR if control is reserved for a later interpreter move".to_string(),
                     ));
                 }
             }
         }
         Ok(BlockOutcome::Continue)
+    }
+
+    fn execute_for_each(&mut self, axis: ForEachAxis, item: ValueId, body: &Block) -> Result<()> {
+        match axis {
+            ForEachAxis::Systematic => {
+                for systematic in self.active_systematics() {
+                    self.values
+                        .insert(item, RuntimeValue::Systematic(systematic));
+                    match self.execute_block(body)? {
+                        BlockOutcome::Continue => {}
+                        BlockOutcome::Return(_) => {
+                            return Err(InterpretError::InvalidExpression(
+                                "KIR systematic loop body returned unexpectedly".to_string(),
+                            ));
+                        }
+                    }
+                }
+                self.values.remove(&item);
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_fill(
+        &mut self,
+        histogram: ValueId,
+        value: ValueId,
+        weight: Option<ValueId>,
+    ) -> Result<()> {
+        let RuntimeValue::Histogram(histogram) = self.value(histogram)? else {
+            return Err(InterpretError::InvalidExpression(format!(
+                "KIR fill expected histogram value {histogram:?}"
+            )));
+        };
+        let RuntimeValue::Numeric(value) = self.value(value)? else {
+            return Err(InterpretError::InvalidExpression(format!(
+                "KIR fill expected numeric value {value:?}"
+            )));
+        };
+        let Some(weight) = weight else {
+            return Err(InterpretError::InvalidExpression(
+                "KIR fill requires a weight".to_string(),
+            ));
+        };
+        let RuntimeValue::Weight(weight) = self.value(weight)? else {
+            return Err(InterpretError::InvalidExpression(format!(
+                "KIR fill expected weight value {weight:?}"
+            )));
+        };
+        let systematic = self.current_systematic()?;
+        let Some(histograms) = &mut self.histograms else {
+            return Ok(());
+        };
+        let Some(histogram) = histograms.get_mut(&histogram) else {
+            return Err(InterpretError::InvalidExpression(format!(
+                "histogram `{histogram}` was not initialized"
+            )));
+        };
+        histogram
+            .get_mut(systematic)
+            .fill_weighted(value, weight.value());
+        Ok(())
     }
 
     fn eval_rvalue(&mut self, expr: &Rvalue) -> Result<RuntimeValue> {
@@ -283,8 +418,7 @@ impl<'a> KirEvaluator<'a> {
                 Ok(RuntimeValue::Candidate)
             }
             Rvalue::Requirement { requirement } => {
-                let lhs =
-                    eval_numeric_expr(&requirement.lhs, &self.selected, &self.derived, None)?;
+                let lhs = eval_numeric_expr(&requirement.lhs, &self.selected, &self.derived, None)?;
                 Ok(RuntimeValue::Bool(compare(
                     lhs.as_f64(),
                     requirement.op,
@@ -296,6 +430,18 @@ impl<'a> KirEvaluator<'a> {
                 &self.selected,
                 &self.derived,
             )?)),
+            Rvalue::Histogram { histogram } => Ok(RuntimeValue::Histogram(histogram.name.clone())),
+            Rvalue::HistogramValue { expr, .. } => Ok(RuntimeValue::Numeric(
+                eval_numeric_expr(expr, &self.selected, &self.derived, None)?.as_f64(),
+            )),
+            Rvalue::Weight { systematic } => {
+                let RuntimeValue::Systematic(systematic) = self.value(*systematic)? else {
+                    return Err(InterpretError::InvalidExpression(format!(
+                        "KIR weight expected systematic value {systematic:?}"
+                    )));
+                };
+                Ok(RuntimeValue::Weight(self.weight_for(systematic)))
+            }
             Rvalue::Literal(_)
             | Rvalue::Quantity(_)
             | Rvalue::ObjectRef(_)
@@ -307,6 +453,54 @@ impl<'a> KirEvaluator<'a> {
                 "KIR rvalue `{expr:?}` is not part of flat executable interpretation yet"
             ))),
         }
+    }
+
+    fn active_systematics(&self) -> Vec<Systematic> {
+        if self
+            .program
+            .systematics
+            .iter()
+            .any(|systematic| matches!(systematic, crate::SystematicDef::Weight(_)))
+        {
+            vec![Systematic::Nominal, Systematic::JesUp, Systematic::JesDown]
+        } else {
+            vec![Systematic::Nominal]
+        }
+    }
+
+    fn current_systematic(&self) -> Result<Systematic> {
+        self.values
+            .values()
+            .find_map(|value| match value {
+                RuntimeValue::Systematic(systematic) => Some(*systematic),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                InterpretError::InvalidExpression(
+                    "KIR fill executed outside systematic context".to_string(),
+                )
+            })
+    }
+
+    fn weight_for(&self, systematic: Systematic) -> EventWeight {
+        let mut weight = self
+            .program
+            .systematics
+            .iter()
+            .find_map(|declared| match declared {
+                crate::SystematicDef::Weight(systematic) => Some(systematic),
+                _ => None,
+            })
+            .map(|declared| match systematic {
+                Systematic::JesUp => EventWeight::nominal().times(declared.up),
+                Systematic::JesDown => EventWeight::nominal().times(declared.down),
+                _ => EventWeight::nominal(),
+            })
+            .unwrap_or_else(EventWeight::nominal);
+        for factor in &self.program.weight.nominal {
+            weight = weight.times(*factor);
+        }
+        weight
     }
 
     fn value(&self, id: ValueId) -> Result<RuntimeValue> {

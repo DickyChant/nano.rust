@@ -409,7 +409,8 @@ impl Hist1D {
         }
     }
 
-    fn fill_weighted(&mut self, value: f64, weight: f64) {
+    /// Fill one value with an explicit numeric weight.
+    pub fn fill_weighted(&mut self, value: f64, weight: f64) {
         if value < self.low {
             self.underflow += weight;
         } else if value >= self.high {
@@ -419,6 +420,100 @@ impl Hist1D {
             let bin = ((value - self.low) / width * self.bins.len() as f64) as usize;
             self.bins[bin] += weight;
         }
+    }
+}
+
+/// One fixed-bin histogram for each member of the closed systematic axis.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistSet1D {
+    nominal: Hist1D,
+    jes_up: Hist1D,
+    jes_down: Hist1D,
+    jer_up: Hist1D,
+    jer_down: Hist1D,
+}
+
+impl HistSet1D {
+    /// Create identical fixed-bin histograms for every systematic variation.
+    pub fn new(bins: usize, low: f64, high: f64) -> Self {
+        Self {
+            nominal: Hist1D::new(bins, low, high),
+            jes_up: Hist1D::new(bins, low, high),
+            jes_down: Hist1D::new(bins, low, high),
+            jer_up: Hist1D::new(bins, low, high),
+            jer_down: Hist1D::new(bins, low, high),
+        }
+    }
+
+    /// Read one variation histogram.
+    pub fn get(&self, systematic: Systematic) -> &Hist1D {
+        struct Getter<'a>(&'a HistSet1D);
+
+        impl<'a> SystematicVisitor for Getter<'a> {
+            type Output = &'a Hist1D;
+
+            fn nominal(self) -> Self::Output {
+                &self.0.nominal
+            }
+
+            fn jes_up(self) -> Self::Output {
+                &self.0.jes_up
+            }
+
+            fn jes_down(self) -> Self::Output {
+                &self.0.jes_down
+            }
+
+            fn jer_up(self) -> Self::Output {
+                &self.0.jer_up
+            }
+
+            fn jer_down(self) -> Self::Output {
+                &self.0.jer_down
+            }
+        }
+
+        systematic.visit(Getter(self))
+    }
+
+    /// Mutably read one variation histogram.
+    pub fn get_mut(&mut self, systematic: Systematic) -> &mut Hist1D {
+        struct Getter<'a>(&'a mut HistSet1D);
+
+        impl<'a> SystematicVisitor for Getter<'a> {
+            type Output = &'a mut Hist1D;
+
+            fn nominal(self) -> Self::Output {
+                &mut self.0.nominal
+            }
+
+            fn jes_up(self) -> Self::Output {
+                &mut self.0.jes_up
+            }
+
+            fn jes_down(self) -> Self::Output {
+                &mut self.0.jes_down
+            }
+
+            fn jer_up(self) -> Self::Output {
+                &mut self.0.jer_up
+            }
+
+            fn jer_down(self) -> Self::Output {
+                &mut self.0.jer_down
+            }
+        }
+
+        systematic.visit(Getter(self))
+    }
+
+    /// Add another histogram set with identical binning into this one.
+    pub fn add(&mut self, other: &Self) {
+        self.nominal.add(&other.nominal);
+        self.jes_up.add(&other.jes_up);
+        self.jes_down.add(&other.jes_down);
+        self.jer_up.add(&other.jer_up);
+        self.jer_down.add(&other.jer_down);
     }
 }
 
@@ -496,6 +591,17 @@ pub fn fill<R: Region, S: SystematicVariation>(
     value: f64,
 ) {
     hist.fill_weighted(value, event.weight.value());
+}
+
+/// Fill the histogram corresponding to the weighted event's systematic variation.
+pub fn fill_set<R: Region, S: SystematicVariation>(
+    histograms: &mut HistSet1D,
+    event: &Weighted<'_, R, S>,
+    value: f64,
+) {
+    histograms
+        .get_mut(event.systematic())
+        .fill_weighted(value, event.weight.value());
 }
 
 /// Energy unit newtype.

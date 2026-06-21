@@ -35,6 +35,7 @@ pub enum Type {
     Candidate,
     Event,
     Weight,
+    Systematic,
     Tensor,
     Histogram,
 }
@@ -49,6 +50,7 @@ impl Type {
             | Self::Candidate
             | Self::Event
             | Self::Weight
+            | Self::Systematic
             | Self::Tensor
             | Self::Histogram => None,
         }

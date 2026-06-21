@@ -55,6 +55,25 @@ impl AnalysisSpec {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ParseError> {
         load_analysis_spec(path)
     }
+
+    /// The declared weight systematic, if this spec requests variation fan-out.
+    pub fn weight_systematic(&self) -> Option<&WeightSystematicDef> {
+        self.systematics
+            .iter()
+            .find_map(|systematic| match systematic {
+                SystematicDef::Weight(def) => Some(def),
+                SystematicDef::Nominal
+                | SystematicDef::JesUp
+                | SystematicDef::JesDown
+                | SystematicDef::JerUp
+                | SystematicDef::JerDown => None,
+            })
+    }
+
+    /// Whether histogram fills should fan out over nominal/up/down weights.
+    pub fn has_weight_systematic(&self) -> bool {
+        self.weight_systematic().is_some()
+    }
 }
 
 impl<'de> serde::Deserialize<'de> for AnalysisSpec {
@@ -372,13 +391,22 @@ pub struct WeightDef {
 }
 
 /// Systematic variations requested by a spec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SystematicDef {
     Nominal,
     JesUp,
     JesDown,
     JerUp,
     JerDown,
+    Weight(WeightSystematicDef),
+}
+
+/// A two-sided normalization/weight systematic.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WeightSystematicDef {
+    pub name: String,
+    pub up: f64,
+    pub down: f64,
 }
 
 /// One channel inside a multi-channel union spec.
@@ -493,14 +521,26 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
     let outputs = output_defs_from_raw(&raw.outputs)?;
     let histograms = histogram_defs_from_raw(&raw.histograms)?;
     let weight = raw.weight.map(weight_def_from_raw).unwrap_or_default();
-    let systematics = raw
+    let mut systematics = raw
         .systematics
         .iter()
         .map(|systematic| systematic_def_from_raw(systematic))
         .collect::<Result<Vec<_>, _>>()?;
+    for systematic in raw.systematic {
+        systematics.push(weight_systematic_def_from_raw(systematic)?);
+    }
     let systematics = if systematics.is_empty() {
         vec![SystematicDef::Nominal]
     } else {
+        if systematics
+            .iter()
+            .any(|systematic| matches!(systematic, SystematicDef::Weight(_)))
+            && !systematics
+                .iter()
+                .any(|systematic| matches!(systematic, SystematicDef::Nominal))
+        {
+            systematics.insert(0, SystematicDef::Nominal);
+        }
         systematics
     };
     let channels = raw
@@ -1254,6 +1294,7 @@ fn validate_histogram(histogram: &HistogramDef, ctx: &mut ValidationContext<'_>)
     }
     match validate_expr(&histogram.expr, &context, ctx) {
         Some(ExprType::Numeric(_)) => {}
+        Some(ExprType::Count) => {}
         Some(_) => ctx.errors.push(SpecError::InvalidExpression {
             context,
             detail: "histogram expression must be numeric".to_string(),
@@ -2426,6 +2467,22 @@ fn validate_raw_analysis_spec(raw: &RawAnalysisSpec) -> Result<(), ParseError> {
         validate_identifier(name, "regions")?;
     }
 
+    let mut weight_systematics = BTreeSet::new();
+    for systematic in &raw.systematic {
+        validate_identifier(&systematic.name, "systematic name")?;
+        if !weight_systematics.insert(systematic.name.as_str()) {
+            return Err(ParseError::InvalidSpec(format!(
+                "duplicate systematic `{}`",
+                systematic.name
+            )));
+        }
+    }
+    if raw.systematic.len() > 1 {
+        return Err(ParseError::InvalidSpec(
+            "this compiler slice supports at most one weight systematic".to_string(),
+        ));
+    }
+
     let mut channel_names = BTreeSet::new();
     for channel in &raw.channels {
         validate_identifier(&channel.name, "channel name")?;
@@ -3038,6 +3095,8 @@ struct RawAnalysisSpec {
     weight: Option<RawWeight>,
     #[serde(default)]
     systematics: Vec<String>,
+    #[serde(default, rename = "systematic")]
+    systematic: Vec<RawSystematic>,
     #[serde(default, rename = "channel")]
     channels: Vec<RawChannel>,
 }
@@ -3123,6 +3182,14 @@ struct RawHistogram {
 struct RawWeight {
     #[serde(default)]
     nominal: Vec<f64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawSystematic {
+    name: String,
+    kind: String,
+    up: f64,
+    down: f64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3227,6 +3294,27 @@ fn systematic_def_from_raw(value: &str) -> Result<SystematicDef, ParseError> {
             "unsupported systematic `{other}`"
         ))),
     }
+}
+
+fn weight_systematic_def_from_raw(raw: RawSystematic) -> Result<SystematicDef, ParseError> {
+    validate_identifier(&raw.name, "systematic name")?;
+    if raw.kind != "weight" {
+        return Err(ParseError::InvalidSpec(format!(
+            "systematic `{}` has unsupported kind `{}`; expected `weight`",
+            raw.name, raw.kind
+        )));
+    }
+    if !(raw.up.is_finite() && raw.down.is_finite()) {
+        return Err(ParseError::InvalidSpec(format!(
+            "weight systematic `{}` has non-finite up/down multiplier",
+            raw.name
+        )));
+    }
+    Ok(SystematicDef::Weight(WeightSystematicDef {
+        name: raw.name,
+        up: raw.up,
+        down: raw.down,
+    }))
 }
 
 fn channel_def_from_raw(raw: RawChannel) -> Result<ChannelDef, ParseError> {
@@ -3701,6 +3789,14 @@ mod tests {
         ),
         ("muon.toml", include_str!("../examples/muon.toml")),
         (
+            "muon_hist_nominal.toml",
+            include_str!("../examples/muon_hist_nominal.toml"),
+        ),
+        (
+            "muon_hist_weight_systematic.toml",
+            include_str!("../examples/muon_hist_weight_systematic.toml"),
+        ),
+        (
             "muon_tagger.toml",
             include_str!("../examples/muon_tagger.toml"),
         ),
@@ -3802,6 +3898,20 @@ mod tests {
                 ("Muon_pt", BranchType::VecF32),
             ]
         );
+    }
+
+    #[test]
+    fn parses_weight_systematic_surface() {
+        let spec = AnalysisSpec::from_toml_str(include_str!(
+            "../examples/muon_hist_weight_systematic.toml"
+        ))
+        .expect("parse weight systematic spec");
+
+        assert_eq!(spec.systematics.len(), 2);
+        let systematic = spec.weight_systematic().expect("weight systematic");
+        assert_eq!(systematic.name, "muon_weight");
+        assert_eq!(systematic.up, 2.0);
+        assert_eq!(systematic.down, 0.5);
     }
 
     #[test]

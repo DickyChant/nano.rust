@@ -12,12 +12,10 @@ use std::fmt;
 
 use nano_core::{BranchSpec, BranchType};
 
-use crate::core::{
-    self, CoreIr, ExprKind, PrimitiveArg, PrimitiveError, PrimitiveRegistry, Type,
-};
+use crate::core::{self, CoreIr, ExprKind, PrimitiveArg, PrimitiveError, PrimitiveRegistry, Type};
 use crate::{
-    Catalogue, CatalogueBranch, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr,
-    HistogramDef, Quantity, ResolvedPlan, SpecError,
+    Catalogue, CatalogueBranch, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, HistogramDef,
+    Quantity, ResolvedPlan, SpecError, SystematicDef, WeightDef,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -42,6 +40,8 @@ pub struct KirProgram {
     pub regions: Vec<KirRegion>,
     pub outputs: Vec<KirOutput>,
     pub histograms: Vec<KirHistogram>,
+    pub systematics: Vec<SystematicDef>,
+    pub weight: WeightDef,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -56,7 +56,7 @@ pub enum Stmt {
         expr: Rvalue,
     },
     ForEach {
-        collection: ValueId,
+        axis: ForEachAxis,
         item: TypedValue,
         body: Block,
     },
@@ -115,6 +115,21 @@ pub enum Rvalue {
         expr: crate::Expr,
         ty: Type,
     },
+    Histogram {
+        histogram: KirHistogram,
+    },
+    HistogramValue {
+        expr: crate::Expr,
+        ty: Type,
+    },
+    Weight {
+        systematic: ValueId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForEachAxis {
+    Systematic,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -315,6 +330,8 @@ pub fn lower_to_kir(core: &CoreIr) -> Result<KirProgram, KirError> {
                 },
             })
             .collect(),
+        systematics: vec![SystematicDef::Nominal],
+        weight: WeightDef::default(),
     };
     verify(&program)?;
     Ok(program)
@@ -379,6 +396,8 @@ pub(crate) fn lower_plan_to_kir(plan: &ResolvedPlan) -> Result<KirProgram, KirEr
             def: histogram.clone(),
         })
         .collect();
+    program.systematics = plan.spec.systematics.clone();
+    program.weight = plan.spec.weight.clone();
     program.read_branches = plan.read_branches.specs().to_vec();
     program.block = executable_block(&program)?;
     verify(&program)?;
@@ -453,6 +472,59 @@ fn executable_block(program: &KirProgram) -> Result<Block, KirError> {
             value,
         });
     }
+
+    if has_weight_systematic(program) && !program.histograms.is_empty() {
+        let systematic = ValueId(next_value);
+        next_value += 1;
+        let mut body = Block::default();
+        let weight = ValueId(next_value);
+        next_value += 1;
+        body.stmts.push(Stmt::Let {
+            value: TypedValue {
+                id: weight,
+                ty: Type::Weight,
+            },
+            expr: Rvalue::Weight { systematic },
+        });
+        for histogram in &program.histograms {
+            let histogram_value = ValueId(next_value);
+            next_value += 1;
+            block.stmts.push(Stmt::Let {
+                value: TypedValue {
+                    id: histogram_value,
+                    ty: Type::Histogram,
+                },
+                expr: Rvalue::Histogram {
+                    histogram: histogram.clone(),
+                },
+            });
+            let fill_value = ValueId(next_value);
+            next_value += 1;
+            body.stmts.push(Stmt::Let {
+                value: TypedValue {
+                    id: fill_value,
+                    ty: output_expr_type(&histogram.def.expr),
+                },
+                expr: Rvalue::HistogramValue {
+                    expr: histogram.def.expr.clone(),
+                    ty: output_expr_type(&histogram.def.expr),
+                },
+            });
+            body.stmts.push(Stmt::Fill {
+                histogram: histogram_value,
+                value: fill_value,
+                weight: Some(weight),
+            });
+        }
+        block.stmts.push(Stmt::ForEach {
+            axis: ForEachAxis::Systematic,
+            item: TypedValue {
+                id: systematic,
+                ty: Type::Systematic,
+            },
+            body,
+        });
+    }
     block.stmts.push(Stmt::Return { values: returned });
 
     Ok(block)
@@ -464,13 +536,15 @@ fn ordered_derived_objects(program: &KirProgram) -> Result<Vec<&KirDerivedObject
 
     while !pending.is_empty() {
         let Some(index) = pending.iter().position(|object| {
-            derived_dependencies(&object.def).into_iter().all(|dependency| {
-                !program
-                    .derived_objects
-                    .iter()
-                    .any(|derived| derived.name == dependency)
-                    || ordered.iter().any(|derived| derived.name == dependency)
-            })
+            derived_dependencies(&object.def)
+                .into_iter()
+                .all(|dependency| {
+                    !program
+                        .derived_objects
+                        .iter()
+                        .any(|derived| derived.name == dependency)
+                        || ordered.iter().any(|derived| derived.name == dependency)
+                })
         }) else {
             return Err(KirError::Lower(
                 "derived object dependency cycle or unresolved dependency".to_string(),
@@ -541,12 +615,17 @@ fn verify_block(
                 }
                 values.insert(value.id, value.ty.clone());
             }
-            Stmt::ForEach {
-                collection,
-                item,
-                body,
-            } => {
-                require_type(*collection, Type::ObjectSet, values)?;
+            Stmt::ForEach { axis, item, body } => {
+                let expected = match axis {
+                    ForEachAxis::Systematic => Type::Systematic,
+                };
+                if item.ty != expected {
+                    return Err(KirError::TypeMismatch {
+                        value: item.id,
+                        expected,
+                        actual: item.ty.clone(),
+                    });
+                }
                 let mut body_values = values.clone();
                 if body_values.insert(item.id, item.ty.clone()).is_some() {
                     return Err(KirError::DuplicateValue(item.id));
@@ -647,7 +726,20 @@ fn verify_rvalue(
         Rvalue::DeriveObject { .. } => Ok(Type::Candidate),
         Rvalue::Requirement { .. } => Ok(Type::Bool),
         Rvalue::Output { ty, .. } => Ok(ty.clone()),
+        Rvalue::Histogram { .. } => Ok(Type::Histogram),
+        Rvalue::HistogramValue { ty, .. } => Ok(ty.clone()),
+        Rvalue::Weight { systematic } => {
+            require_type(*systematic, Type::Systematic, values)?;
+            Ok(Type::Weight)
+        }
     }
+}
+
+fn has_weight_systematic(program: &KirProgram) -> bool {
+    program
+        .systematics
+        .iter()
+        .any(|systematic| matches!(systematic, SystematicDef::Weight(_)))
 }
 
 fn require_type(
@@ -725,6 +817,8 @@ mod tests {
     use crate::{AnalysisSpec, Catalogue};
 
     const MUON_SPEC: &str = include_str!("../examples/muon.toml");
+    const MUON_WEIGHT_SYSTEMATIC_SPEC: &str =
+        include_str!("../examples/muon_hist_weight_systematic.toml");
     const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 
     #[test]
@@ -738,5 +832,28 @@ mod tests {
         verify(&kir).expect("verify kir");
         assert_eq!(kir.name, "muon_demo");
         assert!(matches!(kir.block.stmts.last(), Some(Stmt::Return { .. })));
+    }
+
+    #[test]
+    fn lowers_weight_systematic_histogram_to_for_each_fill() {
+        let spec =
+            AnalysisSpec::from_toml_str(MUON_WEIGHT_SYSTEMATIC_SPEC).expect("parse muon spec");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+        let plan = crate::validate(&spec, &catalogue).expect("validate spec");
+        let kir = lower_plan_to_kir(&plan).expect("lower executable kir");
+
+        verify(&kir).expect("verify kir");
+        assert!(kir.block.stmts.iter().any(|stmt| matches!(
+            stmt,
+            Stmt::ForEach {
+                axis: ForEachAxis::Systematic,
+                body,
+                ..
+            } if body
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, Stmt::Fill { .. }))
+        )));
     }
 }

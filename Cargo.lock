@@ -1172,6 +1172,7 @@ dependencies = [
 name = "nano-spec"
 version = "0.0.0"
 dependencies = [
+ "nano-analysis",
  "nano-core",
  "nano-producers",
  "serde",

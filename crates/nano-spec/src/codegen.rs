@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 
 use nano_core::BranchType;
 
-use crate::kir::{KirProgram, Rvalue, Stmt};
+use crate::kir::{ForEachAxis, KirProgram, Rvalue, Stmt, ValueId};
 use crate::{
     AnalysisSpec, ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef,
     ObjectCandidateDef, ObjectDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
@@ -265,9 +265,14 @@ impl<'a> Generator<'a> {
             )
             .unwrap();
             writeln!(source, "    }}").unwrap();
+            let systematic_param = if self.spec().has_weight_systematic() {
+                "_systematic"
+            } else {
+                "systematic"
+            };
             writeln!(
                 source,
-                "    fn analyze_impl(event: &nano_core::Event, histograms: Option<&mut GenHistograms>, systematic: nano_analysis::Systematic) -> nano_core::Result<Option<GenRow>> {{"
+                "    fn analyze_impl(event: &nano_core::Event, histograms: Option<&mut GenHistograms>, {systematic_param}: nano_analysis::Systematic) -> nano_core::Result<Option<GenRow>> {{"
             )
             .unwrap();
             self.emit_analyze_body_from_kir(&mut source, true, &kir)?;
@@ -292,6 +297,8 @@ impl<'a> Generator<'a> {
     ) -> Result<(), CodegenError> {
         let mut requirement_conditions = BTreeMap::new();
         let mut output_exprs = BTreeMap::new();
+        let mut histogram_fields = BTreeMap::new();
+        let mut histogram_values = BTreeMap::new();
         let mut region_index = 0_usize;
         let mut pending_region_conditions = Vec::new();
         let mut emitted_baseline = false;
@@ -328,6 +335,14 @@ impl<'a> Generator<'a> {
                     Rvalue::Output { expr, .. } => {
                         output_exprs.insert(value.id, expr.clone());
                     }
+                    Rvalue::Histogram { histogram } => {
+                        histogram_fields
+                            .insert(value.id, checked_ident(&histogram.name, "histogram field")?);
+                    }
+                    Rvalue::HistogramValue { expr, .. } => {
+                        histogram_values.insert(value.id, expr.clone());
+                    }
+                    Rvalue::Weight { .. } => {}
                     other => {
                         return Err(CodegenError::UnsupportedFeature(format!(
                             "KIR rvalue `{other:?}` is not supported by string codegen"
@@ -396,7 +411,7 @@ impl<'a> Generator<'a> {
                         )?;
                     }
 
-                    if emit_histograms {
+                    if emit_histograms && !self.spec().has_weight_systematic() {
                         self.emit_histogram_fills(source)?;
                     }
 
@@ -419,9 +434,32 @@ impl<'a> Generator<'a> {
                     writeln!(source, "        }}))").unwrap();
                     return Ok(());
                 }
-                Stmt::ForEach { .. } | Stmt::If { .. } | Stmt::Fill { .. } => {
+                Stmt::ForEach {
+                    axis,
+                    item: _,
+                    body,
+                } => {
+                    self.emit_remaining_kir_regions(
+                        source,
+                        kir,
+                        &mut region_index,
+                        &mut emitted_baseline,
+                        &mut emitted_derived_region_unwraps,
+                    )?;
+                    if emit_histograms {
+                        self.emit_systematic_for_each(
+                            source,
+                            *axis,
+                            body,
+                            &histogram_fields,
+                            &histogram_values,
+                            &mut unwrapped_required,
+                        )?;
+                    }
+                }
+                Stmt::If { .. } | Stmt::Fill { .. } => {
                     return Err(CodegenError::UnsupportedFeature(
-                        "loop/if/fill KIR statements are reserved for later typed emitter moves"
+                        "if/fill KIR statements outside a supported systematic loop are reserved for later typed emitter moves"
                             .to_string(),
                     ));
                 }
@@ -779,9 +817,14 @@ impl<'a> Generator<'a> {
         writeln!(source, "#[derive(Debug, Clone, PartialEq)]").unwrap();
         writeln!(source, "pub struct GenHistograms {{").unwrap();
         for histogram in &self.spec().histograms {
+            let hist_type = if self.spec().has_weight_systematic() {
+                "nano_analysis::HistSet1D"
+            } else {
+                "nano_analysis::Hist1D"
+            };
             writeln!(
                 source,
-                "    pub {}: nano_analysis::Hist1D,",
+                "    pub {}: {hist_type},",
                 checked_ident(&histogram.name, "histogram field")?
             )
             .unwrap();
@@ -792,9 +835,14 @@ impl<'a> Generator<'a> {
         writeln!(source, "    pub fn new() -> Self {{").unwrap();
         writeln!(source, "        Self {{").unwrap();
         for histogram in &self.spec().histograms {
+            let constructor = if self.spec().has_weight_systematic() {
+                "nano_analysis::HistSet1D::new"
+            } else {
+                "nano_analysis::Hist1D::new"
+            };
             writeln!(
                 source,
-                "            {}: nano_analysis::Hist1D::new({}, {}, {}),",
+                "            {}: {constructor}({}, {}, {}),",
                 checked_ident(&histogram.name, "histogram field")?,
                 histogram.bins,
                 f64_literal(histogram.range[0]),
@@ -812,6 +860,163 @@ impl<'a> Generator<'a> {
         writeln!(source, "    }}").unwrap();
         writeln!(source, "}}").unwrap();
         writeln!(source).unwrap();
+        Ok(())
+    }
+
+    fn emit_systematic_for_each(
+        &self,
+        source: &mut String,
+        axis: ForEachAxis,
+        body: &crate::kir::Block,
+        histogram_fields: &BTreeMap<ValueId, String>,
+        _histogram_values: &BTreeMap<ValueId, Expr>,
+        unwrapped: &mut BTreeSet<String>,
+    ) -> Result<(), CodegenError> {
+        match axis {
+            ForEachAxis::Systematic => {}
+        }
+        let Some(region) = self.spec().regions.last() else {
+            return Err(CodegenError::UnsupportedFeature(
+                "histogram outputs require at least one selected region".to_string(),
+            ));
+        };
+        let region_event = checked_ident(&region.name, "region event")?;
+        let region_type = region_type_ident(&region.name)?;
+        let mut value_exprs = BTreeMap::new();
+        let mut weight_values = BTreeSet::new();
+
+        for stmt in &body.stmts {
+            if let Stmt::Let { value, expr } = stmt {
+                match expr {
+                    Rvalue::HistogramValue { expr, .. } => {
+                        self.emit_required_output_unwrap(source, expr, "histogram", unwrapped)?;
+                        let value_expr = self.emit_output_expr(expr, "histogram")?;
+                        value_exprs
+                            .insert(value.id, self.histogram_fill_value_expr(expr, &value_expr)?);
+                    }
+                    Rvalue::Weight { .. } => {
+                        weight_values.insert(value.id);
+                    }
+                    other => {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "KIR systematic loop rvalue `{other:?}` is not supported by string codegen"
+                        )));
+                    }
+                }
+            }
+        }
+
+        writeln!(source, "        if let Some(histograms) = histograms {{").unwrap();
+        self.emit_weight_visitor(source)?;
+        writeln!(
+            source,
+            "            for systematic in [{}] {{",
+            self.active_systematic_exprs().join(", ")
+        )
+        .unwrap();
+        for stmt in &body.stmts {
+            match stmt {
+                Stmt::Let {
+                    value,
+                    expr: Rvalue::Weight { .. },
+                } => {
+                    writeln!(
+                        source,
+                        "                let weight_{} = systematic.visit(GenWeightVisitor);",
+                        value.id.0
+                    )
+                    .unwrap();
+                }
+                Stmt::Let { .. } => {}
+                Stmt::Fill {
+                    histogram,
+                    value,
+                    weight,
+                } => {
+                    let field = histogram_fields.get(histogram).ok_or_else(|| {
+                        CodegenError::UnsupportedFeature(format!(
+                            "KIR fill references missing histogram {histogram:?}"
+                        ))
+                    })?;
+                    let value_expr = value_exprs.get(value).ok_or_else(|| {
+                        CodegenError::UnsupportedFeature(format!(
+                            "KIR fill references missing value {value:?}"
+                        ))
+                    })?;
+                    let weight = weight.ok_or_else(|| {
+                        CodegenError::UnsupportedFeature(
+                            "KIR fill missing weight in systematic loop".to_string(),
+                        )
+                    })?;
+                    if !weight_values.contains(&weight) {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "KIR fill references missing weight {weight:?}"
+                        )));
+                    }
+                    writeln!(source, "                match systematic {{").unwrap();
+                    writeln!(
+                        source,
+                        "                    nano_analysis::Systematic::Nominal => {{"
+                    )
+                    .unwrap();
+                    writeln!(
+                        source,
+                        "                        let weighted = {region_event}_event.weight(weight_{});",
+                        weight.0
+                    )
+                    .unwrap();
+                    writeln!(
+                        source,
+                        "                        nano_analysis::fill_set::<{region_type}, nano_analysis::Nominal>(&mut histograms.{field}, &weighted, {value_expr});"
+                    )
+                    .unwrap();
+                    writeln!(source, "                    }}").unwrap();
+                    writeln!(
+                        source,
+                        "                    nano_analysis::Systematic::JesUp => {{"
+                    )
+                    .unwrap();
+                    writeln!(
+                        source,
+                        "                        let weighted = {region_event}_event.weight_for::<nano_analysis::JesUp>(weight_{});",
+                        weight.0
+                    )
+                    .unwrap();
+                    writeln!(
+                        source,
+                        "                        nano_analysis::fill_set::<{region_type}, nano_analysis::JesUp>(&mut histograms.{field}, &weighted, {value_expr});"
+                    )
+                    .unwrap();
+                    writeln!(source, "                    }}").unwrap();
+                    writeln!(
+                        source,
+                        "                    nano_analysis::Systematic::JesDown => {{"
+                    )
+                    .unwrap();
+                    writeln!(
+                        source,
+                        "                        let weighted = {region_event}_event.weight_for::<nano_analysis::JesDown>(weight_{});",
+                        weight.0
+                    )
+                    .unwrap();
+                    writeln!(
+                        source,
+                        "                        nano_analysis::fill_set::<{region_type}, nano_analysis::JesDown>(&mut histograms.{field}, &weighted, {value_expr});"
+                    )
+                    .unwrap();
+                    writeln!(source, "                    }}").unwrap();
+                    writeln!(source, "                    _ => {{}}").unwrap();
+                    writeln!(source, "                }}").unwrap();
+                }
+                other => {
+                    return Err(CodegenError::UnsupportedFeature(format!(
+                        "KIR statement `{other:?}` is not supported in systematic loops"
+                    )));
+                }
+            }
+        }
+        writeln!(source, "            }}").unwrap();
+        writeln!(source, "        }}").unwrap();
         Ok(())
     }
 
@@ -835,7 +1040,10 @@ impl<'a> Generator<'a> {
         .unwrap();
         for histogram in &self.spec().histograms {
             let field = checked_ident(&histogram.name, "histogram field")?;
-            let value = self.emit_output_expr(&histogram.expr, &field)?;
+            let value = self.histogram_fill_value_expr(
+                &histogram.expr,
+                &self.emit_output_expr(&histogram.expr, &field)?,
+            )?;
             writeln!(
                 source,
                 "            nano_analysis::fill::<{region_type}, nano_analysis::Nominal>(&mut histograms.{field}, &weighted, {value});"
@@ -847,7 +1055,17 @@ impl<'a> Generator<'a> {
     }
 
     fn emit_weight_match(&self, source: &mut String) -> Result<(), CodegenError> {
-        let weight_expr = self.weight_expr();
+        self.emit_weight_visitor(source)?;
+        writeln!(
+            source,
+            "            let weight = systematic.visit(GenWeightVisitor);"
+        )
+        .unwrap();
+        Ok(())
+    }
+
+    fn emit_weight_visitor(&self, source: &mut String) -> Result<(), CodegenError> {
+        let weight_exprs = self.weight_exprs_by_systematic();
         writeln!(source, "            struct GenWeightVisitor;").unwrap();
         writeln!(
             source,
@@ -869,25 +1087,70 @@ impl<'a> Generator<'a> {
             writeln!(
                 source,
                 "                fn {}(self) -> Self::Output {{ {} }}",
-                systematic_method(systematic),
-                weight_expr
+                systematic_method(&systematic),
+                weight_exprs
+                    .get(&systematic_key(&systematic))
+                    .expect("closed systematic weight expression exists")
             )
             .unwrap();
         }
         writeln!(source, "            }}").unwrap();
-        writeln!(
-            source,
-            "            let weight = systematic.visit(GenWeightVisitor);"
-        )
-        .unwrap();
         Ok(())
     }
 
-    fn weight_expr(&self) -> String {
+    fn histogram_fill_value_expr(
+        &self,
+        expr: &Expr,
+        value_expr: &str,
+    ) -> Result<String, CodegenError> {
+        match self.output_type(expr)? {
+            "u32" | "f32" => Ok(format!("f64::from({value_expr})")),
+            "f64" => Ok(value_expr.to_string()),
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "histogram expression `{expr}` has unsupported fill type `{other}`"
+            ))),
+        }
+    }
+
+    fn nominal_weight_expr(&self) -> String {
         self.spec().weight.nominal.iter().fold(
             "nano_analysis::EventWeight::nominal()".to_string(),
             |expr, factor| format!("{expr}.times({})", f64_literal(*factor)),
         )
+    }
+
+    fn weight_exprs_by_systematic(&self) -> BTreeMap<&'static str, String> {
+        let nominal = self.nominal_weight_expr();
+        let mut weights = BTreeMap::from([
+            ("nominal", nominal.clone()),
+            ("jes_up", nominal.clone()),
+            ("jes_down", nominal.clone()),
+            ("jer_up", nominal.clone()),
+            ("jer_down", nominal.clone()),
+        ]);
+        if let Some(systematic) = self.spec().weight_systematic() {
+            weights.insert(
+                "jes_up",
+                format!("{nominal}.times({})", f64_literal(systematic.up)),
+            );
+            weights.insert(
+                "jes_down",
+                format!("{nominal}.times({})", f64_literal(systematic.down)),
+            );
+        }
+        weights
+    }
+
+    fn active_systematic_exprs(&self) -> Vec<&'static str> {
+        if self.spec().has_weight_systematic() {
+            vec![
+                "nano_analysis::Systematic::Nominal",
+                "nano_analysis::Systematic::JesUp",
+                "nano_analysis::Systematic::JesDown",
+            ]
+        } else {
+            vec!["nano_analysis::Systematic::Nominal"]
+        }
     }
 
     fn emit_required_output_unwrap(
@@ -3131,13 +3394,25 @@ fn rust_string(value: &str) -> String {
     format!("{value:?}")
 }
 
-fn systematic_method(systematic: SystematicDef) -> &'static str {
+fn systematic_method(systematic: &SystematicDef) -> &'static str {
     match systematic {
         SystematicDef::Nominal => "nominal",
         SystematicDef::JesUp => "jes_up",
         SystematicDef::JesDown => "jes_down",
         SystematicDef::JerUp => "jer_up",
         SystematicDef::JerDown => "jer_down",
+        SystematicDef::Weight(_) => "nominal",
+    }
+}
+
+fn systematic_key(systematic: &SystematicDef) -> &'static str {
+    match systematic {
+        SystematicDef::Nominal => "nominal",
+        SystematicDef::JesUp => "jes_up",
+        SystematicDef::JesDown => "jes_down",
+        SystematicDef::JerUp => "jer_up",
+        SystematicDef::JerDown => "jer_down",
+        SystematicDef::Weight(_) => "nominal",
     }
 }
 
