@@ -119,7 +119,11 @@ impl<'a> Generator<'a> {
         for output in &self.spec().outputs {
             let field = checked_ident(&output.name, "output field")?;
             let expr = self.emit_output_expr(&output.expr, &field)?;
-            writeln!(source, "            {field}: {expr},").unwrap();
+            if field == expr {
+                writeln!(source, "            {field},").unwrap();
+            } else {
+                writeln!(source, "            {field}: {expr},").unwrap();
+            }
         }
         writeln!(source, "        }}))").unwrap();
         writeln!(source, "    }}").unwrap();
@@ -236,7 +240,11 @@ impl<'a> Generator<'a> {
         for output in &self.spec().outputs {
             let field = checked_ident(&output.name, "output field")?;
             let expr = self.emit_model_output_expr(&output.expr)?;
-            writeln!(source, "            {field}: {expr},").unwrap();
+            if field == expr {
+                writeln!(source, "            {field},").unwrap();
+            } else {
+                writeln!(source, "            {field}: {expr},").unwrap();
+            }
         }
         writeln!(source, "        }}))").unwrap();
         writeln!(source, "    }}").unwrap();
@@ -1252,8 +1260,8 @@ mod tests {
         assert!(source.contains("if (good_muon_pt > 30.0_f32) && (good_muon_eta.abs() < 2.4_f32)"));
         assert!(source.contains("let baseline = nano_analysis::Ev::new(event)"));
         assert!(source.contains("baseline.select::<SignalRegion>(|_| n_good_muon >= 1_u32)"));
-        assert!(source.contains("n_good_muon: n_good_muon,"));
-        assert!(source.contains("lead_muon_pt: lead_muon_pt,"));
+        assert!(source.contains("n_good_muon,"));
+        assert!(source.contains("lead_muon_pt,"));
     }
 
     #[test]

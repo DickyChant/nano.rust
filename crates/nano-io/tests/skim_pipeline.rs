@@ -31,7 +31,7 @@ fn synthetic_muon_skim_round_trips_through_root_io() {
 
     let events = read_events(&input_path, input_schema).unwrap();
     assert_eq!(events.len(), 5);
-    assert_eq!(events[0].scalar::<bool>("pass_preselection").unwrap(), true);
+    assert!(events[0].scalar::<bool>("pass_preselection").unwrap());
     assert_eq!(events[4].scalar::<u64>("event").unwrap(), 1005);
     assert_eq!(events[2].scalar::<i32>("run").unwrap(), 315252);
 

@@ -15,10 +15,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Rust format
         run: cargo fmt --all -- --check
+
+      - name: Rust clippy (lint-clean, warnings are errors)
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --features http -- -D warnings
 
       - name: Rust tests
         run: cargo test

@@ -98,7 +98,7 @@ fn read_object_numeric(
     let info = event
         .schema()
         .find(&branch)
-        .ok_or_else(|| InferError::MissingInput { name: branch })?;
+        .ok_or(InferError::MissingInput { name: branch })?;
 
     match info.branch_type {
         BranchType::VecI8 => object.get::<i8>(attr).map(f32::from),

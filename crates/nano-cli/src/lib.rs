@@ -28,6 +28,8 @@ pub struct RunOptions {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
+// Keep the public enum shape stable for CLI library users.
+#[allow(clippy::large_enum_variant)]
 pub enum Output {
     Validate(ValidateReport),
     Branches(BranchesReport),

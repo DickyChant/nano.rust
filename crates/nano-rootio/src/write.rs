@@ -640,7 +640,7 @@ fn build_tree_object(
         let leaf_count_ref = read_order_object_reference_tag(next_object_index)?;
         next_object_index = next_object_index.saturating_add(1);
         let branch_raw_start = branches_checked_start + 4 + branch_array.len();
-        let built = build_branch_raw_object(
+        let ctx = BranchBuildContext {
             branch,
             meta,
             basket,
@@ -649,7 +649,8 @@ fn build_tree_object(
             branch_raw_start,
             counter_ref,
             leaf_count_ref,
-        )?;
+        };
+        let built = build_branch_raw_object(&ctx)?;
         leaf_refs.push(built.leaf_tree_ref);
         leaf_count_refs.push(built.leaf_count_ref);
         debug_assert_eq!(leaf_refs.len(), branch_index + 1);
@@ -676,26 +677,19 @@ struct BuiltBranch {
     leaf_count_ref: u32,
 }
 
-fn build_branch_raw_object(
-    branch: &Branch,
-    meta: &BranchMeta,
-    basket: &BasketInfo,
+struct BranchBuildContext<'a> {
+    branch: &'a Branch,
+    meta: &'a BranchMeta,
+    basket: &'a BasketInfo,
     entries: usize,
     tree_key_len: usize,
     branch_raw_start: usize,
     counter_ref: Option<u32>,
     leaf_count_ref: u32,
-) -> Result<BuiltBranch> {
-    let branch_body = build_branch(
-        branch,
-        meta,
-        basket,
-        entries,
-        tree_key_len,
-        branch_raw_start,
-        counter_ref,
-        leaf_count_ref,
-    )?;
+}
+
+fn build_branch_raw_object(ctx: &BranchBuildContext<'_>) -> Result<BuiltBranch> {
+    let branch_body = build_branch(ctx)?;
     Ok(BuiltBranch {
         raw_object: raw_object("TBranch", branch_body.bytes)?,
         leaf_tree_ref: branch_body.leaf_tree_ref,
@@ -709,65 +703,56 @@ struct BuiltBranchBody {
     leaf_count_ref: u32,
 }
 
-fn build_branch(
-    branch: &Branch,
-    meta: &BranchMeta,
-    basket: &BasketInfo,
-    entries: usize,
-    tree_key_len: usize,
-    branch_raw_start: usize,
-    counter_ref: Option<u32>,
-    leaf_count_ref: u32,
-) -> Result<BuiltBranchBody> {
+fn build_branch(ctx: &BranchBuildContext<'_>) -> Result<BuiltBranchBody> {
     let mut out = Vec::new();
-    let counter_name = meta.counter.map(|_| leaf_count_name(branch));
+    let counter_name = ctx.meta.counter.map(|_| leaf_count_name(ctx.branch));
     put_u16(&mut out, 12);
     out.extend(checked(tnamed(
-        &branch.name,
-        &branch
+        &ctx.branch.name,
+        &ctx.branch
             .data
-            .branch_title(&branch.name, counter_name.as_deref()),
+            .branch_title(&ctx.branch.name, counter_name.as_deref()),
     ))?);
     out.extend(checked(tattfill_v1())?);
     put_i32(&mut out, 0);
     put_i32(&mut out, 32000);
-    put_i32(&mut out, branch.data.entry_offset_len(entries));
+    put_i32(&mut out, ctx.branch.data.entry_offset_len(ctx.entries));
     put_i32(&mut out, 1);
-    put_i64(&mut out, entries as i64);
+    put_i64(&mut out, ctx.entries as i64);
     put_i32(&mut out, 0);
     put_i32(&mut out, 1);
     put_i32(&mut out, 0);
-    put_i64(&mut out, entries as i64);
+    put_i64(&mut out, ctx.entries as i64);
     put_i64(&mut out, 0);
-    put_i64(&mut out, basket.uncompressed_len as i64);
-    put_i64(&mut out, basket.bytes.len() as i64);
+    put_i64(&mut out, ctx.basket.uncompressed_len as i64);
+    put_i64(&mut out, ctx.basket.bytes.len() as i64);
     out.extend(checked(tobjarray("", Vec::new()))?);
     let leaf_array_checked_start = out.len();
     let mut leaf_array = tobjarray_header("", 1);
-    let leaf_raw_start = branch_raw_start
+    let leaf_raw_start = ctx.branch_raw_start
         + raw_object_prefix_len("TBranch")
         + 4
         + leaf_array_checked_start
         + 4
         + leaf_array.len();
-    let leaf_tree_ref = key_framed_byte_reference_tag(tree_key_len, leaf_raw_start)?;
+    let leaf_tree_ref = key_framed_byte_reference_tag(ctx.tree_key_len, leaf_raw_start)?;
     leaf_array.extend(raw_object(
-        branch.data.leaf_class(),
-        build_leaf(branch, meta, counter_ref)?,
+        ctx.branch.data.leaf_class(),
+        build_leaf(ctx.branch, ctx.meta, ctx.counter_ref)?,
     )?);
     out.extend(checked(leaf_array)?);
     out.extend(checked(tobjarray("", Vec::new()))?);
     put_u8(&mut out, 1);
-    put_i32(&mut out, basket.bytes.len() as i32);
+    put_i32(&mut out, ctx.basket.bytes.len() as i32);
     put_u8(&mut out, 1);
     put_i64(&mut out, 0);
     put_u8(&mut out, 2);
-    put_u64(&mut out, basket.seek);
+    put_u64(&mut out, ctx.basket.seek);
     put_string(&mut out, "");
     Ok(BuiltBranchBody {
         bytes: out,
         leaf_tree_ref,
-        leaf_count_ref,
+        leaf_count_ref: ctx.leaf_count_ref,
     })
 }
 
@@ -908,11 +893,7 @@ fn write_jagged_entry_offsets(
 }
 
 fn branch_element_size(payload: &[u8], entries: usize) -> u32 {
-    if entries == 0 {
-        0
-    } else {
-        (payload.len() / entries) as u32
-    }
+    payload.len().checked_div(entries).unwrap_or(0) as u32
 }
 
 fn build_key(

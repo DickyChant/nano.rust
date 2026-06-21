@@ -735,6 +735,8 @@ fn compute_higgs_mass_4l(
 }
 
 #[cfg(feature = "http")]
+// Parallel electron/muon kinematic arrays mirror the source NanoAOD branches.
+#[allow(clippy::too_many_arguments)]
 fn compute_z_masses_2el2mu(
     el_pt: &[f32],
     el_eta: &[f32],
@@ -762,6 +764,8 @@ fn compute_z_masses_2el2mu(
 }
 
 #[cfg(feature = "http")]
+// Parallel electron/muon kinematic arrays mirror the source NanoAOD branches.
+#[allow(clippy::too_many_arguments)]
 fn compute_higgs_mass_2el2mu(
     el_pt: &[f32],
     el_eta: &[f32],

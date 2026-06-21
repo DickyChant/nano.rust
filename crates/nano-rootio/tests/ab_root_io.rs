@@ -143,7 +143,7 @@ where
         let counts: Vec<u32> = tree
             .branch_by_name(counter_name)
             .expect("root-io counter branch")
-            .as_fixed_size_iterator(|i| be_u32(i))
+            .as_fixed_size_iterator(be_u32)
             .take(start + len)
             .collect()
             .await;

@@ -977,11 +977,7 @@ fn parse_branch<'a>(
         .filter(|bytes| !bytes.is_empty())
         .map(BasketStorage::InMemory)
         .collect::<Vec<_>>();
-    for (seek, len) in fbasketseek
-        .into_iter()
-        .zip(fbasketbytes.into_iter())
-        .take(basket_count)
-    {
+    for (seek, len) in fbasketseek.into_iter().zip(fbasketbytes).take(basket_count) {
         if seek != 0 && len > 0 {
             baskets.push(BasketStorage::OnDisk {
                 source: source.clone(),

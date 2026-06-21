@@ -110,13 +110,7 @@ where
     let (i, objs) = count(
         map_res(
             |i| raw(i, context),
-            |r| {
-                let res = parser(&r, context).map(|(_i, res)| res);
-                if res.is_err() {
-                    res.as_ref().unwrap();
-                }
-                res
-            },
+            |r| parser(&r, context).map(|(_i, res)| res),
         ),
         size as usize,
     )(i)?;

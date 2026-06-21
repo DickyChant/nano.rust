@@ -28,8 +28,9 @@ impl Predictor for InProcessPredictor {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum ProviderSpec {
+    #[default]
     Mock,
     InProcess {
         onnx_path: PathBuf,
@@ -44,12 +45,6 @@ pub enum ProviderSpec {
         launch: crate::LaunchRecipe,
         api: crate::WireApi,
     },
-}
-
-impl Default for ProviderSpec {
-    fn default() -> Self {
-        Self::Mock
-    }
 }
 
 impl ProviderSpec {

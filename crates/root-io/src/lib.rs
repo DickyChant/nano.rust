@@ -13,6 +13,9 @@
 //! The API surface is deliberately small to make the processing of said
 //! files as easy as possible. If you are looking for a particular
 //! parser chances have it that it exists but it is not marked as `pub`.
+// Vendored upstream root-io from cbourjau/alice-rs, kept as a dev oracle.
+// Avoid churn from workspace Clippy policy in this copied dependency.
+#![allow(clippy::all)]
 #![allow(clippy::cognitive_complexity)]
 #![recursion_limit = "256"]
 #[macro_use]

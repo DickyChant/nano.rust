@@ -377,47 +377,31 @@ pub fn validate(
     let model_outputs =
         validate_models(spec, catalogue, &object_sources, &mut required, &mut errors);
 
-    for object in &spec.objects {
-        required.require_counter(&object.source);
-        for (index, cut) in object.cuts.iter().enumerate() {
-            validate_cut(
-                object,
-                index,
-                cut,
-                catalogue,
-                &object_sources,
-                &model_outputs,
-                &mut required,
-                &mut errors,
-            );
-        }
-    }
-
-    for region in &spec.regions {
-        for (index, requirement) in region.require.iter().enumerate() {
-            validate_requirement(
-                region,
-                index,
-                requirement,
-                catalogue,
-                &object_sources,
-                &model_outputs,
-                &mut required,
-                &mut errors,
-            );
-        }
-    }
-
-    for output in &spec.outputs {
-        validate_expr(
-            &output.expr,
-            &format!("output `{}`", output.name),
+    {
+        let mut ctx = ValidationContext {
             catalogue,
-            &object_sources,
-            &model_outputs,
-            &mut required,
-            &mut errors,
-        );
+            object_sources: &object_sources,
+            model_outputs: &model_outputs,
+            required: &mut required,
+            errors: &mut errors,
+        };
+
+        for object in &spec.objects {
+            ctx.required.require_counter(&object.source);
+            for (index, cut) in object.cuts.iter().enumerate() {
+                validate_cut(object, index, cut, &mut ctx);
+            }
+        }
+
+        for region in &spec.regions {
+            for (index, requirement) in region.require.iter().enumerate() {
+                validate_requirement(region, index, requirement, &mut ctx);
+            }
+        }
+
+        for output in &spec.outputs {
+            validate_expr(&output.expr, &format!("output `{}`", output.name), &mut ctx);
+        }
     }
 
     if !errors.is_empty() {
@@ -439,32 +423,23 @@ pub fn validate(
     })
 }
 
-fn validate_cut(
-    object: &ObjectDef,
-    index: usize,
-    cut: &Cut,
-    catalogue: &Catalogue,
-    object_sources: &HashMap<&str, &str>,
-    model_outputs: &ModelOutputs,
-    required: &mut RequiredBranches,
-    errors: &mut Vec<SpecError>,
-) {
+struct ValidationContext<'a> {
+    catalogue: &'a Catalogue,
+    object_sources: &'a HashMap<&'a str, &'a str>,
+    model_outputs: &'a ModelOutputs,
+    required: &'a mut RequiredBranches,
+    errors: &'a mut Vec<SpecError>,
+}
+
+fn validate_cut(object: &ObjectDef, index: usize, cut: &Cut, ctx: &mut ValidationContext<'_>) {
     let context = format!("object `{}` cut {}", object.name, index + 1);
-    let lhs_type = validate_expr(
-        &cut.lhs,
-        &context,
-        catalogue,
-        object_sources,
-        model_outputs,
-        required,
-        errors,
-    );
+    let lhs_type = validate_expr(&cut.lhs, &context, ctx);
 
     match lhs_type {
         Some(ExprType::Numeric(dimension)) => {
-            validate_quantity_unit(&context, &cut.lhs, dimension, cut, errors)
+            validate_quantity_unit(&context, &cut.lhs, dimension, cut, ctx.errors)
         }
-        Some(ExprType::Count) => errors.push(SpecError::InvalidExpression {
+        Some(ExprType::Count) => ctx.errors.push(SpecError::InvalidExpression {
             context,
             detail: "object cuts must compare branch attributes, not counts".to_string(),
         }),
@@ -476,86 +451,38 @@ fn validate_requirement(
     region: &RegionDef,
     index: usize,
     requirement: &Requirement,
-    catalogue: &Catalogue,
-    object_sources: &HashMap<&str, &str>,
-    model_outputs: &ModelOutputs,
-    required: &mut RequiredBranches,
-    errors: &mut Vec<SpecError>,
+    ctx: &mut ValidationContext<'_>,
 ) {
     let context = format!("region `{}` requirement {}", region.name, index + 1);
-    validate_expr(
-        &requirement.lhs,
-        &context,
-        catalogue,
-        object_sources,
-        model_outputs,
-        required,
-        errors,
-    );
+    validate_expr(&requirement.lhs, &context, ctx);
 }
 
-fn validate_expr(
-    expr: &Expr,
-    context: &str,
-    catalogue: &Catalogue,
-    object_sources: &HashMap<&str, &str>,
-    model_outputs: &ModelOutputs,
-    required: &mut RequiredBranches,
-    errors: &mut Vec<SpecError>,
-) -> Option<ExprType> {
+fn validate_expr(expr: &Expr, context: &str, ctx: &mut ValidationContext<'_>) -> Option<ExprType> {
     match expr {
-        Expr::Attr { object, attr } => validate_attr(
-            object,
-            attr,
-            context,
-            catalogue,
-            object_sources,
-            model_outputs,
-            required,
-            errors,
-        ),
-        Expr::Abs(inner) => {
-            match validate_expr(
-                inner,
-                context,
-                catalogue,
-                object_sources,
-                model_outputs,
-                required,
-                errors,
-            ) {
-                Some(ExprType::Numeric(dimension)) => Some(ExprType::Numeric(dimension)),
-                Some(ExprType::Count) => {
-                    errors.push(SpecError::InvalidExpression {
-                        context: context.to_string(),
-                        detail: "abs(...) requires a numeric attribute".to_string(),
-                    });
-                    None
-                }
-                None => None,
+        Expr::Attr { object, attr } => validate_attr(object, attr, context, ctx),
+        Expr::Abs(inner) => match validate_expr(inner, context, ctx) {
+            Some(ExprType::Numeric(dimension)) => Some(ExprType::Numeric(dimension)),
+            Some(ExprType::Count) => {
+                ctx.errors.push(SpecError::InvalidExpression {
+                    context: context.to_string(),
+                    detail: "abs(...) requires a numeric attribute".to_string(),
+                });
+                None
             }
-        }
+            None => None,
+        },
         Expr::Count(object) => {
-            let Some(source) = object_sources.get(object.as_str()) else {
-                errors.push(SpecError::UndefinedObject {
+            let Some(source) = ctx.object_sources.get(object.as_str()) else {
+                ctx.errors.push(SpecError::UndefinedObject {
                     context: context.to_string(),
                     object: object.clone(),
                 });
                 return None;
             };
-            required.require_counter(source);
+            ctx.required.require_counter(source);
             Some(ExprType::Count)
         }
-        Expr::LeadingAttr { object, attr } => validate_attr(
-            object,
-            attr,
-            context,
-            catalogue,
-            object_sources,
-            model_outputs,
-            required,
-            errors,
-        ),
+        Expr::LeadingAttr { object, attr } => validate_attr(object, attr, context, ctx),
     }
 }
 
@@ -563,14 +490,10 @@ fn validate_attr(
     object: &str,
     attr: &str,
     context: &str,
-    catalogue: &Catalogue,
-    object_sources: &HashMap<&str, &str>,
-    model_outputs: &ModelOutputs,
-    required: &mut RequiredBranches,
-    errors: &mut Vec<SpecError>,
+    ctx: &mut ValidationContext<'_>,
 ) -> Option<ExprType> {
-    let Some(source) = object_sources.get(object) else {
-        errors.push(SpecError::UndefinedObject {
+    let Some(source) = ctx.object_sources.get(object) else {
+        ctx.errors.push(SpecError::UndefinedObject {
             context: context.to_string(),
             object: object.to_string(),
         });
@@ -578,13 +501,13 @@ fn validate_attr(
     };
 
     let branch = format!("{source}_{attr}");
-    if let Some(output) = model_outputs.by_branch.get(&branch) {
-        required.require_counter(source);
+    if let Some(output) = ctx.model_outputs.by_branch.get(&branch) {
+        ctx.required.require_counter(source);
         return Some(ExprType::Numeric(output.dimension));
     }
 
-    let Some(entry) = catalogue.branch(&branch) else {
-        errors.push(SpecError::MissingBranch {
+    let Some(entry) = ctx.catalogue.branch(&branch) else {
+        ctx.errors.push(SpecError::MissingBranch {
             context: context.to_string(),
             branch,
         });
@@ -592,7 +515,7 @@ fn validate_attr(
     };
 
     let Some(branch_type) = entry.branch_type else {
-        errors.push(SpecError::UnsupportedBranchType {
+        ctx.errors.push(SpecError::UnsupportedBranchType {
             context: context.to_string(),
             branch,
             raw_type: entry.raw_type.clone(),
@@ -601,7 +524,7 @@ fn validate_attr(
     };
 
     if !is_numeric_vector(branch_type) {
-        errors.push(SpecError::WrongBranchType {
+        ctx.errors.push(SpecError::WrongBranchType {
             context: context.to_string(),
             branch,
             expected: "numeric vector branch".to_string(),
@@ -610,8 +533,8 @@ fn validate_attr(
         return None;
     }
 
-    required.require_counter(source);
-    required.require_attr(source, attr);
+    ctx.required.require_counter(source);
+    ctx.required.require_attr(source, attr);
     Some(ExprType::Numeric(attribute_dimension(attr)))
 }
 

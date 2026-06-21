@@ -1331,7 +1331,7 @@ mod tests {
     fn event_reads_scalar_and_event_level_attachments() {
         let event = Event::from_columns(schema(), columns(), 0).unwrap();
 
-        assert_eq!(event.scalar::<bool>("Flag_goodVertices").unwrap(), true);
+        assert!(event.scalar::<bool>("Flag_goodVertices").unwrap());
         assert_eq!(event.scalar::<f32>("MET_pt").unwrap(), 90.0);
         assert_eq!(
             event.vector_ref::<f32>("FatJet_pt").unwrap(),
@@ -1377,7 +1377,7 @@ mod tests {
             *jet.extra::<(f32, f32, f32, f32)>("p4").unwrap(),
             (401.0, 0.5, 1.0, 80.0)
         );
-        assert_eq!(*jet.extra::<bool>("is_qualified").unwrap(), true);
+        assert!(*jet.extra::<bool>("is_qualified").unwrap());
     }
 
     #[test]
