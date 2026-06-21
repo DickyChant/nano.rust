@@ -112,6 +112,11 @@ def build() -> None:
     for asset in SITE_SRC.glob("*.cast"):
         shutil.copy(asset, PUBLIC / asset.name)
 
+    # generated plots (kuva SVG/PNG) -> /plots
+    plots_dir = SITE_SRC / "plots"
+    if plots_dir.is_dir():
+        shutil.copytree(plots_dir, PUBLIC / "plots")
+
     # rustdoc -> /api
     if RUSTDOC.exists():
         shutil.copytree(RUSTDOC, PUBLIC / "api")

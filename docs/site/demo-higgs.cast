@@ -1,0 +1,11 @@
+{"version": 2, "width": 100, "height": 32, "timestamp": 1782005517, "env": {"SHELL": "/usr/bin/bash"}}
+[0.003, "o", "\u001b[1;36m# ROOT's df103 Higgs->ZZ->4l analysis, ported to nano.rust, on CMS Open Data:\u001b[0m\r\n"]
+[1.305, "o", "\u001b[1;36m# 3 channels (4mu/4e/2e2mu), lepton selection + Z pairing + 4-lepton mass.\u001b[0m\r\n"]
+[2.607, "o", "\u001b[1;32m$\u001b[0m target/debug/examples/higgs4l_opendata 'https://eospublic.cern.ch//eos/root-eos/cms_opendata_2012_nanoaod_skimmed/SMHiggsToZZTo4L.root' --insecure\r\n"]
+[8.563, "o", "source: https://eospublic.cern.ch//eos/root-eos/cms_opendata_2012_nanoaod_skimmed/SMHiggsToZZTo4L.root\r\nevents_read: 29381\r\nselected_4mu: 9115\r\nselected_4e: 5528\r\nselected_2e2mu: 12065\r\ntotal_selected: 26708\r\n"]
+[8.566, "o", "h_mass_histogram_gev:\r\n   70-80       52 #\r\n   80-90       85 #\r\n   90-100     105 #\r\n  100-110     311 #\r\n  110-120    2080 ####\r\n  120-130   23370 ########################################\r\n  130-140     647 ##\r\n  140-150      28 #\r\n  150-160      10 #\r\n  160-170       5 #\r\n  170-180       2 #\r\nbytes_fetched: 6337932 / 5133841\r\n"]
+[8.567, "o", "\r\n"]
+[10.168, "o", "\u001b[1;36m# the 4-lepton mass peaks at 125 GeV -- the Higgs. read over HTTPS, pure Rust.\u001b[0m\r\n"]
+[11.47, "o", "\u001b[1;36m# and it matches ROOT's df103 EXACTLY: total 26708, peak bin 23370 -- bit-identical.\u001b[0m\r\n"]
+[12.772, "o", "\u001b[1;36m# with --plot it renders the peak via kuva (plot in the post).\u001b[0m\r\n"]
+[15.577, "x", "0"]

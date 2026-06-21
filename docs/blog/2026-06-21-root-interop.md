@@ -59,6 +59,11 @@ bytes_fetched: 768178 / 2244449133
 The **Z peak** stands out in the 80–100 GeV bin, and reading 20 000 events
 fetched **768 KB of the 2.2 GB file (0.034 %)** — on-demand, nothing stored.
 
+![Dimuon invariant-mass spectrum from CMS Open Data, reconstructed by nano.rust](../plots/dimuon_spectrum.png)
+
+*The dimuon spectrum, plotted in-process with [kuva](https://crates.io/crates/kuva)
+via `--plot` (`--features plot`).*
+
 ## 3. The interop check: nano.rust vs ROOT, same file
 
 The point of the exercise. nano.rust reads over **HTTPS** (pure Rust, no ROOT);
