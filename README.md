@@ -105,7 +105,7 @@ evaluator, an **ML inference protocol**, and an agent action space (`nano` CLI +
 MCP server). Next: golden tests against the frozen `.root` references, wiring
 real corrections/JME systematics into the channel, and a **Rust-native workflow
 DAG orchestrator** (the LAW backend is descoped). See [`docs/`](docs/) —
-[architecture](docs/architecture.md), [ADL front-end](docs/adl-frontend.md), [orchestrator](docs/orchestrator.md),
+[architecture](docs/architecture.md), [compiler roadmap](docs/compiler-roadmap.md), [ADL front-end](docs/adl-frontend.md), [orchestrator](docs/orchestrator.md),
 [vision](docs/vision.md), [versioning](docs/versioning.md),
 [state machine](docs/state-machine.md), [semantic layer](docs/semantic-layer.md),
 [inference protocol](docs/inference-protocol.md),
