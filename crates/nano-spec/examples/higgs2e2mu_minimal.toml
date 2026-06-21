@@ -1,0 +1,35 @@
+[analysis]
+name = "higgs2e2mu_minimal"
+year = "Run2012"
+
+[objects.good_electron]
+source = "Electron"
+cuts = []
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[derived.z_el]
+kind = "combine"
+items = ["good_electron", "good_electron"]
+
+[derived.z_mu]
+kind = "combine"
+items = ["good_muon", "good_muon"]
+
+[derived.h]
+kind = "combine"
+items = ["z_mu", "z_el"]
+
+[[outputs]]
+name = "z_el_mass"
+expr = "z_el.mass"
+
+[[outputs]]
+name = "z_mu_mass"
+expr = "z_mu.mass"
+
+[[outputs]]
+name = "h_mass"
+expr = "h.mass"

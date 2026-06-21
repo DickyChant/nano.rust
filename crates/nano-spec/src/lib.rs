@@ -138,6 +138,7 @@ pub struct DerivedObjectDef {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DerivedSource {
     Pair(ObjectPairDef),
+    Candidate(ObjectCandidateDef),
 }
 
 /// Pair combinatorics over one selected object collection.
@@ -146,6 +147,13 @@ pub struct ObjectPairDef {
     pub object: String,
     pub constraints: Vec<PairConstraint>,
     pub selection: PairSelection,
+    pub exclude: Vec<String>,
+}
+
+/// Candidate assembly from selected objects and/or previously derived objects.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ObjectCandidateDef {
+    pub items: Vec<String>,
 }
 
 /// Pair-level constraints.
@@ -575,7 +583,64 @@ fn validate_derived_object(derived: &DerivedObjectDef, ctx: &mut ValidationConte
                     );
                 }
             }
+
+            for excluded in &pair.exclude {
+                let Some(excluded_derived) = ctx.derived_objects.get(excluded.as_str()) else {
+                    ctx.errors.push(SpecError::UndefinedObject {
+                        context: context.clone(),
+                        object: excluded.clone(),
+                    });
+                    continue;
+                };
+                match &excluded_derived.source {
+                    DerivedSource::Pair(excluded_pair) if excluded_pair.object == pair.object => {}
+                    DerivedSource::Pair(excluded_pair) => {
+                        ctx.errors.push(SpecError::InvalidExpression {
+                            context: context.clone(),
+                            detail: format!(
+                                "pair `{}` excludes `{excluded}`, but `{excluded}` is built from `{}` instead of `{}`",
+                                derived.name, excluded_pair.object, pair.object
+                            ),
+                        });
+                    }
+                    DerivedSource::Candidate(_) => {
+                        ctx.errors.push(SpecError::InvalidExpression {
+                            context: context.clone(),
+                            detail: format!(
+                                "pair `{}` can only exclude pair-derived selections, not candidate `{excluded}`",
+                                derived.name
+                            ),
+                        });
+                    }
+                }
+            }
         }
+        DerivedSource::Candidate(candidate) => {
+            if candidate.items.is_empty() {
+                ctx.errors.push(SpecError::InvalidExpression {
+                    context,
+                    detail: "candidate items must not be empty".to_string(),
+                });
+                return;
+            }
+            for item in &candidate.items {
+                validate_candidate_item(item, &context, ctx);
+            }
+        }
+    }
+}
+
+fn validate_candidate_item(item: &str, context: &str, ctx: &mut ValidationContext<'_>) {
+    if let Some(source) = ctx.object_sources.get(item) {
+        ctx.required.require_counter(source);
+        require_four_vector(source, context, ctx);
+    } else if let Some(derived) = ctx.derived_objects.get(item) {
+        validate_derived_attr(derived, "mass", context, ctx);
+    } else {
+        ctx.errors.push(SpecError::UndefinedObject {
+            context: context.to_string(),
+            object: item.to_string(),
+        });
     }
 }
 
@@ -725,6 +790,20 @@ fn validate_derived_attr(
                 }
             }
         }
+        DerivedSource::Candidate(_) => match attr {
+            "mass" => Some(ExprType::Numeric(Dimension::Momentum)),
+            "pt" => Some(ExprType::Numeric(Dimension::Momentum)),
+            other => {
+                ctx.errors.push(SpecError::InvalidExpression {
+                    context: context.to_string(),
+                    detail: format!(
+                        "derived candidate `{}` has no attribute `{other}`; supported attributes are `mass` and `pt`",
+                        derived.name
+                    ),
+                });
+                None
+            }
+        },
     }
 }
 
@@ -1495,12 +1574,18 @@ struct RawObject {
 #[derive(Debug, serde::Deserialize)]
 struct RawDerivedObject {
     kind: String,
-    object: String,
+    #[serde(default)]
+    object: Option<String>,
+    #[serde(default)]
+    items: Vec<String>,
     #[serde(default)]
     constraints: Vec<String>,
-    selection: String,
+    #[serde(default)]
+    selection: Option<String>,
     #[serde(default)]
     target: Option<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1544,27 +1629,52 @@ fn derived_object_def_from_raw(
     (name, raw): (String, RawDerivedObject),
 ) -> Result<DerivedObjectDef, ParseError> {
     validate_identifier(&name, "derived object name")?;
-    validate_identifier(
-        &raw.object,
-        &format!("derived object `{name}` source object"),
-    )?;
-
-    let constraints = raw
-        .constraints
-        .iter()
-        .map(|constraint| pair_constraint_from_raw(&name, constraint))
-        .collect::<Result<Vec<_>, _>>()?;
-    let selection = pair_selection_from_raw(&name, &raw.selection, raw.target.as_deref())?;
 
     let source = match raw.kind.as_str() {
-        "pair" => DerivedSource::Pair(ObjectPairDef {
-            object: raw.object,
-            constraints,
-            selection,
-        }),
+        "pair" => {
+            let object = raw.object.ok_or_else(|| {
+                ParseError::InvalidSpec(format!("derived pair `{name}` is missing `object`"))
+            })?;
+            validate_identifier(&object, &format!("derived object `{name}` source object"))?;
+            let constraints = raw
+                .constraints
+                .iter()
+                .map(|constraint| pair_constraint_from_raw(&name, constraint))
+                .collect::<Result<Vec<_>, _>>()?;
+            let selection = pair_selection_from_raw(
+                &name,
+                raw.selection.as_deref().unwrap_or("leading_pt"),
+                raw.target.as_deref(),
+            )?;
+            for excluded in &raw.exclude {
+                validate_identifier(excluded, &format!("derived pair `{name}` exclude"))?;
+            }
+            DerivedSource::Pair(ObjectPairDef {
+                object,
+                constraints,
+                selection,
+                exclude: raw.exclude,
+            })
+        }
+        "candidate" | "combine" => {
+            if raw.object.is_some() {
+                return Err(ParseError::InvalidSpec(format!(
+                    "derived candidate `{name}` uses `items`, not `object`"
+                )));
+            }
+            if raw.selection.is_some() || raw.target.is_some() || !raw.constraints.is_empty() {
+                return Err(ParseError::InvalidSpec(format!(
+                    "derived candidate `{name}` does not accept `selection`, `target`, or `constraints`"
+                )));
+            }
+            for item in &raw.items {
+                validate_identifier(item, &format!("derived candidate `{name}` item"))?;
+            }
+            DerivedSource::Candidate(ObjectCandidateDef { items: raw.items })
+        }
         kind => {
             return Err(ParseError::InvalidSpec(format!(
-                "derived object `{name}` has unsupported kind `{kind}`; expected `pair`"
+                "derived object `{name}` has unsupported kind `{kind}`; expected `pair` or `combine`"
             )));
         }
     };
@@ -1841,6 +1951,8 @@ mod tests {
     const MUON_SPEC_TOML: &str = include_str!("../examples/muon.toml");
     const MUON_TAGGER_SPEC_TOML: &str = include_str!("../examples/muon_tagger.toml");
     const DIMUON_SPEC_TOML: &str = include_str!("../examples/dimuon.toml");
+    const HIGGS4MU_MINIMAL_SPEC_TOML: &str = include_str!("../examples/higgs4mu_minimal.toml");
+    const HIGGS2E2MU_MINIMAL_SPEC_TOML: &str = include_str!("../examples/higgs2e2mu_minimal.toml");
     const MUON_SPEC_YAML: &str = include_str!("../examples/muon.yaml");
     const MUON_SPEC_JSON: &str = r#"
 {
@@ -1936,6 +2048,7 @@ mod tests {
                 object: "good_muon".to_string(),
                 constraints: vec![PairConstraint::OppositeCharge],
                 selection: PairSelection::LeadingPt,
+                exclude: vec![],
             })
         );
         assert_eq!(
@@ -1969,6 +2082,143 @@ mod tests {
                 ("Muon_pt", BranchType::VecF32),
             ]
         );
+    }
+
+    #[test]
+    fn parses_nested_four_lepton_candidates_into_typed_ir() {
+        let spec = AnalysisSpec::from_toml_str(HIGGS4MU_MINIMAL_SPEC_TOML).expect("parse 4mu spec");
+
+        assert_eq!(spec.derived_objects.len(), 3);
+        let z2 = spec
+            .derived_objects
+            .iter()
+            .find(|derived| derived.name == "z2")
+            .expect("z2 derived object");
+        let h = spec
+            .derived_objects
+            .iter()
+            .find(|derived| derived.name == "h")
+            .expect("h derived object");
+        assert!(matches!(
+            &z2.source,
+            DerivedSource::Pair(ObjectPairDef { exclude, .. }) if exclude == &vec!["z1".to_string()]
+        ));
+        assert_eq!(
+            h.source,
+            DerivedSource::Candidate(ObjectCandidateDef {
+                items: vec!["z1".to_string(), "z2".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn validation_derives_nested_four_lepton_read_branches() {
+        let spec = AnalysisSpec::from_toml_str(HIGGS4MU_MINIMAL_SPEC_TOML).expect("parse 4mu spec");
+        let plan = validate(&spec, &catalogue()).expect("validate 4mu spec");
+        let read_branches = plan
+            .read_branches
+            .specs()
+            .iter()
+            .map(|spec| (spec.name.as_str(), spec.branch_type))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            read_branches,
+            vec![
+                ("nMuon", BranchType::U32),
+                ("Muon_charge", BranchType::VecI32),
+                ("Muon_eta", BranchType::VecF32),
+                ("Muon_mass", BranchType::VecF32),
+                ("Muon_phi", BranchType::VecF32),
+                ("Muon_pt", BranchType::VecF32),
+            ]
+        );
+    }
+
+    #[test]
+    fn validation_derives_cross_collection_candidate_read_branches() {
+        let spec =
+            AnalysisSpec::from_toml_str(HIGGS2E2MU_MINIMAL_SPEC_TOML).expect("parse 2e2mu spec");
+        let plan = validate(&spec, &catalogue()).expect("validate 2e2mu spec");
+        let read_branches = plan
+            .read_branches
+            .specs()
+            .iter()
+            .map(|spec| (spec.name.as_str(), spec.branch_type))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            read_branches,
+            vec![
+                ("nElectron", BranchType::U32),
+                ("nMuon", BranchType::U32),
+                ("Electron_eta", BranchType::VecF32),
+                ("Electron_mass", BranchType::VecF32),
+                ("Electron_phi", BranchType::VecF32),
+                ("Electron_pt", BranchType::VecF32),
+                ("Muon_eta", BranchType::VecF32),
+                ("Muon_mass", BranchType::VecF32),
+                ("Muon_phi", BranchType::VecF32),
+                ("Muon_pt", BranchType::VecF32),
+            ]
+        );
+    }
+
+    #[test]
+    fn validation_rejects_candidate_item_over_undefined_source() {
+        let spec_text = HIGGS2E2MU_MINIMAL_SPEC_TOML.replace(
+            "items = [\"z_mu\", \"z_el\"]",
+            "items = [\"z_mu\", \"ghost\"]",
+        );
+        let spec = AnalysisSpec::from_toml_str(&spec_text).expect("parse modified spec");
+        let errors = validate(&spec, &catalogue()).expect_err("validation should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::UndefinedObject { object, .. } if object == "ghost"
+        )));
+    }
+
+    #[test]
+    fn validation_rejects_remaining_from_incompatible_collection() {
+        let spec_text = r#"
+[analysis]
+name = "bad_remaining"
+year = "Run2012"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[objects.good_electron]
+source = "Electron"
+cuts = []
+
+[derived.z_el]
+kind = "pair"
+object = "good_electron"
+constraints = ["opposite_charge"]
+selection = "leading_pt"
+
+[derived.z_mu_remaining]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "leading_pt"
+exclude = ["z_el"]
+
+[[outputs]]
+name = "mass"
+expr = "z_mu_remaining.mass"
+"#;
+        let spec = AnalysisSpec::from_toml_str(spec_text).expect("parse modified spec");
+        let errors = validate(&spec, &catalogue()).expect_err("validation should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidExpression { detail, .. }
+                if detail.contains("instead of `good_muon`")
+        )));
     }
 
     #[test]

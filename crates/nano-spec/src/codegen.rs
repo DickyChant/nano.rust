@@ -12,8 +12,8 @@ use std::fmt::Write as _;
 use nano_core::BranchType;
 
 use crate::{
-    AnalysisSpec, CmpOp, DerivedObjectDef, DerivedSource, Expr, ModelDef, ObjectDef,
-    PairConstraint, PairSelection, ResolvedPlan,
+    AnalysisSpec, CmpOp, DerivedObjectDef, DerivedSource, Expr, ModelDef, ObjectCandidateDef,
+    ObjectDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
 };
 
 /// Generate compilable Rust producer source from a validated plan.
@@ -472,6 +472,7 @@ impl<'a> Generator<'a> {
         if !selected_attrs.is_empty() {
             writeln!(source, "        #[derive(Debug, Clone, Copy)]").unwrap();
             writeln!(source, "        struct {selected_type} {{").unwrap();
+            writeln!(source, "            source_index: usize,").unwrap();
             for attr in &selected_attrs {
                 writeln!(
                     source,
@@ -564,6 +565,11 @@ impl<'a> Generator<'a> {
                 "                {selected_ident}.push({selected_type} {{"
             )
             .unwrap();
+            writeln!(
+                source,
+                "                    source_index: {item_ident}.index(),"
+            )
+            .unwrap();
             for attr in &selected_attrs {
                 let attr_ident = attr_ident(&object.name, attr)?;
                 writeln!(
@@ -647,6 +653,14 @@ impl<'a> Generator<'a> {
                         }
                     }
                 }
+                DerivedSource::Candidate(candidate) => {
+                    if candidate.items.iter().any(|item| item == object_name) {
+                        attrs.insert("pt".to_string());
+                        attrs.insert("eta".to_string());
+                        attrs.insert("phi".to_string());
+                        attrs.insert("mass".to_string());
+                    }
+                }
             }
         }
         Ok(attrs)
@@ -663,6 +677,11 @@ impl<'a> Generator<'a> {
             writeln!(source, "struct {type_ident} {{").unwrap();
             writeln!(source, "    mass: f64,").unwrap();
             writeln!(source, "    pt: f64,").unwrap();
+            writeln!(source, "    energy: f64,").unwrap();
+            writeln!(source, "    px: f64,").unwrap();
+            writeln!(source, "    py: f64,").unwrap();
+            writeln!(source, "    pz: f64,").unwrap();
+            writeln!(source, "    constituents: &'static [GenConstituent],").unwrap();
             writeln!(source, "}}").unwrap();
             writeln!(source).unwrap();
         }
@@ -674,6 +693,12 @@ impl<'a> Generator<'a> {
             return Ok(());
         }
 
+        writeln!(source, "#[derive(Debug, Clone, Copy, PartialEq, Eq)]").unwrap();
+        writeln!(source, "struct GenConstituent {{").unwrap();
+        writeln!(source, "    object: &'static str,").unwrap();
+        writeln!(source, "    index: usize,").unwrap();
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
         writeln!(
             source,
             "fn gen_four_vector(pt: f32, eta: f32, phi: f32, mass: f32) -> (f64, f64, f64, f64) {{"
@@ -694,14 +719,32 @@ impl<'a> Generator<'a> {
         writeln!(source, "    (energy, px, py, pz)").unwrap();
         writeln!(source, "}}").unwrap();
         writeln!(source).unwrap();
+        writeln!(
+            source,
+            "fn gen_mass_pt(energy: f64, px: f64, py: f64, pz: f64) -> (f64, f64) {{"
+        )
+        .unwrap();
+        writeln!(source, "    (").unwrap();
+        writeln!(
+            source,
+            "        (energy * energy - px * px - py * py - pz * pz).max(0.0).sqrt(),"
+        )
+        .unwrap();
+        writeln!(source, "        (px * px + py * py).sqrt(),").unwrap();
+        writeln!(source, "    )").unwrap();
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
         Ok(())
     }
 
     fn emit_derived_objects(&self, source: &mut String) -> Result<(), CodegenError> {
-        for derived in &self.spec().derived_objects {
+        for derived in self.ordered_derived_objects()? {
             match &derived.source {
                 DerivedSource::Pair(pair) => {
                     self.emit_pair_derived_object(source, derived, pair)?;
+                }
+                DerivedSource::Candidate(candidate) => {
+                    self.emit_candidate_derived_object(source, derived, candidate)?;
                 }
             }
         }
@@ -712,18 +755,43 @@ impl<'a> Generator<'a> {
         &self,
         source: &mut String,
         derived: &DerivedObjectDef,
-        pair: &crate::ObjectPairDef,
+        pair: &ObjectPairDef,
     ) -> Result<(), CodegenError> {
         let derived_ident = checked_ident(&derived.name, "derived object")?;
         let derived_type = derived_type_ident(&derived.name)?;
         let selected_ident = selected_objects_ident(&pair.object)?;
         let order_ident = format!("{derived_ident}_order");
         let best_diff_ident = format!("{derived_ident}_best_diff");
+        let excluded_ident = format!("{derived_ident}_excluded");
         let target = match &pair.selection {
             PairSelection::LeadingPt => None,
             PairSelection::NearestMass { target } => Some(f64_literal(target.value)),
         };
 
+        if pair.exclude.is_empty() {
+            writeln!(
+                source,
+                "        let {excluded_ident}: Vec<usize> = Vec::new();"
+            )
+            .unwrap();
+        } else {
+            writeln!(source, "        let mut {excluded_ident} = Vec::new();").unwrap();
+        }
+        for excluded in &pair.exclude {
+            let excluded_ident_name = checked_ident(excluded, "excluded derived object")?;
+            writeln!(
+                source,
+                "        if let Some(excluded) = &{excluded_ident_name} {{"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "            {excluded_ident}.extend(excluded.constituents.iter().filter(|item| item.object == {}).map(|item| item.index));",
+                rust_string(&pair.object)
+            )
+            .unwrap();
+            writeln!(source, "        }}").unwrap();
+        }
         writeln!(
             source,
             "        let mut {order_ident} = (0..{selected_ident}.len()).collect::<Vec<_>>();"
@@ -747,11 +815,19 @@ impl<'a> Generator<'a> {
             .unwrap();
         }
         let loop_label = format!("'{}_pairs", derived_ident);
-        writeln!(
-            source,
-            "        {loop_label}: for (left_pos, &left) in {order_ident}.iter().enumerate() {{"
-        )
-        .unwrap();
+        if target.is_some() {
+            writeln!(
+                source,
+                "        for (left_pos, &left) in {order_ident}.iter().enumerate() {{"
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                source,
+                "        {loop_label}: for (left_pos, &left) in {order_ident}.iter().enumerate() {{"
+            )
+            .unwrap();
+        }
         writeln!(
             source,
             "            for &right in &{order_ident}[left_pos + 1..] {{"
@@ -767,6 +843,13 @@ impl<'a> Generator<'a> {
             "                let second = {selected_ident}[right];"
         )
         .unwrap();
+        writeln!(
+            source,
+            "                if {excluded_ident}.contains(&first.source_index) || {excluded_ident}.contains(&second.source_index) {{"
+        )
+        .unwrap();
+        writeln!(source, "                    continue;").unwrap();
+        writeln!(source, "                }}").unwrap();
 
         for constraint in &pair.constraints {
             match constraint {
@@ -799,7 +882,7 @@ impl<'a> Generator<'a> {
         writeln!(source, "                let pz = pz1 + pz2;").unwrap();
         writeln!(
             source,
-            "                let mass = (energy * energy - px * px - py * py - pz * pz).max(0.0).sqrt();"
+            "                let (mass, pt) = gen_mass_pt(energy, px, py, pz);"
         )
         .unwrap();
         writeln!(
@@ -811,12 +894,25 @@ impl<'a> Generator<'a> {
         writeln!(source, "                }}").unwrap();
         writeln!(
             source,
-            "                let pt = (px * px + py * py).sqrt();"
+            "                let constituents = Box::leak(Box::new(["
         )
         .unwrap();
         writeln!(
             source,
-            "                let candidate = {derived_type} {{ mass, pt }};"
+            "                    GenConstituent {{ object: {}, index: first.source_index }},",
+            rust_string(&pair.object)
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "                    GenConstituent {{ object: {}, index: second.source_index }},",
+            rust_string(&pair.object)
+        )
+        .unwrap();
+        writeln!(source, "                ]));").unwrap();
+        writeln!(
+            source,
+            "                let candidate = {derived_type} {{ mass, pt, energy, px, py, pz, constituents }};"
         )
         .unwrap();
         match target {
@@ -832,7 +928,7 @@ impl<'a> Generator<'a> {
                 .unwrap();
                 writeln!(
                     source,
-                    "                if {best_diff_ident}.map_or(true, |best| diff < best) {{"
+                    "                if {best_diff_ident}.is_none_or(|best| diff < best) {{"
                 )
                 .unwrap();
                 writeln!(
@@ -848,6 +944,116 @@ impl<'a> Generator<'a> {
                 writeln!(source, "                }}").unwrap();
             }
         }
+        writeln!(source, "            }}").unwrap();
+        writeln!(source, "        }}").unwrap();
+        writeln!(source).unwrap();
+        Ok(())
+    }
+
+    fn emit_candidate_derived_object(
+        &self,
+        source: &mut String,
+        derived: &DerivedObjectDef,
+        candidate: &ObjectCandidateDef,
+    ) -> Result<(), CodegenError> {
+        let derived_ident = checked_ident(&derived.name, "derived object")?;
+        let derived_type = derived_type_ident(&derived.name)?;
+        let used_ident = format!("{derived_ident}_used");
+
+        writeln!(
+            source,
+            "        let mut {derived_ident}: Option<{derived_type}> = None;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "        let mut {used_ident}: Vec<GenConstituent> = Vec::new();"
+        )
+        .unwrap();
+        writeln!(source, "        let mut energy = 0.0_f64;").unwrap();
+        writeln!(source, "        let mut px = 0.0_f64;").unwrap();
+        writeln!(source, "        let mut py = 0.0_f64;").unwrap();
+        writeln!(source, "        let mut pz = 0.0_f64;").unwrap();
+        writeln!(source, "        let mut candidate_complete = true;").unwrap();
+
+        let mut object_occurrences = BTreeMap::<String, usize>::new();
+        for item in &candidate.items {
+            if self.object(item).is_ok() {
+                let occurrence = object_occurrences.entry(item.clone()).or_insert(0);
+                let source_ident = selected_objects_ident(item)?;
+                let local_ident = format!("{derived_ident}_{item}_{occurrence}");
+                writeln!(source, "        if candidate_complete {{").unwrap();
+                writeln!(
+                    source,
+                    "            if let Some({local_ident}) = {object_getter}.copied() {{",
+                    object_getter = if *occurrence == 0 {
+                        format!("{source_ident}.first()")
+                    } else {
+                        format!("{source_ident}.get({occurrence})")
+                    }
+                )
+                .unwrap();
+                writeln!(
+                    source,
+                    "                let (item_e, item_px, item_py, item_pz) = gen_four_vector({local_ident}.pt, {local_ident}.eta, {local_ident}.phi, {local_ident}.mass);"
+                )
+                .unwrap();
+                writeln!(source, "                energy += item_e;").unwrap();
+                writeln!(source, "                px += item_px;").unwrap();
+                writeln!(source, "                py += item_py;").unwrap();
+                writeln!(source, "                pz += item_pz;").unwrap();
+                writeln!(
+                    source,
+                    "                {used_ident}.push(GenConstituent {{ object: {}, index: {local_ident}.source_index }});",
+                    rust_string(item)
+                )
+                .unwrap();
+                writeln!(source, "            }} else {{").unwrap();
+                writeln!(source, "                candidate_complete = false;").unwrap();
+                writeln!(source, "            }}").unwrap();
+                writeln!(source, "        }}").unwrap();
+                *occurrence += 1;
+            } else {
+                self.derived_object(item)?;
+                let item_ident = checked_ident(item, "candidate item")?;
+                writeln!(source, "        if candidate_complete {{").unwrap();
+                writeln!(
+                    source,
+                    "            if let Some({item_ident}) = &{item_ident} {{"
+                )
+                .unwrap();
+                writeln!(source, "                energy += {item_ident}.energy;").unwrap();
+                writeln!(source, "                px += {item_ident}.px;").unwrap();
+                writeln!(source, "                py += {item_ident}.py;").unwrap();
+                writeln!(source, "                pz += {item_ident}.pz;").unwrap();
+                writeln!(
+                    source,
+                    "                {used_ident}.extend({item_ident}.constituents.iter().copied());"
+                )
+                .unwrap();
+                writeln!(source, "            }} else {{").unwrap();
+                writeln!(source, "                candidate_complete = false;").unwrap();
+                writeln!(source, "            }}").unwrap();
+                writeln!(source, "        }}").unwrap();
+            }
+        }
+        writeln!(source, "        if candidate_complete {{").unwrap();
+        writeln!(
+            source,
+            "            let (mass, pt) = gen_mass_pt(energy, px, py, pz);"
+        )
+        .unwrap();
+        writeln!(source, "            if mass.is_finite() && mass > 0.0 {{").unwrap();
+        writeln!(
+            source,
+            "                let constituents = Box::leak({used_ident}.into_boxed_slice());"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "                {derived_ident} = Some({derived_type} {{ mass, pt, energy, px, py, pz, constituents }});"
+        )
+        .unwrap();
         writeln!(source, "            }}").unwrap();
         writeln!(source, "        }}").unwrap();
         writeln!(source).unwrap();
@@ -1048,6 +1254,32 @@ impl<'a> Generator<'a> {
                         )));
                     }
                 }
+                for excluded in &pair.exclude {
+                    self.derived_object(excluded)?;
+                }
+                Ok(())
+            }
+            DerivedSource::Candidate(candidate) => {
+                if candidate.items.is_empty() {
+                    return Err(CodegenError::UnsupportedFeature(format!(
+                        "derived candidate `{}` has no items",
+                        derived.name
+                    )));
+                }
+                for item in &candidate.items {
+                    if self.object(item).is_ok() {
+                        for attr in ["pt", "eta", "phi", "mass"] {
+                            if self.object_attr_branch_type(item, attr)? != BranchType::VecF32 {
+                                return Err(CodegenError::UnsupportedFeature(format!(
+                                    "derived candidate `{}` requires `{}`.{attr} as a f32 vector branch",
+                                    derived.name, item
+                                )));
+                            }
+                        }
+                    } else {
+                        self.derived_object(item)?;
+                    }
+                }
                 Ok(())
             }
         }
@@ -1090,6 +1322,43 @@ impl<'a> Generator<'a> {
                     "derived object `{name}` is not defined in the analysis spec"
                 ))
             })
+    }
+
+    fn ordered_derived_objects(&self) -> Result<Vec<&DerivedObjectDef>, CodegenError> {
+        let mut ordered = Vec::with_capacity(self.spec().derived_objects.len());
+        let mut visiting = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        for derived in &self.spec().derived_objects {
+            self.visit_derived(derived, &mut visiting, &mut visited, &mut ordered)?;
+        }
+        Ok(ordered)
+    }
+
+    fn visit_derived<'b>(
+        &'b self,
+        derived: &'b DerivedObjectDef,
+        visiting: &mut BTreeSet<String>,
+        visited: &mut BTreeSet<String>,
+        ordered: &mut Vec<&'b DerivedObjectDef>,
+    ) -> Result<(), CodegenError> {
+        if visited.contains(&derived.name) {
+            return Ok(());
+        }
+        if !visiting.insert(derived.name.clone()) {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "derived object dependency cycle includes `{}`",
+                derived.name
+            )));
+        }
+        for dependency in derived_dependencies(derived) {
+            if let Ok(dep) = self.derived_object(&dependency) {
+                self.visit_derived(dep, visiting, visited, ordered)?;
+            }
+        }
+        visiting.remove(&derived.name);
+        visited.insert(derived.name.clone());
+        ordered.push(derived);
+        Ok(())
     }
 
     fn validate_model_region_expr(&self, expr: &Expr, context: &str) -> Result<(), CodegenError> {
@@ -1753,6 +2022,13 @@ fn collect_derived_objects_in_expr(
         }
         Expr::Abs(inner) => collect_derived_objects_in_expr(inner, spec, objects),
         _ => {}
+    }
+}
+
+fn derived_dependencies(derived: &DerivedObjectDef) -> Vec<String> {
+    match &derived.source {
+        DerivedSource::Pair(pair) => pair.exclude.clone(),
+        DerivedSource::Candidate(candidate) => candidate.items.clone(),
     }
 }
 

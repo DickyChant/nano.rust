@@ -1,0 +1,37 @@
+[analysis]
+name = "higgs4mu_minimal"
+year = "Run2012"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[derived.z1]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "nearest_mass"
+target = "91.1876 GeV"
+
+[derived.z2]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "leading_pt"
+exclude = ["z1"]
+
+[derived.h]
+kind = "combine"
+items = ["z1", "z2"]
+
+[[outputs]]
+name = "z1_mass"
+expr = "z1.mass"
+
+[[outputs]]
+name = "z2_mass"
+expr = "z2.mass"
+
+[[outputs]]
+name = "h_mass"
+expr = "h.mass"

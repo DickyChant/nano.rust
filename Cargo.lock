@@ -1064,6 +1064,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-gen-higgs4l-demo"
+version = "0.0.0"
+dependencies = [
+ "nano-analysis",
+ "nano-core",
+ "nano-spec",
+]
+
+[[package]]
 name = "nano-gen-tagger-demo"
 version = "0.0.0"
 dependencies = [

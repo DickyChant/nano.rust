@@ -10,7 +10,10 @@ use std::fmt;
 
 use nano_core::{BranchType, Event, ObjectView};
 
-use crate::{CmpOp, Expr, ObjectDef, ResolvedPlan};
+use crate::{
+    CmpOp, DerivedObjectDef, DerivedSource, Expr, ObjectCandidateDef, ObjectDef, ObjectPairDef,
+    PairConstraint, PairSelection, ResolvedPlan,
+};
 
 /// One typed output cell produced by the interpreter.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -87,11 +90,29 @@ impl From<nano_core::NanoError> for InterpretError {
 
 type Result<T> = std::result::Result<T, InterpretError>;
 type SelectedObjects = HashMap<String, Vec<SelectedObject>>;
+type DerivedObjects = HashMap<String, Option<DerivedObject>>;
 
 #[derive(Debug, Clone, PartialEq)]
 struct SelectedObject {
     source_index: usize,
     leading_values: HashMap<String, NumericValue>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DerivedObject {
+    mass: f64,
+    pt: f64,
+    energy: f64,
+    px: f64,
+    py: f64,
+    pz: f64,
+    constituents: Vec<Constituent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Constituent {
+    object: String,
+    index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -132,10 +153,11 @@ pub fn interpret(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>
     }
 
     let selected = select_objects(plan, event)?;
+    let derived = derive_objects(plan, &selected)?;
 
     for region in &plan.spec.regions {
         for requirement in &region.require {
-            let lhs = eval_numeric_expr(&requirement.lhs, &selected, None)?;
+            let lhs = eval_numeric_expr(&requirement.lhs, &selected, &derived, None)?;
             if !compare(lhs.as_f64(), requirement.op, requirement.rhs.value) {
                 return Ok(None);
             }
@@ -144,7 +166,7 @@ pub fn interpret(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>
 
     let mut values = Vec::with_capacity(plan.spec.outputs.len());
     for output in &plan.spec.outputs {
-        let Some(value) = eval_output_expr(&output.expr, &selected)? else {
+        let Some(value) = eval_output_expr(&output.expr, &selected, &derived)? else {
             return Ok(None);
         };
         values.push((output.name.clone(), value));
@@ -194,6 +216,272 @@ fn passes_object_cuts(
     Ok(true)
 }
 
+fn derive_objects(plan: &ResolvedPlan, selected: &SelectedObjects) -> Result<DerivedObjects> {
+    let mut derived = HashMap::with_capacity(plan.spec.derived_objects.len());
+    for object in ordered_derived_objects(plan)? {
+        let value = match &object.source {
+            DerivedSource::Pair(pair) => derive_pair(pair, selected, &derived)?,
+            DerivedSource::Candidate(candidate) => derive_candidate(candidate, selected, &derived)?,
+        };
+        derived.insert(object.name.clone(), value);
+    }
+    Ok(derived)
+}
+
+fn derive_pair(
+    pair: &ObjectPairDef,
+    selected: &SelectedObjects,
+    derived: &DerivedObjects,
+) -> Result<Option<DerivedObject>> {
+    let objects = selected
+        .get(&pair.object)
+        .ok_or_else(|| InterpretError::MissingObject(pair.object.clone()))?;
+    let mut excluded = Vec::new();
+    for name in &pair.exclude {
+        if let Some(object) = derived_object(derived, name)? {
+            excluded.extend(
+                object
+                    .constituents
+                    .iter()
+                    .filter(|item| item.object == pair.object)
+                    .map(|item| item.index),
+            );
+        }
+    }
+
+    let mut order = (0..objects.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        attr_f64(&objects[right], "pt").total_cmp(&attr_f64(&objects[left], "pt"))
+    });
+
+    let target = match &pair.selection {
+        PairSelection::LeadingPt => None,
+        PairSelection::NearestMass { target } => Some(target.value),
+    };
+    let mut best = None;
+    let mut best_diff = None::<f64>;
+    for (left_pos, &left) in order.iter().enumerate() {
+        for &right in &order[left_pos + 1..] {
+            let first = &objects[left];
+            let second = &objects[right];
+            if excluded.contains(&first.source_index) || excluded.contains(&second.source_index) {
+                continue;
+            }
+            if !passes_pair_constraints(pair, first, second)? {
+                continue;
+            }
+            let candidate = combine_selected(&pair.object, [first, second])?;
+            if !candidate.mass.is_finite() || candidate.mass <= 0.0 {
+                continue;
+            }
+            if let Some(target) = target {
+                let diff = (candidate.mass - target).abs();
+                if best_diff.is_none_or(|best| diff < best) {
+                    best_diff = Some(diff);
+                    best = Some(candidate);
+                }
+            } else {
+                return Ok(Some(candidate));
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn derive_candidate(
+    candidate: &ObjectCandidateDef,
+    selected: &SelectedObjects,
+    derived: &DerivedObjects,
+) -> Result<Option<DerivedObject>> {
+    let mut occurrences = HashMap::<&str, usize>::new();
+    let mut energy = 0.0;
+    let mut px = 0.0;
+    let mut py = 0.0;
+    let mut pz = 0.0;
+    let mut constituents = Vec::new();
+
+    for item in &candidate.items {
+        if let Some(objects) = selected.get(item) {
+            let occurrence = occurrences.entry(item.as_str()).or_insert(0);
+            let Some(object) = objects.get(*occurrence) else {
+                return Ok(None);
+            };
+            let (item_e, item_px, item_py, item_pz) = selected_four_vector(object);
+            energy += item_e;
+            px += item_px;
+            py += item_py;
+            pz += item_pz;
+            constituents.push(Constituent {
+                object: item.clone(),
+                index: object.source_index,
+            });
+            *occurrence += 1;
+        } else if let Some(object) = derived_object(derived, item)? {
+            energy += object.energy;
+            px += object.px;
+            py += object.py;
+            pz += object.pz;
+            constituents.extend(object.constituents.iter().cloned());
+        } else {
+            return Err(InterpretError::MissingObject(item.clone()));
+        }
+    }
+
+    let (mass, pt) = mass_pt(energy, px, py, pz);
+    if mass.is_finite() && mass > 0.0 {
+        Ok(Some(DerivedObject {
+            mass,
+            pt,
+            energy,
+            px,
+            py,
+            pz,
+            constituents,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn passes_pair_constraints(
+    pair: &ObjectPairDef,
+    first: &SelectedObject,
+    second: &SelectedObject,
+) -> Result<bool> {
+    for constraint in &pair.constraints {
+        match constraint {
+            PairConstraint::OppositeCharge => {
+                if attr_f64(first, "charge") * attr_f64(second, "charge") >= 0.0 {
+                    return Ok(false);
+                }
+            }
+            PairConstraint::SameFlavor => {}
+        }
+    }
+    Ok(true)
+}
+
+fn combine_selected<'a>(
+    object: &str,
+    items: impl IntoIterator<Item = &'a SelectedObject>,
+) -> Result<DerivedObject> {
+    let mut energy = 0.0;
+    let mut px = 0.0;
+    let mut py = 0.0;
+    let mut pz = 0.0;
+    let mut constituents = Vec::new();
+    for item in items {
+        let (item_e, item_px, item_py, item_pz) = selected_four_vector(item);
+        energy += item_e;
+        px += item_px;
+        py += item_py;
+        pz += item_pz;
+        constituents.push(Constituent {
+            object: object.to_string(),
+            index: item.source_index,
+        });
+    }
+    let (mass, pt) = mass_pt(energy, px, py, pz);
+    Ok(DerivedObject {
+        mass,
+        pt,
+        energy,
+        px,
+        py,
+        pz,
+        constituents,
+    })
+}
+
+fn selected_four_vector(item: &SelectedObject) -> (f64, f64, f64, f64) {
+    let pt = attr_f64(item, "pt");
+    let eta = attr_f64(item, "eta");
+    let phi = attr_f64(item, "phi");
+    let mass = attr_f64(item, "mass");
+    let px = pt * phi.cos();
+    let py = pt * phi.sin();
+    let pz = pt * eta.sinh();
+    let energy = (px * px + py * py + pz * pz + mass * mass).sqrt();
+    (energy, px, py, pz)
+}
+
+fn attr_f64(item: &SelectedObject, attr: &str) -> f64 {
+    item.leading_values
+        .get(attr)
+        .copied()
+        .map(NumericValue::as_f64)
+        .unwrap_or(0.0)
+}
+
+fn mass_pt(energy: f64, px: f64, py: f64, pz: f64) -> (f64, f64) {
+    (
+        (energy * energy - px * px - py * py - pz * pz)
+            .max(0.0)
+            .sqrt(),
+        (px * px + py * py).sqrt(),
+    )
+}
+
+fn derived_object<'a>(
+    derived: &'a DerivedObjects,
+    name: &str,
+) -> Result<Option<&'a DerivedObject>> {
+    derived
+        .get(name)
+        .map(Option::as_ref)
+        .ok_or_else(|| InterpretError::MissingObject(name.to_string()))
+}
+
+fn ordered_derived_objects(plan: &ResolvedPlan) -> Result<Vec<&DerivedObjectDef>> {
+    fn visit<'a>(
+        plan: &'a ResolvedPlan,
+        object: &'a DerivedObjectDef,
+        visiting: &mut Vec<String>,
+        visited: &mut Vec<String>,
+        ordered: &mut Vec<&'a DerivedObjectDef>,
+    ) -> Result<()> {
+        if visited.contains(&object.name) {
+            return Ok(());
+        }
+        if visiting.contains(&object.name) {
+            return Err(InterpretError::InvalidExpression(format!(
+                "derived object dependency cycle includes `{}`",
+                object.name
+            )));
+        }
+        visiting.push(object.name.clone());
+        for dependency in derived_dependencies(object) {
+            if let Some(dep) = plan
+                .spec
+                .derived_objects
+                .iter()
+                .find(|derived| derived.name == dependency)
+            {
+                visit(plan, dep, visiting, visited, ordered)?;
+            }
+        }
+        visiting.pop();
+        visited.push(object.name.clone());
+        ordered.push(object);
+        Ok(())
+    }
+
+    let mut ordered = Vec::new();
+    let mut visiting = Vec::new();
+    let mut visited = Vec::new();
+    for object in &plan.spec.derived_objects {
+        visit(plan, object, &mut visiting, &mut visited, &mut ordered)?;
+    }
+    Ok(ordered)
+}
+
+fn derived_dependencies(object: &DerivedObjectDef) -> Vec<String> {
+    match &object.source {
+        DerivedSource::Pair(pair) => pair.exclude.clone(),
+        DerivedSource::Candidate(candidate) => candidate.items.clone(),
+    }
+}
+
 fn leading_attrs_for_object(plan: &ResolvedPlan, object_name: &str) -> Vec<String> {
     let mut attrs = Vec::new();
     for output in &plan.spec.outputs {
@@ -208,7 +496,35 @@ fn leading_attrs_for_object(plan: &ResolvedPlan, object_name: &str) -> Vec<Strin
             collect_leading_attrs(&requirement.lhs, object_name, &mut attrs);
         }
     }
+    for derived in &plan.spec.derived_objects {
+        match &derived.source {
+            DerivedSource::Pair(pair) if pair.object == object_name => {
+                for attr in ["pt", "eta", "phi", "mass"] {
+                    push_attr(&mut attrs, attr);
+                }
+                for constraint in &pair.constraints {
+                    if matches!(constraint, PairConstraint::OppositeCharge) {
+                        push_attr(&mut attrs, "charge");
+                    }
+                }
+            }
+            DerivedSource::Candidate(candidate)
+                if candidate.items.iter().any(|item| item == object_name) =>
+            {
+                for attr in ["pt", "eta", "phi", "mass"] {
+                    push_attr(&mut attrs, attr);
+                }
+            }
+            _ => {}
+        }
+    }
     attrs
+}
+
+fn push_attr(attrs: &mut Vec<String>, attr: &str) {
+    if !attrs.iter().any(|value| value == attr) {
+        attrs.push(attr.to_string());
+    }
 }
 
 fn collect_leading_attrs(expr: &Expr, object_name: &str, attrs: &mut Vec<String>) {
@@ -280,7 +596,11 @@ fn read_object_attr(
     }
 }
 
-fn eval_output_expr(expr: &Expr, selected: &SelectedObjects) -> Result<Option<Value>> {
+fn eval_output_expr(
+    expr: &Expr,
+    selected: &SelectedObjects,
+    derived: &DerivedObjects,
+) -> Result<Option<Value>> {
     match expr {
         Expr::Count(object) => {
             let count = selected
@@ -308,6 +628,18 @@ fn eval_output_expr(expr: &Expr, selected: &SelectedObjects) -> Result<Option<Va
                 })?),
             }))
         }
+        Expr::Attr { object, attr } => {
+            let Some(candidate) = derived_object(derived, object)? else {
+                return Ok(None);
+            };
+            match attr.as_str() {
+                "mass" => Ok(Some(Value::F64(candidate.mass))),
+                "pt" => Ok(Some(Value::F64(candidate.pt))),
+                other => Err(InterpretError::InvalidExpression(format!(
+                    "derived object `{object}` has no interpreted attribute `{other}`"
+                ))),
+            }
+        }
         other => Err(InterpretError::Unsupported(format!(
             "output expression `{other}` is not supported by the interpreter"
         ))),
@@ -317,31 +649,41 @@ fn eval_output_expr(expr: &Expr, selected: &SelectedObjects) -> Result<Option<Va
 fn eval_numeric_expr(
     expr: &Expr,
     selected: &SelectedObjects,
+    derived: &DerivedObjects,
     current: Option<(&str, &SelectedObject)>,
 ) -> Result<NumericValue> {
     match expr {
         Expr::Attr { object, attr } => {
-            let Some((current_object, selected_object)) = current else {
-                return Err(InterpretError::Unsupported(format!(
-                    "expression `{expr}` needs an object context"
-                )));
-            };
-            if object != current_object {
-                return Err(InterpretError::Unsupported(format!(
-                    "expression `{expr}` references `{object}` outside the current object `{current_object}`"
-                )));
+            if let Some((current_object, selected_object)) = current {
+                if object != current_object {
+                    return Err(InterpretError::Unsupported(format!(
+                        "expression `{expr}` references `{object}` outside the current object `{current_object}`"
+                    )));
+                }
+                return selected_object
+                    .leading_values
+                    .get(attr)
+                    .copied()
+                    .ok_or_else(|| {
+                        InterpretError::InvalidExpression(format!(
+                            "attribute `{attr}` was not materialized for `{object}`"
+                        ))
+                    });
             }
-            selected_object
-                .leading_values
-                .get(attr)
-                .copied()
-                .ok_or_else(|| {
-                    InterpretError::InvalidExpression(format!(
-                        "attribute `{attr}` was not materialized for `{object}`"
-                    ))
-                })
+            let candidate = derived_object(derived, object)?.ok_or_else(|| {
+                InterpretError::InvalidExpression(format!(
+                    "derived object `{object}` has no selected candidate"
+                ))
+            })?;
+            match attr.as_str() {
+                "mass" => Ok(NumericValue::F64(candidate.mass)),
+                "pt" => Ok(NumericValue::F64(candidate.pt)),
+                other => Err(InterpretError::InvalidExpression(format!(
+                    "derived object `{object}` has no interpreted attribute `{other}`"
+                ))),
+            }
         }
-        Expr::Abs(inner) => Ok(eval_numeric_expr(inner, selected, current)?.abs()),
+        Expr::Abs(inner) => Ok(eval_numeric_expr(inner, selected, derived, current)?.abs()),
         Expr::Count(object) => {
             let count = selected
                 .get(object)
