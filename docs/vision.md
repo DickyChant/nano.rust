@@ -46,6 +46,7 @@ layer. The analysis *meaning* lives in the typed IR, independent of any backend.
 | 3 — Semantic compiler | spec → semantic IR → validate → Rust codegen | **Core done** — `nano-spec` validate + derive `read_branches` + codegen, proven equal to hand-written (`nano-gen-demo`), incl. **inference codegen** (`nano-gen-tagger-demo`) |
 | 4 — Workflow DAG (executor-agnostic) | typed workflow **DAG** as a portable IR: chunking, merging, provenance, staleness | **In progress** — `nano-workflow` typed DAG + local serial/parallel executor built; portable JSON export + standalone task unit + **Dask/Ray adapters** next. No built-in scheduler (LAW/HTCondor descoped) — the DAG is delegated to Dask/Ray/any system |
 | 5 — Agentic integration | agent-operable harness, semantic-diff review, validation/repair | **Started** — `nano-cli` + `nano-mcp` expose the compiler-gated action space; review/repair loops are future |
+| 7 — UI / visualization layer | optional human cockpit over the DAG: capability-gated **web dashboard (kuva SVG) + ROOT browser** if kuva is present, else a **TUI** | **Planned** — the human counterpart to the MCP agent view; both front-ends share one UI-agnostic session core. See [`ui-layer.md`](ui-layer.md) |
 
 Beyond the original plan, an **inference protocol** (`nano-inference`: mock / in-process
 ONNX / remote / self-launching server, declared as `[[model]]`) was added as a boundary
