@@ -1,0 +1,19 @@
+[package]
+name = "nano-jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runtime codegen, compile, and dlopen backend for nano.rust specs"
+
+[dependencies]
+nano-core = { workspace = true }
+nano-spec = { workspace = true, optional = true }
+
+[dev-dependencies]
+nano-gen-demo = { workspace = true }
+nano-producers = { workspace = true }
+
+[features]
+default = []
+jit = ["dep:nano-spec"]

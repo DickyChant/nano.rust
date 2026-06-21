@@ -50,7 +50,7 @@ verified IR with pluggable back-ends.
 |---|---|---|---|
 | **interpret** | walk the IR per event (`nano-spec::interpret`, `nano run --interpret`) | the spec *validator* | built |
 | **codegen + AOT** | IR → generated Rust (`nano-analysis` typestate) → compiled kernel | the **Rust compiler** | built |
-| **JIT (compile + dlopen)** | IR → Rust → `rustc` at runtime → `libloading` | the **Rust compiler** | future |
+| **JIT (compile + dlopen)** | IR → Rust → `rustc` at runtime → dynamic loader | the **Rust compiler** | first muon slice, optional |
 | ~~Cranelift / LLVM JIT~~ | lower IR to a codegen backend ourselves | nothing reusable — rejected | — |
 
 The compiled kernel is expressed *in the `nano-analysis` typestate* — `Raw →
@@ -83,6 +83,15 @@ The **interpreter** is the one back-end that does not get the compiler guarantee
 JIT paths remain the trusted *production* back-ends, while the interpreter is the
 *flexible* one (arbitrary validated spec, no toolchain, slightly slower).
 
+The JIT back-end lives in `nano-jit` behind the `jit` feature. It is deliberately
+optional: it needs a Rust toolchain at runtime and pays compile latency before
+the first event. Its purpose is arbitrary validated specs at native speed without
+a manual rebuild, not replacing the default interpreter or AOT paths. The first
+slice exports a C ABI muon kernel (`nMuon`, `Muon_pt`, `Muon_eta`, and a
+`repr(C)` row) so `&nano_core::Event` never crosses the dynamic-library boundary;
+the loaded crate reconstructs its own internal event and calls the generated
+producer inside the dylib.
+
 ## "Verify *what* once; choose *how*"
 
 Because the IR is the contract and back-ends are interchangeable, the same
@@ -102,7 +111,7 @@ the execution.
 |---|---|
 | Front-end (verifier) | `nano-spec` (parse/validate/derive), `nano-corrections` (typed corrections) |
 | Per-event IR + kernel vocabulary | `nano-spec` (IR), `nano-analysis` (typestate), `nano-inference` (model boundary) |
-| Per-event back-ends | `nano-spec::interpret`; codegen → `nano-producers`-shaped kernels; (JIT: future) |
+| Per-event back-ends | `nano-spec::interpret`; codegen → `nano-producers`-shaped kernels; `nano-jit` (optional runtime compile + dlopen) |
 | Data plane | `nano-rootio` (owned ROOT I/O), `nano-io` (streaming), `nano-core` (event model) |
 | Workflow IR + back-ends | `nano-workflow` (DAG, local executor, portable graph, task unit), `integrations/` (Dask/Ray) |
 | Action space | `nano-cli` (`validate`/`branches`/`inspect`/`codegen`/`run`), `nano-mcp` (same as agent tools) |
