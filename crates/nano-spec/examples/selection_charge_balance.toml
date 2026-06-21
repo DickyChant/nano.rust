@@ -1,0 +1,17 @@
+[analysis]
+name = "selection_charge_balance"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = ["pt > 5 GeV"]
+
+[regions.signal]
+require = [
+  "sum(good_muon.charge) == 0",
+  "count(good_muon, charge > 0) == 1",
+]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"

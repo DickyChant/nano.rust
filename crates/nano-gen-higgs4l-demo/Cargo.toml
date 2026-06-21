@@ -10,6 +10,11 @@ build = "build.rs"
 [dependencies]
 nano-analysis = { workspace = true }
 nano-core = { workspace = true }
+nano-io = { workspace = true, optional = true }
+
+[features]
+default = []
+http = ["nano-io/http"]
 
 [build-dependencies]
 nano-spec = { workspace = true }

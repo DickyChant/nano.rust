@@ -1,0 +1,56 @@
+[analysis]
+name = "higgs4l_4mu"
+year = "Run2012"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[derived.z1]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "nearest_mass_truncated"
+target = "91.2 GeV"
+
+[derived.z2]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "leading_pt"
+exclude = ["z1"]
+
+[derived.h]
+kind = "combine"
+items = ["z1", "z2"]
+
+[regions.signal]
+require = [
+  "count(good_muon) == 4",
+  "all(good_muon, pt > 5 GeV)",
+  "all(good_muon, abs(eta) < 2.4)",
+  "all(good_muon, abs(pfRelIso04_all) < 0.40)",
+  "all(good_muon, sqrt(dxy*dxy + dz*dz) / sqrt(dxyErr*dxyErr + dzErr*dzErr) < 4.0)",
+  "all(good_muon, abs(dxy) < 0.5)",
+  "all(good_muon, abs(dz) < 1.0)",
+  "count(good_muon, charge == 1) == 2",
+  "count(good_muon, charge == -1) == 2",
+  "z1.min_delta_r >= 0.02",
+  "z2.min_delta_r >= 0.02",
+  "closest_mass(z1, z2, 91.2 GeV) > 40 GeV",
+  "closest_mass(z1, z2, 91.2 GeV) < 120 GeV",
+  "other_mass(z1, z2, 91.2 GeV) > 12 GeV",
+  "other_mass(z1, z2, 91.2 GeV) < 120 GeV",
+]
+
+[[outputs]]
+name = "z1_mass"
+expr = "closest_mass(z1, z2, 91.2 GeV)"
+
+[[outputs]]
+name = "z2_mass"
+expr = "other_mass(z1, z2, 91.2 GeV)"
+
+[[outputs]]
+name = "h_mass"
+expr = "h.mass"

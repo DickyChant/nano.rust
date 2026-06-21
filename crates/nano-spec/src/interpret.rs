@@ -102,6 +102,7 @@ struct SelectedObject {
 struct DerivedObject {
     mass: f64,
     pt: f64,
+    min_delta_r: f64,
     energy: f64,
     px: f64,
     py: f64,
@@ -221,7 +222,24 @@ fn passes_object_cuts(
 
 fn derive_objects(plan: &ResolvedPlan, selected: &SelectedObjects) -> Result<DerivedObjects> {
     let mut derived = HashMap::with_capacity(plan.spec.derived_objects.len());
-    for object in ordered_derived_objects(plan)? {
+    let mut pending = plan.spec.derived_objects.iter().collect::<Vec<_>>();
+
+    while !pending.is_empty() {
+        let Some(index) = pending.iter().position(|object| {
+            derived_dependencies(object).into_iter().all(|dependency| {
+                !plan
+                    .spec
+                    .derived_objects
+                    .iter()
+                    .any(|derived| derived.name == dependency)
+                    || derived.contains_key(&dependency)
+            })
+        }) else {
+            return Err(InterpretError::InvalidExpression(
+                "derived object dependency cycle or unresolved dependency".to_string(),
+            ));
+        };
+        let object = pending.remove(index);
         let value = match &object.source {
             DerivedSource::Pair(pair) => derive_pair(pair, selected, &derived)?,
             DerivedSource::Candidate(candidate) => derive_candidate(candidate, selected, &derived)?,
@@ -253,16 +271,24 @@ fn derive_pair(
     }
 
     let mut order = (0..objects.len()).collect::<Vec<_>>();
-    order.sort_by(|&left, &right| {
-        attr_f64(&objects[right], "pt").total_cmp(&attr_f64(&objects[left], "pt"))
-    });
+    if !matches!(pair.selection, PairSelection::NearestMassTruncated { .. }) {
+        order.sort_by(|&left, &right| {
+            attr_f64(&objects[right], "pt").total_cmp(&attr_f64(&objects[left], "pt"))
+        });
+    }
 
     let target = match &pair.selection {
         PairSelection::LeadingPt => None,
         PairSelection::NearestMass { target } => Some(target.value),
+        PairSelection::NearestMassTruncated { .. } => None,
+    };
+    let truncated_target = match &pair.selection {
+        PairSelection::NearestMassTruncated { target } => Some(target.value),
+        PairSelection::LeadingPt | PairSelection::NearestMass { .. } => None,
     };
     let mut best = None;
     let mut best_diff = None::<f64>;
+    let mut best_mass = -1_i32;
     for (left_pos, &left) in order.iter().enumerate() {
         for &right in &order[left_pos + 1..] {
             let first = &objects[left];
@@ -284,6 +310,11 @@ fn derive_pair(
                 let diff = (candidate.mass - target).abs();
                 if best_diff.is_none_or(|best| diff < best) {
                     best_diff = Some(diff);
+                    best = Some(candidate);
+                }
+            } else if let Some(target) = truncated_target {
+                if (target - candidate.mass).abs() < (target - f64::from(best_mass)).abs() {
+                    best_mass = candidate.mass as i32;
                     best = Some(candidate);
                 }
             } else {
@@ -337,7 +368,10 @@ fn derive_candidate(
                     .unwrap_or(NumericValue::F64(0.0)),
             });
             *occurrence += 1;
-        } else if let Some(object) = derived_object(derived, item)? {
+        } else if derived.contains_key(item) {
+            let Some(object) = derived_object(derived, item)? else {
+                return Ok(None);
+            };
             energy += object.energy;
             px += object.px;
             py += object.py;
@@ -353,6 +387,7 @@ fn derive_candidate(
         let candidate = DerivedObject {
             mass,
             pt,
+            min_delta_r: candidate_min_delta_r(&constituents),
             energy,
             px,
             py,
@@ -506,6 +541,7 @@ fn combine_selected<'a>(
     Ok(DerivedObject {
         mass,
         pt,
+        min_delta_r: candidate_min_delta_r(&constituents),
         energy,
         px,
         py,
@@ -555,6 +591,21 @@ fn delta_r(left_eta: f64, left_phi: f64, right_eta: f64, right_phi: f64) -> f64 
     (deta * deta + dphi * dphi).sqrt()
 }
 
+fn candidate_min_delta_r(constituents: &[Constituent]) -> f64 {
+    let mut min = f64::INFINITY;
+    for (left_pos, left) in constituents.iter().enumerate() {
+        for right in &constituents[left_pos + 1..] {
+            min = min.min(delta_r(
+                left.eta.as_f64(),
+                left.phi.as_f64(),
+                right.eta.as_f64(),
+                right.phi.as_f64(),
+            ));
+        }
+    }
+    min
+}
+
 fn derived_object<'a>(
     derived: &'a DerivedObjects,
     name: &str,
@@ -563,49 +614,6 @@ fn derived_object<'a>(
         .get(name)
         .map(Option::as_ref)
         .ok_or_else(|| InterpretError::MissingObject(name.to_string()))
-}
-
-fn ordered_derived_objects(plan: &ResolvedPlan) -> Result<Vec<&DerivedObjectDef>> {
-    fn visit<'a>(
-        plan: &'a ResolvedPlan,
-        object: &'a DerivedObjectDef,
-        visiting: &mut Vec<String>,
-        visited: &mut Vec<String>,
-        ordered: &mut Vec<&'a DerivedObjectDef>,
-    ) -> Result<()> {
-        if visited.contains(&object.name) {
-            return Ok(());
-        }
-        if visiting.contains(&object.name) {
-            return Err(InterpretError::InvalidExpression(format!(
-                "derived object dependency cycle includes `{}`",
-                object.name
-            )));
-        }
-        visiting.push(object.name.clone());
-        for dependency in derived_dependencies(object) {
-            if let Some(dep) = plan
-                .spec
-                .derived_objects
-                .iter()
-                .find(|derived| derived.name == dependency)
-            {
-                visit(plan, dep, visiting, visited, ordered)?;
-            }
-        }
-        visiting.pop();
-        visited.push(object.name.clone());
-        ordered.push(object);
-        Ok(())
-    }
-
-    let mut ordered = Vec::new();
-    let mut visiting = Vec::new();
-    let mut visited = Vec::new();
-    for object in &plan.spec.derived_objects {
-        visit(plan, object, &mut visiting, &mut visited, &mut ordered)?;
-    }
-    Ok(ordered)
 }
 
 fn derived_dependencies(object: &DerivedObjectDef) -> Vec<String> {
@@ -841,6 +849,7 @@ fn eval_output_expr(
             match attr.as_str() {
                 "mass" => Ok(Some(Value::F64(candidate.mass))),
                 "pt" => Ok(Some(Value::F64(candidate.pt))),
+                "min_delta_r" | "dR" | "dr" => Ok(Some(Value::F64(candidate.min_delta_r))),
                 other => Err(InterpretError::InvalidExpression(format!(
                     "derived object `{object}` has no interpreted attribute `{other}`"
                 ))),
@@ -851,6 +860,40 @@ fn eval_output_expr(
         )?))),
         Expr::Any { object, predicate } => Ok(Some(Value::Bool(collection_any(
             selected, derived, object, predicate,
+        )?))),
+        Expr::EitherPairPt {
+            left,
+            right,
+            leading,
+            subleading,
+        } => Ok(Some(Value::Bool(either_pair_pt(
+            selected,
+            left,
+            right,
+            leading.value,
+            subleading.value,
+        )?))),
+        Expr::ClosestMass {
+            left,
+            right,
+            target,
+        } => Ok(Some(Value::F64(ordered_mass(
+            derived,
+            left,
+            right,
+            target.value,
+            true,
+        )?))),
+        Expr::OtherMass {
+            left,
+            right,
+            target,
+        } => Ok(Some(Value::F64(ordered_mass(
+            derived,
+            left,
+            right,
+            target.value,
+            false,
         )?))),
         other => Err(InterpretError::Unsupported(format!(
             "output expression `{other}` is not supported by the interpreter"
@@ -890,6 +933,7 @@ fn eval_numeric_expr(
             match attr.as_str() {
                 "mass" => Ok(NumericValue::F64(candidate.mass)),
                 "pt" => Ok(NumericValue::F64(candidate.pt)),
+                "min_delta_r" | "dR" | "dr" => Ok(NumericValue::F64(candidate.min_delta_r)),
                 other => Err(InterpretError::InvalidExpression(format!(
                     "derived object `{object}` has no interpreted attribute `{other}`"
                 ))),
@@ -932,6 +976,40 @@ fn eval_numeric_expr(
                 0
             },
         )),
+        Expr::EitherPairPt {
+            left,
+            right,
+            leading,
+            subleading,
+        } => Ok(NumericValue::U64(
+            if either_pair_pt(selected, left, right, leading.value, subleading.value)? {
+                1
+            } else {
+                0
+            },
+        )),
+        Expr::ClosestMass {
+            left,
+            right,
+            target,
+        } => Ok(NumericValue::F64(ordered_mass(
+            derived,
+            left,
+            right,
+            target.value,
+            true,
+        )?)),
+        Expr::OtherMass {
+            left,
+            right,
+            target,
+        } => Ok(NumericValue::F64(ordered_mass(
+            derived,
+            left,
+            right,
+            target.value,
+            false,
+        )?)),
         Expr::LeadingAttr { object, attr } => {
             leading_value(selected, object, attr)?.ok_or_else(|| {
                 InterpretError::InvalidExpression(format!(
@@ -948,6 +1026,61 @@ fn eval_numeric_expr(
             "filter-only expression `{expr}` is not valid here"
         ))),
     }
+}
+
+fn either_pair_pt(
+    selected: &SelectedObjects,
+    left: &str,
+    right: &str,
+    leading: f64,
+    subleading: f64,
+) -> Result<bool> {
+    Ok(pair_pt(selected, left, leading, subleading)?
+        || pair_pt(selected, right, leading, subleading)?)
+}
+
+fn pair_pt(
+    selected: &SelectedObjects,
+    object: &str,
+    leading: f64,
+    subleading: f64,
+) -> Result<bool> {
+    let objects = selected
+        .get(object)
+        .ok_or_else(|| InterpretError::MissingObject(object.to_string()))?;
+    let mut pts = objects
+        .iter()
+        .map(|selected_object| attr_f64(selected_object, "pt"))
+        .collect::<Vec<_>>();
+    pts.sort_by(|left, right| right.total_cmp(left));
+    Ok(
+        pts.first().is_some_and(|pt| *pt > leading)
+            && pts.get(1).is_some_and(|pt| *pt > subleading),
+    )
+}
+
+fn ordered_mass(
+    derived: &DerivedObjects,
+    left: &str,
+    right: &str,
+    target: f64,
+    closest: bool,
+) -> Result<f64> {
+    let left_mass = derived_object(derived, left)?
+        .ok_or_else(|| {
+            InterpretError::InvalidExpression(format!("derived object `{left}` has no candidate"))
+        })?
+        .mass;
+    let right_mass = derived_object(derived, right)?
+        .ok_or_else(|| {
+            InterpretError::InvalidExpression(format!("derived object `{right}` has no candidate"))
+        })?
+        .mass;
+    let left_is_closest = (left_mass - target).abs() < (right_mass - target).abs();
+    Ok(match (closest, left_is_closest) {
+        (true, true) | (false, false) => left_mass,
+        (true, false) | (false, true) => right_mass,
+    })
 }
 
 fn leading_value(

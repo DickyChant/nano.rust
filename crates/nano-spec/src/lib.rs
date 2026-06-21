@@ -172,6 +172,9 @@ pub enum PairSelection {
     LeadingPt,
     /// Choose the valid pair whose invariant mass is closest to a target.
     NearestMass { target: Quantity },
+    /// Match ROOT df103's helper: scan source order and compare against the
+    /// previously stored candidate mass after truncating it to an integer.
+    NearestMassTruncated { target: Quantity },
 }
 
 /// A numeric comparison cut.
@@ -285,6 +288,22 @@ pub enum Expr {
     Any {
         object: String,
         predicate: Box<Cut>,
+    },
+    EitherPairPt {
+        left: String,
+        right: String,
+        leading: Quantity,
+        subleading: Quantity,
+    },
+    ClosestMass {
+        left: String,
+        right: String,
+        target: Quantity,
+    },
+    OtherMass {
+        left: String,
+        right: String,
+        target: Quantity,
     },
     LeadingAttr {
         object: String,
@@ -665,6 +684,18 @@ fn validate_derived_object(derived: &DerivedObjectDef, ctx: &mut ValidationConte
                         ctx.errors,
                     );
                 }
+                PairSelection::NearestMassTruncated { target } => {
+                    validate_quantity_unit(
+                        &context,
+                        &Expr::Attr {
+                            object: derived.name.clone(),
+                            attr: "mass".to_string(),
+                        },
+                        Dimension::Momentum,
+                        target,
+                        ctx.errors,
+                    );
+                }
             }
 
             for excluded in &pair.exclude {
@@ -890,6 +921,31 @@ fn validate_expr(expr: &Expr, context: &str, ctx: &mut ValidationContext<'_>) ->
             validate_collection_predicate(object, predicate, context, ctx);
             Some(ExprType::Bool)
         }
+        Expr::EitherPairPt {
+            left,
+            right,
+            leading,
+            subleading,
+        } => {
+            validate_pair_pt_object(left, leading, subleading, context, ctx);
+            validate_pair_pt_object(right, leading, subleading, context, ctx);
+            Some(ExprType::Bool)
+        }
+        Expr::ClosestMass {
+            left,
+            right,
+            target,
+        }
+        | Expr::OtherMass {
+            left,
+            right,
+            target,
+        } => {
+            validate_mass_order_object(left, context, ctx);
+            validate_mass_order_object(right, context, ctx);
+            validate_quantity_unit(context, expr, Dimension::Momentum, target, ctx.errors);
+            Some(ExprType::Numeric(Dimension::Momentum))
+        }
         Expr::LeadingAttr { object, attr } => validate_attr(object, attr, context, ctx),
         Expr::PairDeltaR
         | Expr::PairLeadingPt
@@ -904,6 +960,61 @@ fn validate_expr(expr: &Expr, context: &str, ctx: &mut ValidationContext<'_>) ->
             None
         }
     }
+}
+
+fn validate_pair_pt_object(
+    object: &str,
+    leading: &Quantity,
+    subleading: &Quantity,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    validate_quantity_unit(
+        context,
+        &Expr::Attr {
+            object: object.to_string(),
+            attr: "pt".to_string(),
+        },
+        Dimension::Momentum,
+        leading,
+        ctx.errors,
+    );
+    validate_quantity_unit(
+        context,
+        &Expr::Attr {
+            object: object.to_string(),
+            attr: "pt".to_string(),
+        },
+        Dimension::Momentum,
+        subleading,
+        ctx.errors,
+    );
+    let Some(source) = ctx.object_sources.get(object) else {
+        ctx.errors.push(SpecError::UndefinedObject {
+            context: context.to_string(),
+            object: object.to_string(),
+        });
+        return;
+    };
+    require_attr_branch_type(
+        source,
+        "pt",
+        BranchType::VecF32,
+        "f32 vector branch for leading/subleading pT",
+        context,
+        ctx,
+    );
+}
+
+fn validate_mass_order_object(object: &str, context: &str, ctx: &mut ValidationContext<'_>) {
+    let Some(derived) = ctx.derived_objects.get(object) else {
+        ctx.errors.push(SpecError::UndefinedObject {
+            context: context.to_string(),
+            object: object.to_string(),
+        });
+        return;
+    };
+    validate_derived_attr(derived, "mass", context, ctx);
 }
 
 fn validate_binary_dimension(
@@ -1090,6 +1201,25 @@ fn validate_derived_attr(
                     );
                     Some(ExprType::Numeric(Dimension::Momentum))
                 }
+                "min_delta_r" | "dR" | "dr" => {
+                    require_attr_branch_type(
+                        source,
+                        "eta",
+                        BranchType::VecF32,
+                        "f32 vector branch for pair delta-R",
+                        context,
+                        ctx,
+                    );
+                    require_attr_branch_type(
+                        source,
+                        "phi",
+                        BranchType::VecF32,
+                        "f32 vector branch for pair delta-R",
+                        context,
+                        ctx,
+                    );
+                    Some(ExprType::Numeric(Dimension::Dimensionless))
+                }
                 other => {
                     ctx.errors.push(SpecError::InvalidExpression {
                         context: context.to_string(),
@@ -1105,6 +1235,7 @@ fn validate_derived_attr(
         DerivedSource::Candidate(_) => match attr {
             "mass" => Some(ExprType::Numeric(Dimension::Momentum)),
             "pt" => Some(ExprType::Numeric(Dimension::Momentum)),
+            "min_delta_r" | "dR" | "dr" => Some(ExprType::Numeric(Dimension::Dimensionless)),
             other => {
                 ctx.errors.push(SpecError::InvalidExpression {
                     context: context.to_string(),
@@ -1741,7 +1872,10 @@ fn parse_candidate_filter(input: &str) -> Result<Cut, ParseError> {
 
 fn parse_requirement(input: &str) -> Result<Requirement, ParseError> {
     let trimmed = input.trim();
-    if starts_with_call(trimmed, "all") || starts_with_call(trimmed, "any") {
+    if starts_with_call(trimmed, "all")
+        || starts_with_call(trimmed, "any")
+        || starts_with_call(trimmed, "either_pair_pt")
+    {
         return Ok(Requirement {
             lhs: parse_expr(trimmed, None)?,
             op: CmpOp::Eq,
@@ -1902,6 +2036,42 @@ fn parse_expr_prec(
         });
     }
 
+    if let Some(inner) = input
+        .strip_prefix("either_pair_pt(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let args = split_top_level_args(inner);
+        if args.len() != 4 {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse either_pair_pt predicate `{input}`; expected either_pair_pt(left, right, leading, subleading)"
+            )));
+        }
+        let left = args[0].trim();
+        let right = args[1].trim();
+        validate_identifier(left, input)?;
+        validate_identifier(right, input)?;
+        return Ok(Expr::EitherPairPt {
+            left: left.to_string(),
+            right: right.to_string(),
+            leading: parse_quantity(args[2].trim())?,
+            subleading: parse_quantity(args[3].trim())?,
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("closest_mass(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return parse_mass_order_expr(input, inner, true);
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("other_mass(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return parse_mass_order_expr(input, inner, false);
+    }
+
     if let Some(rest) = input.strip_prefix("leading(") {
         let Some((object, attr)) = rest.split_once(").") else {
             return Err(ParseError::InvalidSpec(format!(
@@ -1998,6 +2168,52 @@ fn split_top_level_comma(input: &str) -> Option<(&str, &str)> {
         }
     }
     None
+}
+
+fn split_top_level_args(input: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut depth = 0_i32;
+    let mut start = 0;
+    for (index, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(&input[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(&input[start..]);
+    args
+}
+
+fn parse_mass_order_expr(input: &str, inner: &str, closest: bool) -> Result<Expr, ParseError> {
+    let args = split_top_level_args(inner);
+    if args.len() != 3 {
+        return Err(ParseError::InvalidSpec(format!(
+            "could not parse mass-order expression `{input}`; expected function(left, right, target)"
+        )));
+    }
+    let left = args[0].trim();
+    let right = args[1].trim();
+    validate_identifier(left, input)?;
+    validate_identifier(right, input)?;
+    let target = parse_quantity(args[2].trim())?;
+    if closest {
+        Ok(Expr::ClosestMass {
+            left: left.to_string(),
+            right: right.to_string(),
+            target,
+        })
+    } else {
+        Ok(Expr::OtherMass {
+            left: left.to_string(),
+            right: right.to_string(),
+            target,
+        })
+    }
 }
 
 fn find_binary_operator(input: &str, min_prec: u8) -> Option<(usize, ArithOp, u8)> {
@@ -2279,6 +2495,16 @@ fn pair_selection_from_raw(
                 target: parse_quantity(target)?,
             })
         }
+        "nearest_mass_truncated" => {
+            let Some(target) = target else {
+                return Err(ParseError::InvalidSpec(format!(
+                    "derived object `{name}` selection `nearest_mass_truncated` requires `target`"
+                )));
+            };
+            Ok(PairSelection::NearestMassTruncated {
+                target: parse_quantity(target)?,
+            })
+        }
         other => Err(ParseError::InvalidSpec(format!(
             "derived object `{name}` has unsupported pair selection `{other}`"
         ))),
@@ -2527,6 +2753,25 @@ impl fmt::Display for Expr {
                 predicate.op.as_str(),
                 predicate.rhs
             ),
+            Self::EitherPairPt {
+                left,
+                right,
+                leading,
+                subleading,
+            } => write!(
+                f,
+                "either_pair_pt({left}, {right}, {leading}, {subleading})"
+            ),
+            Self::ClosestMass {
+                left,
+                right,
+                target,
+            } => write!(f, "closest_mass({left}, {right}, {target})"),
+            Self::OtherMass {
+                left,
+                right,
+                target,
+            } => write!(f, "other_mass({left}, {right}, {target})"),
             Self::LeadingAttr { object, attr } => write!(f, "leading({object}).{attr}"),
             Self::PairDeltaR => f.write_str("dR"),
             Self::PairLeadingPt => f.write_str("leading_pt"),

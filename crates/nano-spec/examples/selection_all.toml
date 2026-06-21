@@ -1,0 +1,14 @@
+[analysis]
+name = "selection_all"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[regions.signal]
+require = ["all(good_muon, pt > 5 GeV)"]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"

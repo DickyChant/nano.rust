@@ -308,6 +308,16 @@ impl<'a> Generator<'a> {
                 Expr::All { object, .. } | Expr::Any { object, .. } => {
                     self.object(object)?;
                 }
+                Expr::EitherPairPt { left, right, .. } => {
+                    self.object(left)?;
+                    self.object(right)?;
+                    self.require_f32_attr(left, "pt", "either_pair_pt output")?;
+                    self.require_f32_attr(right, "pt", "either_pair_pt output")?;
+                }
+                Expr::ClosestMass { left, right, .. } | Expr::OtherMass { left, right, .. } => {
+                    self.validate_derived_attr(left, "mass", "mass-order output")?;
+                    self.validate_derived_attr(right, "mass", "mass-order output")?;
+                }
                 Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
                     self.validate_derived_attr(object, attr, "derived output")?;
                 }
@@ -709,6 +719,7 @@ impl<'a> Generator<'a> {
             writeln!(source, "struct {type_ident} {{").unwrap();
             writeln!(source, "    mass: f64,").unwrap();
             writeln!(source, "    pt: f64,").unwrap();
+            writeln!(source, "    min_delta_r: f64,").unwrap();
             writeln!(source, "    energy: f64,").unwrap();
             writeln!(source, "    px: f64,").unwrap();
             writeln!(source, "    py: f64,").unwrap();
@@ -879,8 +890,12 @@ impl<'a> Generator<'a> {
         let best_diff_ident = format!("{derived_ident}_best_diff");
         let excluded_ident = format!("{derived_ident}_excluded");
         let target = match &pair.selection {
-            PairSelection::LeadingPt => None,
+            PairSelection::LeadingPt | PairSelection::NearestMassTruncated { .. } => None,
             PairSelection::NearestMass { target } => Some(f64_literal(target.value)),
+        };
+        let truncated_target = match &pair.selection {
+            PairSelection::NearestMassTruncated { target } => Some(f64_literal(target.value)),
+            PairSelection::LeadingPt | PairSelection::NearestMass { .. } => None,
         };
 
         if pair.exclude.is_empty() {
@@ -907,16 +922,24 @@ impl<'a> Generator<'a> {
             .unwrap();
             writeln!(source, "        }}").unwrap();
         }
-        writeln!(
-            source,
-            "        let mut {order_ident} = (0..{selected_ident}.len()).collect::<Vec<_>>();"
-        )
-        .unwrap();
-        writeln!(
-            source,
-            "        {order_ident}.sort_by(|&left, &right| {selected_ident}[right].pt.total_cmp(&{selected_ident}[left].pt));"
-        )
-        .unwrap();
+        if truncated_target.is_none() {
+            writeln!(
+                source,
+                "        let mut {order_ident} = (0..{selected_ident}.len()).collect::<Vec<_>>();"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "        {order_ident}.sort_by(|&left, &right| {selected_ident}[right].pt.total_cmp(&{selected_ident}[left].pt));"
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                source,
+                "        let {order_ident} = (0..{selected_ident}.len()).collect::<Vec<_>>();"
+            )
+            .unwrap();
+        }
         writeln!(
             source,
             "        let mut {derived_ident}: Option<{derived_type}> = None;"
@@ -929,8 +952,15 @@ impl<'a> Generator<'a> {
             )
             .unwrap();
         }
+        if truncated_target.is_some() {
+            writeln!(
+                source,
+                "        let mut {derived_ident}_best_mass = -1_i32;"
+            )
+            .unwrap();
+        }
         let loop_label = format!("'{}_pairs", derived_ident);
-        if target.is_some() {
+        if target.is_some() || truncated_target.is_some() {
             writeln!(
                 source,
                 "        for (left_pos, &left) in {order_ident}.iter().enumerate() {{"
@@ -1040,15 +1070,20 @@ impl<'a> Generator<'a> {
         writeln!(source, "                ]));").unwrap();
         writeln!(
             source,
-            "                let candidate = {derived_type} {{ mass, pt, energy, px, py, pz, constituents }};"
+            "                let min_delta_r = gen_delta_r(first.eta, first.phi, second.eta, second.phi);"
         )
         .unwrap();
-        match target {
-            None => {
+        writeln!(
+            source,
+            "                let candidate = {derived_type} {{ mass, pt, min_delta_r, energy, px, py, pz, constituents }};"
+        )
+        .unwrap();
+        match (target, truncated_target) {
+            (None, None) => {
                 writeln!(source, "                {derived_ident} = Some(candidate);").unwrap();
                 writeln!(source, "                break {loop_label};").unwrap();
             }
-            Some(target) => {
+            (Some(target), None) => {
                 writeln!(
                     source,
                     "                let diff = (mass - {target}).abs();"
@@ -1071,6 +1106,25 @@ impl<'a> Generator<'a> {
                 .unwrap();
                 writeln!(source, "                }}").unwrap();
             }
+            (None, Some(target)) => {
+                writeln!(
+                    source,
+                    "                if ({target} - mass).abs() < ({target} - f64::from({derived_ident}_best_mass)).abs() {{"
+                )
+                .unwrap();
+                writeln!(
+                    source,
+                    "                    {derived_ident}_best_mass = mass as i32;"
+                )
+                .unwrap();
+                writeln!(
+                    source,
+                    "                    {derived_ident} = Some(candidate);"
+                )
+                .unwrap();
+                writeln!(source, "                }}").unwrap();
+            }
+            (Some(_), Some(_)) => unreachable!("pair selection cannot use both nearest modes"),
         }
         writeln!(source, "            }}").unwrap();
         writeln!(source, "        }}").unwrap();
@@ -1184,6 +1238,11 @@ impl<'a> Generator<'a> {
             "            let (mass, pt) = gen_mass_pt(energy, px, py, pz);"
         )
         .unwrap();
+        writeln!(
+            source,
+            "            let min_delta_r = gen_candidate_min_delta_r(&{used_ident});"
+        )
+        .unwrap();
         writeln!(source, "            if mass.is_finite() && mass > 0.0 {{").unwrap();
         for filter in &candidate.filters {
             let lhs = self.emit_candidate_filter_expr(&filter.lhs, &used_ident)?;
@@ -1205,7 +1264,7 @@ impl<'a> Generator<'a> {
         .unwrap();
         writeln!(
             source,
-            "                    {derived_ident} = Some({derived_type} {{ mass, pt, energy, px, py, pz, constituents }});"
+            "                    {derived_ident} = Some({derived_type} {{ mass, pt, min_delta_r, energy, px, py, pz, constituents }});"
         )
         .unwrap();
         writeln!(source, "                }}").unwrap();
@@ -1373,6 +1432,41 @@ impl<'a> Generator<'a> {
                     "region requirement",
                 )?)
             }
+            Expr::EitherPairPt {
+                left,
+                right,
+                leading,
+                subleading,
+            } => {
+                let predicate =
+                    self.emit_either_pair_pt_expr(left, right, leading.value, subleading.value)?;
+                Ok(bool_comparison_expr(
+                    predicate,
+                    op,
+                    rhs,
+                    "region requirement",
+                )?)
+            }
+            Expr::ClosestMass {
+                left,
+                right,
+                target,
+            } => Ok(format!(
+                "{} {} {}",
+                self.emit_ordered_mass_expr(left, right, target.value, true)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
+            Expr::OtherMass {
+                left,
+                right,
+                target,
+            } => Ok(format!(
+                "{} {} {}",
+                self.emit_ordered_mass_expr(left, right, target.value, false)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
             Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
                 let lhs = derived_attr_expr(object, attr)?;
                 Ok(format!("{lhs} {} {}", cmp_op(op), f64_literal(rhs)))
@@ -1397,6 +1491,51 @@ impl<'a> Generator<'a> {
         );
         let predicate = self.emit_selected_predicate(object, &item, predicate)?;
         Ok(format!("{selected}.iter().{method}(|{item}| {predicate})"))
+    }
+
+    fn emit_either_pair_pt_expr(
+        &self,
+        left: &str,
+        right: &str,
+        leading: f64,
+        subleading: f64,
+    ) -> Result<String, CodegenError> {
+        Ok(format!(
+            "({} || {})",
+            self.emit_pair_pt_expr(left, leading, subleading)?,
+            self.emit_pair_pt_expr(right, leading, subleading)?
+        ))
+    }
+
+    fn emit_pair_pt_expr(
+        &self,
+        object: &str,
+        leading: f64,
+        subleading: f64,
+    ) -> Result<String, CodegenError> {
+        let selected = selected_objects_ident(object)?;
+        let item = format!("{}_pt_item", checked_ident(object, "pair pT object")?);
+        Ok(format!(
+            "{{ let mut pts = {selected}.iter().map(|{item}| {item}.pt).collect::<Vec<_>>(); pts.sort_by(|left, right| right.total_cmp(left)); pts.first().is_some_and(|pt| *pt > {}) && pts.get(1).is_some_and(|pt| *pt > {}) }}",
+            f32_literal(leading),
+            f32_literal(subleading)
+        ))
+    }
+
+    fn emit_ordered_mass_expr(
+        &self,
+        left: &str,
+        right: &str,
+        target: f64,
+        closest: bool,
+    ) -> Result<String, CodegenError> {
+        let left = checked_ident(left, "mass-order left")?;
+        let right = checked_ident(right, "mass-order right")?;
+        let target = f64_literal(target);
+        let comparator = if closest { "<" } else { ">=" };
+        Ok(format!(
+            "(if ({left}.mass - {target}).abs() {comparator} ({right}.mass - {target}).abs() {{ {left}.mass }} else {{ {right}.mass }})"
+        ))
     }
 
     fn emit_output_expr(&self, expr: &Expr, output_name: &str) -> Result<String, CodegenError> {
@@ -1424,6 +1563,22 @@ impl<'a> Generator<'a> {
             Expr::Any { object, predicate } => {
                 self.emit_collection_bool_expr("any", object, predicate)
             }
+            Expr::EitherPairPt {
+                left,
+                right,
+                leading,
+                subleading,
+            } => self.emit_either_pair_pt_expr(left, right, leading.value, subleading.value),
+            Expr::ClosestMass {
+                left,
+                right,
+                target,
+            } => self.emit_ordered_mass_expr(left, right, target.value, true),
+            Expr::OtherMass {
+                left,
+                right,
+                target,
+            } => self.emit_ordered_mass_expr(left, right, target.value, false),
             Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
                 derived_attr_expr(object, attr)
             }
@@ -1440,6 +1595,8 @@ impl<'a> Generator<'a> {
             Expr::CountWhere { .. } => Ok("u32"),
             Expr::SumAttr { .. } => Ok("f64"),
             Expr::All { .. } | Expr::Any { .. } => Ok("bool"),
+            Expr::EitherPairPt { .. } => Ok("bool"),
+            Expr::ClosestMass { .. } | Expr::OtherMass { .. } => Ok("f64"),
             Expr::Attr { object, .. } if self.derived_object(object).is_ok() => Ok("f64"),
             Expr::LeadingAttr { .. } => Ok("f32"),
             other => Err(CodegenError::UnsupportedFeature(format!(
@@ -1481,6 +1638,16 @@ impl<'a> Generator<'a> {
             | Expr::Any { object, predicate } => {
                 self.object(object)?;
                 self.validate_selected_expr(object, &predicate.lhs)
+            }
+            Expr::EitherPairPt { left, right, .. } => {
+                self.object(left)?;
+                self.object(right)?;
+                self.require_f32_attr(left, "pt", context)?;
+                self.require_f32_attr(right, "pt", context)
+            }
+            Expr::ClosestMass { left, right, .. } | Expr::OtherMass { left, right, .. } => {
+                self.validate_derived_attr(left, "mass", context)?;
+                self.validate_derived_attr(right, "mass", context)
             }
             Expr::SumAttr { object, attr } => {
                 self.object(object)?;
@@ -1681,7 +1848,7 @@ impl<'a> Generator<'a> {
     ) -> Result<(), CodegenError> {
         self.derived_object(object)?;
         match attr {
-            "mass" | "pt" => Ok(()),
+            "mass" | "pt" | "min_delta_r" | "dR" | "dr" => Ok(()),
             other => Err(CodegenError::UnsupportedFeature(format!(
                 "{context}: derived object `{object}` has no supported attribute `{other}`"
             ))),
@@ -2268,6 +2435,13 @@ fn collect_selected_attr_names(
             collect_selected_attr_names(&predicate.lhs, object_name, attrs)
         }
         Expr::CountWhere { .. } | Expr::All { .. } | Expr::Any { .. } => Ok(()),
+        Expr::EitherPairPt { left, right, .. } => {
+            if left == object_name || right == object_name {
+                attrs.insert("pt".to_string());
+            }
+            Ok(())
+        }
+        Expr::ClosestMass { .. } | Expr::OtherMass { .. } => Ok(()),
         Expr::SumAttr { object, attr } if object == object_name => {
             attrs.insert(attr.clone());
             Ok(())
@@ -2350,6 +2524,10 @@ fn derived_type_ident(object_name: &str) -> Result<String, CodegenError> {
 }
 
 fn derived_attr_expr(object_name: &str, attr: &str) -> Result<String, CodegenError> {
+    let attr = match attr {
+        "dR" | "dr" => "min_delta_r",
+        other => other,
+    };
     Ok(format!(
         "{}.{}",
         checked_ident(object_name, "derived object")?,
@@ -2532,6 +2710,22 @@ fn collect_derived_objects_in_expr(
         | Expr::All { predicate, .. }
         | Expr::Any { predicate, .. } => {
             collect_derived_objects_in_expr(&predicate.lhs, spec, objects);
+        }
+        Expr::ClosestMass { left, right, .. } | Expr::OtherMass { left, right, .. } => {
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *left)
+            {
+                objects.insert(left.clone());
+            }
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *right)
+            {
+                objects.insert(right.clone());
+            }
         }
         _ => {}
     }

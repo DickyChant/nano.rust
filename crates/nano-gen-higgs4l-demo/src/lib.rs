@@ -32,6 +32,19 @@ pub mod higgs4mu {
     clippy::neg_cmp_op_on_partial_ord,
     clippy::unnecessary_cast
 )]
+pub mod higgs4e {
+    include!(concat!(env!("OUT_DIR"), "/generated_higgs4e.rs"));
+}
+
+#[allow(
+    dead_code,
+    non_snake_case,
+    unused_parens,
+    clippy::collapsible_if,
+    clippy::double_parens,
+    clippy::neg_cmp_op_on_partial_ord,
+    clippy::unnecessary_cast
+)]
 pub mod higgs2e2mu {
     include!(concat!(env!("OUT_DIR"), "/generated_higgs2e2mu.rs"));
 }

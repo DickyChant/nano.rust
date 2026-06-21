@@ -1,0 +1,15 @@
+[analysis]
+name = "selection_sip3d"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = [
+  "sqrt(dxy^2 + dz^2) / sqrt(dxyErr^2 + dzErr^2) < 4",
+  "abs(dxy) < 0.5",
+  "abs(dz) < 1",
+]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"

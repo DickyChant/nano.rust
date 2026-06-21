@@ -22,13 +22,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     generate(
         repo_root,
         &catalogue,
-        "crates/nano-spec/examples/higgs4mu_minimal.toml",
+        "crates/nano-spec/examples/higgs4l.toml",
         "generated_higgs4mu.rs",
     )?;
     generate(
         repo_root,
         &catalogue,
-        "crates/nano-spec/examples/higgs2e2mu_minimal.toml",
+        "crates/nano-spec/examples/higgs4l_4e.toml",
+        "generated_higgs4e.rs",
+    )?;
+    generate(
+        repo_root,
+        &catalogue,
+        "crates/nano-spec/examples/higgs4l_2e2mu.toml",
         "generated_higgs2e2mu.rs",
     )?;
 

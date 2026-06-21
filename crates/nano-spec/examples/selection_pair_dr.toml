@@ -1,0 +1,18 @@
+[analysis]
+name = "selection_pair_dr"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = ["pt > 5 GeV"]
+
+[derived.z]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+filters = ["dR > 0.3", "leading_pt > 20 GeV", "subleading_pt > 10 GeV"]
+selection = "leading_pt"
+
+[[outputs]]
+name = "z_mass"
+expr = "z.mass"
