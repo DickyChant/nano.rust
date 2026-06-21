@@ -340,6 +340,20 @@ impl Hist1D {
         self.underflow + self.overflow + self.bins.iter().sum::<f64>()
     }
 
+    /// Add another histogram with identical binning into this one.
+    ///
+    /// Panics if the histogram binning differs.
+    pub fn add(&mut self, other: &Self) {
+        assert_eq!(self.bins.len(), other.bins.len(), "histogram bin mismatch");
+        assert_eq!(self.low, other.low, "histogram low edge mismatch");
+        assert_eq!(self.high, other.high, "histogram high edge mismatch");
+        self.underflow += other.underflow;
+        self.overflow += other.overflow;
+        for (left, right) in self.bins.iter_mut().zip(&other.bins) {
+            *left += right;
+        }
+    }
+
     fn fill_weighted(&mut self, value: f64, weight: f64) {
         if value < self.low {
             self.underflow += weight;

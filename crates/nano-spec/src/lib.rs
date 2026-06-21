@@ -25,6 +25,10 @@ pub struct AnalysisSpec {
     pub models: Vec<ModelDef>,
     pub regions: Vec<RegionDef>,
     pub outputs: Vec<OutputDef>,
+    pub histograms: Vec<HistogramDef>,
+    pub weight: WeightDef,
+    pub systematics: Vec<SystematicDef>,
+    pub channels: Vec<ChannelDef>,
 }
 
 impl AnalysisSpec {
@@ -350,6 +354,59 @@ pub struct OutputDef {
     pub expr: Expr,
 }
 
+/// Histogram terminal requested by the spec.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HistogramDef {
+    pub name: String,
+    pub expr: Expr,
+    pub bins: usize,
+    pub range: [f64; 2],
+}
+
+/// Multiplicative event-weight factors.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WeightDef {
+    pub nominal: Vec<f64>,
+}
+
+/// Systematic variations requested by a spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SystematicDef {
+    Nominal,
+    JesUp,
+    JesDown,
+    JerUp,
+    JerDown,
+}
+
+/// One channel inside a multi-channel union spec.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChannelDef {
+    pub name: String,
+    pub objects: Vec<ObjectDef>,
+    pub derived_objects: Vec<DerivedObjectDef>,
+    pub regions: Vec<RegionDef>,
+    pub outputs: Vec<OutputDef>,
+}
+
+impl ChannelDef {
+    fn as_spec(&self, parent: &AnalysisSpec) -> AnalysisSpec {
+        AnalysisSpec {
+            name: format!("{}_{}", parent.name, self.name),
+            year: parent.year.clone(),
+            objects: self.objects.clone(),
+            derived_objects: self.derived_objects.clone(),
+            models: Vec::new(),
+            regions: self.regions.clone(),
+            outputs: self.outputs.clone(),
+            histograms: parent.histograms.clone(),
+            weight: parent.weight.clone(),
+            systematics: parent.systematics.clone(),
+            channels: Vec::new(),
+        }
+    }
+}
+
 /// A parsed NanoAOD branch catalogue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Catalogue {
@@ -423,52 +480,32 @@ pub fn parse_analysis_spec_with_format(
 
 fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseError> {
     validate_raw_analysis_spec(&raw)?;
-    let mut objects = Vec::with_capacity(raw.objects.len());
-    for (name, object) in raw.objects {
-        let cuts = object
-            .cuts
-            .iter()
-            .map(|cut| parse_cut(cut, &name))
-            .collect::<Result<Vec<_>, _>>()?;
-        objects.push(ObjectDef {
-            name,
-            source: object.source,
-            cuts,
-        });
-    }
-
-    let derived_objects = raw
-        .derived
-        .into_iter()
-        .map(derived_object_def_from_raw)
-        .collect::<Result<Vec<_>, _>>()?;
-
+    let objects = object_defs_from_raw(raw.objects)?;
+    let derived_objects = derived_defs_from_raw(raw.derived)?;
     let models = raw
         .models
         .into_iter()
         .map(model_def_from_raw)
         .collect::<Result<Vec<_>, _>>()?;
-
-    let mut regions = Vec::with_capacity(raw.regions.len());
-    for (name, region) in raw.regions {
-        let require = region
-            .require
-            .iter()
-            .map(|requirement| parse_requirement(requirement))
-            .collect::<Result<Vec<_>, _>>()?;
-        regions.push(RegionDef { name, require });
-    }
-
-    let outputs = raw
-        .outputs
+    let regions = region_defs_from_raw(raw.regions)?;
+    let outputs = output_defs_from_raw(&raw.outputs)?;
+    let histograms = histogram_defs_from_raw(&raw.histograms)?;
+    let weight = raw.weight.map(weight_def_from_raw).unwrap_or_default();
+    let systematics = raw
+        .systematics
         .iter()
-        .map(|output| {
-            Ok(OutputDef {
-                name: output.name.clone(),
-                expr: parse_expr(&output.expr, None)?,
-            })
-        })
-        .collect::<Result<Vec<_>, ParseError>>()?;
+        .map(|systematic| systematic_def_from_raw(systematic))
+        .collect::<Result<Vec<_>, _>>()?;
+    let systematics = if systematics.is_empty() {
+        vec![SystematicDef::Nominal]
+    } else {
+        systematics
+    };
+    let channels = raw
+        .channels
+        .into_iter()
+        .map(channel_def_from_raw)
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(AnalysisSpec {
         name: raw.analysis.name,
@@ -478,6 +515,10 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
         models,
         regions,
         outputs,
+        histograms,
+        weight,
+        systematics,
+        channels,
     })
 }
 
@@ -486,6 +527,10 @@ pub fn validate(
     spec: &AnalysisSpec,
     catalogue: &Catalogue,
 ) -> Result<ResolvedPlan, Vec<SpecError>> {
+    if !spec.channels.is_empty() {
+        return validate_union(spec, catalogue);
+    }
+
     let object_sources = spec
         .objects
         .iter()
@@ -531,6 +576,10 @@ pub fn validate(
         for output in &spec.outputs {
             validate_expr(&output.expr, &format!("output `{}`", output.name), &mut ctx);
         }
+
+        for histogram in &spec.histograms {
+            validate_histogram(histogram, &mut ctx);
+        }
     }
 
     if !errors.is_empty() {
@@ -550,6 +599,109 @@ pub fn validate(
         spec: spec.clone(),
         read_branches,
     })
+}
+
+fn validate_union(
+    spec: &AnalysisSpec,
+    catalogue: &Catalogue,
+) -> Result<ResolvedPlan, Vec<SpecError>> {
+    let mut errors = Vec::new();
+    if !spec.models.is_empty() {
+        errors.push(SpecError::InvalidExpression {
+            context: "multi-channel union".to_string(),
+            detail: "model-aware union codegen is not yet supported".to_string(),
+        });
+    }
+    if !spec.objects.is_empty() || !spec.derived_objects.is_empty() || !spec.regions.is_empty() {
+        errors.push(SpecError::InvalidExpression {
+            context: "multi-channel union".to_string(),
+            detail: "declare objects, derived objects, and regions inside [[channel]] blocks"
+                .to_string(),
+        });
+    }
+
+    let Some(first) = spec.channels.first() else {
+        unreachable!("caller checks channels is non-empty");
+    };
+    let first_schema = output_schema(&first.outputs);
+    let mut branch_specs = BTreeMap::new();
+    for channel in &spec.channels {
+        if channel.outputs.is_empty() {
+            errors.push(SpecError::InvalidExpression {
+                context: format!("channel `{}`", channel.name),
+                detail: "channels in a union must declare at least one output".to_string(),
+            });
+        }
+        if output_schema(&channel.outputs) != first_schema {
+            errors.push(SpecError::InvalidExpression {
+                context: format!("channel `{}`", channel.name),
+                detail: "channel output schema must match the first channel by name and order"
+                    .to_string(),
+            });
+        }
+
+        let channel_spec = channel.as_spec(spec);
+        match validate(&channel_spec, catalogue) {
+            Ok(plan) => {
+                for branch in plan.read_branches.specs() {
+                    branch_specs.insert(branch.name.clone(), branch.branch_type);
+                }
+            }
+            Err(channel_errors) => errors.extend(channel_errors),
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let read_branches = BranchSchema::new(
+        branch_specs
+            .into_iter()
+            .map(|(name, branch_type)| BranchSpec::new(name, branch_type))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| {
+        vec![SpecError::InvalidReadSchema {
+            detail: error.to_string(),
+        }]
+    })?;
+
+    Ok(ResolvedPlan {
+        spec: spec.clone(),
+        read_branches,
+    })
+}
+
+fn output_schema(outputs: &[OutputDef]) -> Vec<&str> {
+    outputs.iter().map(|output| output.name.as_str()).collect()
+}
+
+fn validate_histogram(histogram: &HistogramDef, ctx: &mut ValidationContext<'_>) {
+    let context = format!("histogram `{}`", histogram.name);
+    if histogram.bins == 0 {
+        ctx.errors.push(SpecError::InvalidExpression {
+            context: context.clone(),
+            detail: "histogram bins must be greater than zero".to_string(),
+        });
+    }
+    if !(histogram.range[0].is_finite()
+        && histogram.range[1].is_finite()
+        && histogram.range[1] > histogram.range[0])
+    {
+        ctx.errors.push(SpecError::InvalidExpression {
+            context: context.clone(),
+            detail: "histogram range must be finite and ordered".to_string(),
+        });
+    }
+    match validate_expr(&histogram.expr, &context, ctx) {
+        Some(ExprType::Numeric(_)) => {}
+        Some(_) => ctx.errors.push(SpecError::InvalidExpression {
+            context,
+            detail: "histogram expression must be numeric".to_string(),
+        }),
+        None => {}
+    }
 }
 
 struct ValidationContext<'a> {
@@ -1745,6 +1897,38 @@ fn validate_raw_analysis_spec(raw: &RawAnalysisSpec) -> Result<(), ParseError> {
         validate_identifier(name, "regions")?;
     }
 
+    let mut channel_names = BTreeSet::new();
+    for channel in &raw.channels {
+        validate_identifier(&channel.name, "channel name")?;
+        if !channel_names.insert(channel.name.as_str()) {
+            return Err(ParseError::InvalidSpec(format!(
+                "duplicate channel `{}`",
+                channel.name
+            )));
+        }
+        for (name, object) in &channel.objects {
+            validate_identifier(name, &format!("channel `{}` objects", channel.name))?;
+            if object.source.trim().is_empty() {
+                return Err(ParseError::InvalidSpec(format!(
+                    "channel `{}` object `{name}` is missing source",
+                    channel.name
+                )));
+            }
+        }
+        for name in channel.derived.keys() {
+            validate_identifier(name, &format!("channel `{}` derived", channel.name))?;
+            if channel.objects.contains_key(name) {
+                return Err(ParseError::InvalidSpec(format!(
+                    "channel `{}` derived object `{name}` duplicates an object name",
+                    channel.name
+                )));
+            }
+        }
+        for name in channel.regions.keys() {
+            validate_identifier(name, &format!("channel `{}` regions", channel.name))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -2319,6 +2503,14 @@ struct RawAnalysisSpec {
     regions: BTreeMap<String, RawRegion>,
     #[serde(default)]
     outputs: Vec<RawOutput>,
+    #[serde(default, rename = "histogram")]
+    histograms: Vec<RawHistogram>,
+    #[serde(default)]
+    weight: Option<RawWeight>,
+    #[serde(default)]
+    systematics: Vec<String>,
+    #[serde(default, rename = "channel")]
+    channels: Vec<RawChannel>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2388,6 +2580,135 @@ struct RawRegion {
 struct RawOutput {
     name: String,
     expr: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawHistogram {
+    name: String,
+    expr: String,
+    bins: usize,
+    range: [f64; 2],
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawWeight {
+    #[serde(default)]
+    nominal: Vec<f64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawChannel {
+    name: String,
+    #[serde(default)]
+    objects: BTreeMap<String, RawObject>,
+    #[serde(default, alias = "derived_objects")]
+    derived: BTreeMap<String, RawDerivedObject>,
+    #[serde(default)]
+    regions: BTreeMap<String, RawRegion>,
+    #[serde(default)]
+    outputs: Vec<RawOutput>,
+}
+
+fn object_defs_from_raw(
+    raw_objects: BTreeMap<String, RawObject>,
+) -> Result<Vec<ObjectDef>, ParseError> {
+    let mut objects = Vec::with_capacity(raw_objects.len());
+    for (name, object) in raw_objects {
+        let cuts = object
+            .cuts
+            .iter()
+            .map(|cut| parse_cut(cut, &name))
+            .collect::<Result<Vec<_>, _>>()?;
+        objects.push(ObjectDef {
+            name,
+            source: object.source,
+            cuts,
+        });
+    }
+    Ok(objects)
+}
+
+fn derived_defs_from_raw(
+    raw_derived: BTreeMap<String, RawDerivedObject>,
+) -> Result<Vec<DerivedObjectDef>, ParseError> {
+    raw_derived
+        .into_iter()
+        .map(derived_object_def_from_raw)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn region_defs_from_raw(
+    raw_regions: BTreeMap<String, RawRegion>,
+) -> Result<Vec<RegionDef>, ParseError> {
+    let mut regions = Vec::with_capacity(raw_regions.len());
+    for (name, region) in raw_regions {
+        let require = region
+            .require
+            .iter()
+            .map(|requirement| parse_requirement(requirement))
+            .collect::<Result<Vec<_>, _>>()?;
+        regions.push(RegionDef { name, require });
+    }
+    Ok(regions)
+}
+
+fn output_defs_from_raw(raw_outputs: &[RawOutput]) -> Result<Vec<OutputDef>, ParseError> {
+    raw_outputs
+        .iter()
+        .map(|output| {
+            Ok(OutputDef {
+                name: output.name.clone(),
+                expr: parse_expr(&output.expr, None)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ParseError>>()
+}
+
+fn histogram_defs_from_raw(
+    raw_histograms: &[RawHistogram],
+) -> Result<Vec<HistogramDef>, ParseError> {
+    raw_histograms
+        .iter()
+        .map(|histogram| {
+            validate_identifier(&histogram.name, "histogram name")?;
+            Ok(HistogramDef {
+                name: histogram.name.clone(),
+                expr: parse_expr(&histogram.expr, None)?,
+                bins: histogram.bins,
+                range: histogram.range,
+            })
+        })
+        .collect::<Result<Vec<_>, ParseError>>()
+}
+
+fn weight_def_from_raw(raw: RawWeight) -> WeightDef {
+    WeightDef {
+        nominal: raw.nominal,
+    }
+}
+
+fn systematic_def_from_raw(value: &str) -> Result<SystematicDef, ParseError> {
+    match value {
+        "nominal" | "Nominal" => Ok(SystematicDef::Nominal),
+        "jes_up" | "JesUp" => Ok(SystematicDef::JesUp),
+        "jes_down" | "JesDown" => Ok(SystematicDef::JesDown),
+        "jer_up" | "JerUp" => Ok(SystematicDef::JerUp),
+        "jer_down" | "JerDown" => Ok(SystematicDef::JerDown),
+        other => Err(ParseError::InvalidSpec(format!(
+            "unsupported systematic `{other}`"
+        ))),
+    }
+}
+
+fn channel_def_from_raw(raw: RawChannel) -> Result<ChannelDef, ParseError> {
+    validate_identifier(&raw.name, "channel name")?;
+    Ok(ChannelDef {
+        name: raw.name,
+        objects: object_defs_from_raw(raw.objects)?,
+        derived_objects: derived_defs_from_raw(raw.derived)?,
+        regions: region_defs_from_raw(raw.regions)?,
+        outputs: output_defs_from_raw(&raw.outputs)?,
+    })
 }
 
 fn derived_object_def_from_raw(

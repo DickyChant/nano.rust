@@ -57,13 +57,11 @@ The compiled kernel is expressed *in the `nano-analysis` typestate* — `Raw →
 Baseline → Scored<M> → Region → Weighted<R> → fill`. The typestate *makes
 invalid states unrepresentable* for code written in it (stage order, region
 typing, score-before-use, weight-before-fill, units, exhaustive systematics).
-**Honest status of what codegen emits today:** the generated kernels exercise
-region gating and (for `[[model]]` specs) `Ev::infer`/`score`; `Weighted<R>`/
-`fill`/systematic *emission* and a richer unit lattice (`Unit` is currently
-`GeV`/dimensionless — a first slice) are still being wired, so treat
-"compiler-checked weights/units/systematics" as the typestate's *capability*,
-not yet what every generated row uses. The interpreter trades the compiler
-guarantee for not needing a toolchain.
+Generated row-only kernels exercise region gating and, for `[[model]]` specs,
+`Ev::infer`/`score`; generated histogram kernels also emit
+`EventWeight -> Weighted<R> -> fill`, with an exhaustive `Systematic` match for
+the first nominal-only weight slice. `Unit` is currently `GeV`/dimensionless.
+The interpreter trades the compiler guarantee for not needing a toolchain.
 
 ### 2. Workflow DAG IR — how the kernel runs across files
 

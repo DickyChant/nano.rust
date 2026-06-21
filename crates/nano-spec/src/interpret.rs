@@ -43,6 +43,13 @@ impl OutputRow {
     }
 }
 
+/// One selected channel row produced by a multi-channel union spec.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ChannelOutputRow {
+    pub channel: String,
+    pub row: OutputRow,
+}
+
 /// Errors reported while interpreting a validated plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterpretError {
@@ -150,6 +157,11 @@ impl NumericValue {
 /// `leading(...)` output had no selected object. Model specs are deliberately
 /// unsupported in this runtime until inference is implemented for this path.
 pub fn interpret(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>> {
+    if !plan.spec.channels.is_empty() {
+        return Err(InterpretError::Unsupported(
+            "use interpret_union for multi-channel union specs".to_string(),
+        ));
+    }
     if !plan.spec.models.is_empty() {
         return Err(InterpretError::Unsupported(
             "models not yet interpreted; use the compiled path".to_string(),
@@ -177,6 +189,37 @@ pub fn interpret(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>
     }
 
     Ok(Some(OutputRow::new(values)))
+}
+
+/// Interpret one event with a multi-channel union plan.
+///
+/// Each matching channel contributes one row, preserving the spec channel order.
+pub fn interpret_union(plan: &ResolvedPlan, event: &Event) -> Result<Vec<ChannelOutputRow>> {
+    if plan.spec.channels.is_empty() {
+        return interpret(plan, event).map(|row| {
+            row.into_iter()
+                .map(|row| ChannelOutputRow {
+                    channel: plan.spec.name.clone(),
+                    row,
+                })
+                .collect()
+        });
+    }
+
+    let mut rows = Vec::new();
+    for channel in &plan.spec.channels {
+        let channel_plan = ResolvedPlan {
+            spec: channel.as_spec(&plan.spec),
+            read_branches: plan.read_branches.clone(),
+        };
+        if let Some(row) = interpret(&channel_plan, event)? {
+            rows.push(ChannelOutputRow {
+                channel: channel.name.clone(),
+                row,
+            });
+        }
+    }
+    Ok(rows)
 }
 
 fn select_objects(plan: &ResolvedPlan, event: &Event) -> Result<SelectedObjects> {

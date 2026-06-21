@@ -1,0 +1,186 @@
+systematics = ["nominal"]
+
+[analysis]
+name = "higgs4l_all"
+year = "Run2012"
+
+[weight]
+nominal = []
+
+[[histogram]]
+name = "h_mass"
+expr = "h.mass"
+bins = 60
+range = [70.0, 170.0]
+
+[[channel]]
+name = "four_mu"
+
+[channel.objects.good_muon]
+source = "Muon"
+cuts = []
+
+[channel.derived.z1]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "nearest_mass_truncated"
+target = "91.2 GeV"
+
+[channel.derived.z2]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "leading_pt"
+exclude = ["z1"]
+
+[channel.derived.h]
+kind = "combine"
+items = ["z1", "z2"]
+
+[channel.regions.signal]
+require = [
+  "count(good_muon) == 4",
+  "all(good_muon, pt > 5 GeV)",
+  "all(good_muon, abs(eta) < 2.4)",
+  "all(good_muon, abs(pfRelIso04_all) < 0.40)",
+  "all(good_muon, sqrt(dxy*dxy + dz*dz) / sqrt(dxyErr*dxyErr + dzErr*dzErr) < 4.0)",
+  "all(good_muon, abs(dxy) < 0.5)",
+  "all(good_muon, abs(dz) < 1.0)",
+  "count(good_muon, charge == 1) == 2",
+  "count(good_muon, charge == -1) == 2",
+  "z1.min_delta_r >= 0.02",
+  "z2.min_delta_r >= 0.02",
+  "closest_mass(z1, z2, 91.2 GeV) > 40 GeV",
+  "closest_mass(z1, z2, 91.2 GeV) < 120 GeV",
+  "other_mass(z1, z2, 91.2 GeV) > 12 GeV",
+  "other_mass(z1, z2, 91.2 GeV) < 120 GeV",
+]
+
+[[channel.outputs]]
+name = "z1_mass"
+expr = "closest_mass(z1, z2, 91.2 GeV)"
+
+[[channel.outputs]]
+name = "z2_mass"
+expr = "other_mass(z1, z2, 91.2 GeV)"
+
+[[channel.outputs]]
+name = "h_mass"
+expr = "h.mass"
+
+[[channel]]
+name = "four_e"
+
+[channel.objects.good_electron]
+source = "Electron"
+cuts = []
+
+[channel.derived.z1]
+kind = "pair"
+object = "good_electron"
+constraints = ["opposite_charge"]
+selection = "nearest_mass_truncated"
+target = "91.2 GeV"
+
+[channel.derived.z2]
+kind = "pair"
+object = "good_electron"
+constraints = ["opposite_charge"]
+selection = "leading_pt"
+exclude = ["z1"]
+
+[channel.derived.h]
+kind = "combine"
+items = ["z1", "z2"]
+
+[channel.regions.signal]
+require = [
+  "count(good_electron) == 4",
+  "all(good_electron, pt > 7 GeV)",
+  "all(good_electron, abs(eta) < 2.5)",
+  "all(good_electron, abs(pfRelIso03_all) < 0.40)",
+  "all(good_electron, sqrt(dxy*dxy + dz*dz) / sqrt(dxyErr*dxyErr + dzErr*dzErr) < 4.0)",
+  "all(good_electron, abs(dxy) < 0.5)",
+  "all(good_electron, abs(dz) < 1.0)",
+  "count(good_electron, charge == 1) == 2",
+  "count(good_electron, charge == -1) == 2",
+  "z1.min_delta_r >= 0.02",
+  "z2.min_delta_r >= 0.02",
+  "closest_mass(z1, z2, 91.2 GeV) > 40 GeV",
+  "closest_mass(z1, z2, 91.2 GeV) < 120 GeV",
+  "other_mass(z1, z2, 91.2 GeV) > 12 GeV",
+  "other_mass(z1, z2, 91.2 GeV) < 120 GeV",
+]
+
+[[channel.outputs]]
+name = "z1_mass"
+expr = "closest_mass(z1, z2, 91.2 GeV)"
+
+[[channel.outputs]]
+name = "z2_mass"
+expr = "other_mass(z1, z2, 91.2 GeV)"
+
+[[channel.outputs]]
+name = "h_mass"
+expr = "h.mass"
+
+[[channel]]
+name = "two_e_two_mu"
+
+[channel.objects.good_electron]
+source = "Electron"
+cuts = []
+
+[channel.objects.good_muon]
+source = "Muon"
+cuts = []
+
+[channel.derived.z_el]
+kind = "combine"
+items = ["good_electron", "good_electron"]
+filters = ["dR >= 0.02"]
+
+[channel.derived.z_mu]
+kind = "combine"
+items = ["good_muon", "good_muon"]
+filters = ["dR >= 0.02"]
+
+[channel.derived.h]
+kind = "combine"
+items = ["z_mu", "z_el"]
+
+[channel.regions.signal]
+require = [
+  "count(good_electron) >= 2",
+  "count(good_muon) >= 2",
+  "all(good_electron, abs(eta) < 2.5)",
+  "all(good_muon, abs(eta) < 2.4)",
+  "either_pair_pt(good_muon, good_electron, 20 GeV, 10 GeV)",
+  "all(good_electron, abs(pfRelIso03_all) < 0.40)",
+  "all(good_muon, abs(pfRelIso04_all) < 0.40)",
+  "all(good_electron, sqrt(dxy*dxy + dz*dz) / sqrt(dxyErr*dxyErr + dzErr*dzErr) < 4.0)",
+  "all(good_muon, sqrt(dxy*dxy + dz*dz) / sqrt(dxyErr*dxyErr + dzErr*dzErr) < 4.0)",
+  "all(good_electron, abs(dxy) < 0.5)",
+  "all(good_muon, abs(dxy) < 0.5)",
+  "all(good_electron, abs(dz) < 1.0)",
+  "all(good_muon, abs(dz) < 1.0)",
+  "sum(good_electron.charge) == 0",
+  "sum(good_muon.charge) == 0",
+  "closest_mass(z_mu, z_el, 91.2 GeV) > 40 GeV",
+  "closest_mass(z_mu, z_el, 91.2 GeV) < 120 GeV",
+  "other_mass(z_mu, z_el, 91.2 GeV) > 12 GeV",
+  "other_mass(z_mu, z_el, 91.2 GeV) < 120 GeV",
+]
+
+[[channel.outputs]]
+name = "z1_mass"
+expr = "closest_mass(z_mu, z_el, 91.2 GeV)"
+
+[[channel.outputs]]
+name = "z2_mass"
+expr = "other_mass(z_mu, z_el, 91.2 GeV)"
+
+[[channel.outputs]]
+name = "h_mass"
+expr = "h.mass"

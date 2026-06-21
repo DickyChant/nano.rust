@@ -1,10 +1,13 @@
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
-use nano_gen_higgs4l_demo::{higgs2e2mu, higgs4e, higgs4mu};
-use nano_spec::interpret::{interpret, Value};
+use nano_gen_higgs4l_demo::{higgs2e2mu, higgs4e, higgs4l_all, higgs4mu};
+use nano_spec::interpret::{interpret, interpret_union, Value};
 use nano_spec::{validate, AnalysisSpec, Catalogue};
 
 const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 const HIGGS4MU_SPEC: &str = include_str!("../../nano-spec/examples/higgs4l.toml");
+const HIGGS4L_ALL_SPEC: &str = include_str!("../../nano-spec/examples/higgs4l_all.toml");
+const GENERATED_HIGGS4L_ALL: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/generated_higgs4l_all.rs"));
 
 #[test]
 fn generated_full_four_muon_matches_df103_reference_on_synthetic_events() {
@@ -86,6 +89,68 @@ fn interpreted_full_four_muon_matches_generated_code_on_synthetic_events() {
     }
 }
 
+#[test]
+fn generated_union_matches_per_channel_generated_outputs_on_synthetic_events() {
+    for entry in 0..5 {
+        let event = synthetic_event(entry);
+        let union = union_rows(&event);
+        let per_channel = per_channel_rows(&event);
+        assert_eq!(union, per_channel, "entry {entry}");
+    }
+}
+
+#[test]
+fn interpreted_union_matches_generated_union_on_synthetic_events() {
+    let spec = AnalysisSpec::from_toml_str(HIGGS4L_ALL_SPEC).expect("parse union spec");
+    let catalogue =
+        Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+    let plan = validate(&spec, &catalogue).expect("validate union spec");
+
+    for entry in 0..5 {
+        let event = synthetic_event(entry);
+        let generated = union_rows(&event);
+        let interpreted = interpret_union(&plan, &event)
+            .unwrap_or_else(|error| panic!("entry {entry}: {error:?}"))
+            .into_iter()
+            .map(|row| {
+                (
+                    row.channel,
+                    row_bits(
+                        value_f64(row.row.get("z1_mass").expect("z1_mass")),
+                        value_f64(row.row.get("z2_mass").expect("z2_mass")),
+                        value_f64(row.row.get("h_mass").expect("h_mass")),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(interpreted, generated, "entry {entry}");
+    }
+}
+
+#[test]
+fn generated_union_fills_histogram_through_weighted_terminal() {
+    assert!(GENERATED_HIGGS4L_ALL.contains(".weight(weight)"));
+    assert!(GENERATED_HIGGS4L_ALL.contains("nano_analysis::fill::<SignalRegion>"));
+    assert!(GENERATED_HIGGS4L_ALL.contains("match systematic"));
+
+    let mut histograms = higgs4l_all::GenHistograms::new();
+    let mut selected = 0_usize;
+    for entry in 0..5 {
+        let event = synthetic_event(entry);
+        let rows = higgs4l_all::GeneratedProducer::analyze_and_fill(
+            &event,
+            &mut histograms,
+            nano_analysis::Systematic::Nominal,
+        )
+        .unwrap();
+        selected += rows.len();
+    }
+
+    assert_eq!(histograms.h_mass.sumw(), selected as f64);
+    assert_eq!(selected, 4);
+}
+
 #[cfg(feature = "http")]
 #[test]
 fn generated_open_data_counts_match_root_when_enabled() {
@@ -103,10 +168,23 @@ fn generated_open_data_counts_match_root_when_enabled() {
     let mut count_4mu = 0_usize;
     let mut count_4e = 0_usize;
     let mut count_2e2mu = 0_usize;
+    let mut union_count_4mu = 0_usize;
+    let mut union_count_4e = 0_usize;
+    let mut union_count_2e2mu = 0_usize;
     let mut h_masses = Vec::new();
+    let mut union_h_masses = Vec::new();
 
     for event in &mut events {
         let event = event.expect("read event");
+        for row in higgs4l_all::GeneratedProducer::analyze(&event).expect("union") {
+            match row.channel {
+                "four_mu" => union_count_4mu += 1,
+                "four_e" => union_count_4e += 1,
+                "two_e_two_mu" => union_count_2e2mu += 1,
+                other => panic!("unexpected union channel {other}"),
+            }
+            union_h_masses.push(f64::from(row.h_mass as f32));
+        }
         if let Some(row) = higgs4mu::GeneratedProducer::analyze(&event).expect("4mu") {
             count_4mu += 1;
             h_masses.push(f64::from(row.h_mass as f32));
@@ -131,6 +209,10 @@ fn generated_open_data_counts_match_root_when_enabled() {
     assert_eq!(count_2e2mu, 12065);
     assert_eq!(count_4mu + count_4e + count_2e2mu, 26708);
     assert_eq!(peak, 23370);
+    assert_eq!(union_count_4mu, count_4mu);
+    assert_eq!(union_count_4e, count_4e);
+    assert_eq!(union_count_2e2mu, count_2e2mu);
+    assert_eq!(union_h_masses, h_masses);
 }
 
 fn synthetic_event(entry: usize) -> Event {
@@ -420,6 +502,42 @@ fn vec_i32<'a>(event: &'a Event, source: &str, attr: &str) -> &'a [i32] {
 
 fn row_bits(z1: f64, z2: f64, h: f64) -> (u32, u32, u32) {
     bits(z1 as f32, z2 as f32, h as f32)
+}
+
+fn union_rows(event: &Event) -> Vec<(String, (u32, u32, u32))> {
+    higgs4l_all::GeneratedProducer::analyze(event)
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.channel.to_string(),
+                row_bits(row.z1_mass, row.z2_mass, row.h_mass),
+            )
+        })
+        .collect()
+}
+
+fn per_channel_rows(event: &Event) -> Vec<(String, (u32, u32, u32))> {
+    let mut rows = Vec::new();
+    if let Some(row) = higgs4mu::GeneratedProducer::analyze(event).unwrap() {
+        rows.push((
+            "four_mu".to_string(),
+            row_bits(row.z1_mass, row.z2_mass, row.h_mass),
+        ));
+    }
+    if let Some(row) = higgs4e::GeneratedProducer::analyze(event).unwrap() {
+        rows.push((
+            "four_e".to_string(),
+            row_bits(row.z1_mass, row.z2_mass, row.h_mass),
+        ));
+    }
+    if let Some(row) = higgs2e2mu::GeneratedProducer::analyze(event).unwrap() {
+        rows.push((
+            "two_e_two_mu".to_string(),
+            row_bits(row.z1_mass, row.z2_mass, row.h_mass),
+        ));
+    }
+    rows
 }
 
 fn bits(z1: f32, z2: f32, h: f32) -> (u32, u32, u32) {

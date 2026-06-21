@@ -37,6 +37,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         "crates/nano-spec/examples/higgs4l_2e2mu.toml",
         "generated_higgs2e2mu.rs",
     )?;
+    generate(
+        repo_root,
+        &catalogue,
+        "crates/nano-spec/examples/higgs4l_all.toml",
+        "generated_higgs4l_all.rs",
+    )?;
 
     Ok(())
 }
