@@ -26,6 +26,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         report.total_selected()
     );
     print_histogram(&report.h_masses);
+    if let Some(path) = options.dump_selected.as_deref() {
+        write_selected_dump(path, &report.selected)?;
+        println!("selected_dump: {}", path);
+    }
     println!(
         "bytes_fetched: {} / {}",
         report.bytes_fetched, report.file_size
@@ -44,6 +48,7 @@ struct Options {
     source: String,
     events: Option<usize>,
     insecure: bool,
+    dump_selected: Option<String>,
 }
 
 #[cfg(feature = "http")]
@@ -52,6 +57,7 @@ impl Options {
         let mut source = DEFAULT_URL.to_string();
         let mut events = None;
         let mut insecure = env_flag("NANO_HTTP_INSECURE");
+        let mut dump_selected = None;
         let mut positional = Vec::new();
 
         let mut args = std::env::args().skip(1);
@@ -66,9 +72,12 @@ impl Options {
                         .map_err(|err| format!("invalid event count: {err}"))?;
                     events = Some(value);
                 }
+                "--dump-selected" => {
+                    dump_selected = Some(args.next().ok_or("missing value after --dump-selected")?);
+                }
                 "-h" | "--help" => {
                     return Err(format!(
-                        "usage: higgs4l_opendata [url-or-file] [n] [--events n] [--insecure]\ndefault URL: {DEFAULT_URL}"
+                        "usage: higgs4l_opendata [url-or-file] [n] [--events n] [--insecure] [--dump-selected path]\ndefault URL: {DEFAULT_URL}"
                     )
                     .into());
                 }
@@ -94,6 +103,7 @@ impl Options {
             source,
             events,
             insecure,
+            dump_selected,
         })
     }
 }
@@ -106,6 +116,7 @@ pub struct AnalysisReport {
     pub count_4e: usize,
     pub count_2e2mu: usize,
     pub h_masses: Vec<f64>,
+    pub selected: Vec<SelectedCandidate>,
     pub bytes_fetched: u64,
     pub file_size: u64,
 }
@@ -118,10 +129,25 @@ impl AnalysisReport {
 }
 
 #[cfg(feature = "http")]
+#[derive(Debug, Clone)]
+pub struct SelectedCandidate {
+    pub run: i32,
+    pub luminosity_block: u32,
+    pub event: u64,
+    pub channel: &'static str,
+    pub h_mass: f32,
+    pub z1_mass: f32,
+    pub z2_mass: f32,
+}
+
+#[cfg(feature = "http")]
 pub fn higgs4l_schema() -> nano_core::BranchSchema {
     use nano_core::{BranchSchema, BranchSpec, BranchType};
 
     BranchSchema::new([
+        BranchSpec::new("run", BranchType::I32),
+        BranchSpec::new("luminosityBlock", BranchType::U32),
+        BranchSpec::new("event", BranchType::U64),
         BranchSpec::new("nMuon", BranchType::U32),
         BranchSpec::new("Muon_pt", BranchType::VecF32),
         BranchSpec::new("Muon_eta", BranchType::VecF32),
@@ -185,18 +211,22 @@ where
     for event in events.take(max_events) {
         let event = event?;
         report.events_read += 1;
+        let id = EventId::from_event(&event)?;
 
-        if let Some(mass) = reco_higgs_to_4mu(&event)? {
+        if let Some(candidate) = reco_higgs_to_4mu(&event, id)? {
             report.count_4mu += 1;
-            report.h_masses.push(mass);
+            report.h_masses.push(f64::from(candidate.h_mass));
+            report.selected.push(candidate);
         }
-        if let Some(mass) = reco_higgs_to_4el(&event)? {
+        if let Some(candidate) = reco_higgs_to_4el(&event, id)? {
             report.count_4e += 1;
-            report.h_masses.push(mass);
+            report.h_masses.push(f64::from(candidate.h_mass));
+            report.selected.push(candidate);
         }
-        if let Some(mass) = reco_higgs_to_2el2mu(&event)? {
+        if let Some(candidate) = reco_higgs_to_2el2mu(&event, id)? {
             report.count_2e2mu += 1;
-            report.h_masses.push(mass);
+            report.h_masses.push(f64::from(candidate.h_mass));
+            report.selected.push(candidate);
         }
     }
 
@@ -204,7 +234,51 @@ where
 }
 
 #[cfg(feature = "http")]
-fn reco_higgs_to_4mu(event: &nano_core::Event) -> Result<Option<f64>, Box<dyn Error>> {
+#[derive(Debug, Clone, Copy)]
+struct EventId {
+    run: i32,
+    luminosity_block: u32,
+    event: u64,
+}
+
+#[cfg(feature = "http")]
+impl EventId {
+    fn from_event(event: &nano_core::Event) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            run: event.scalar::<i32>("run")?,
+            luminosity_block: event.scalar::<u32>("luminosityBlock")?,
+            event: event.scalar::<u64>("event")?,
+        })
+    }
+}
+
+#[cfg(feature = "http")]
+#[derive(Debug, Clone, Copy)]
+struct CandidateMasses {
+    h_mass: f32,
+    z_masses: [f32; 2],
+}
+
+#[cfg(feature = "http")]
+impl CandidateMasses {
+    fn selected(self, id: EventId, channel: &'static str) -> SelectedCandidate {
+        SelectedCandidate {
+            run: id.run,
+            luminosity_block: id.luminosity_block,
+            event: id.event,
+            channel,
+            h_mass: self.h_mass,
+            z1_mass: self.z_masses[0],
+            z2_mass: self.z_masses[1],
+        }
+    }
+}
+
+#[cfg(feature = "http")]
+fn reco_higgs_to_4mu(
+    event: &nano_core::Event,
+    id: EventId,
+) -> Result<Option<SelectedCandidate>, Box<dyn Error>> {
     let muons = MuonBranches::from_event(event)?;
 
     // df103 selection_4mu: event-level cuts on all muons, then exactly two
@@ -234,13 +308,20 @@ fn reco_higgs_to_4mu(event: &nano_core::Event) -> Result<Option<f64>, Box<dyn Er
         return Ok(None);
     }
 
-    Ok(Some(compute_higgs_mass_4l(
-        &z_idx, muons.pt, muons.eta, muons.phi, muons.mass,
-    )))
+    Ok(Some(
+        CandidateMasses {
+            h_mass: compute_higgs_mass_4l(&z_idx, muons.pt, muons.eta, muons.phi, muons.mass),
+            z_masses,
+        }
+        .selected(id, "4mu"),
+    ))
 }
 
 #[cfg(feature = "http")]
-fn reco_higgs_to_4el(event: &nano_core::Event) -> Result<Option<f64>, Box<dyn Error>> {
+fn reco_higgs_to_4el(
+    event: &nano_core::Event,
+    id: EventId,
+) -> Result<Option<SelectedCandidate>, Box<dyn Error>> {
     let electrons = ElectronBranches::from_event(event)?;
 
     // df103 selection_4el.
@@ -285,17 +366,26 @@ fn reco_higgs_to_4el(event: &nano_core::Event) -> Result<Option<f64>, Box<dyn Er
         return Ok(None);
     }
 
-    Ok(Some(compute_higgs_mass_4l(
-        &z_idx,
-        electrons.pt,
-        electrons.eta,
-        electrons.phi,
-        electrons.mass,
-    )))
+    Ok(Some(
+        CandidateMasses {
+            h_mass: compute_higgs_mass_4l(
+                &z_idx,
+                electrons.pt,
+                electrons.eta,
+                electrons.phi,
+                electrons.mass,
+            ),
+            z_masses,
+        }
+        .selected(id, "4e"),
+    ))
 }
 
 #[cfg(feature = "http")]
-fn reco_higgs_to_2el2mu(event: &nano_core::Event) -> Result<Option<f64>, Box<dyn Error>> {
+fn reco_higgs_to_2el2mu(
+    event: &nano_core::Event,
+    id: EventId,
+) -> Result<Option<SelectedCandidate>, Box<dyn Error>> {
     let muons = MuonBranches::from_event(event)?;
     let electrons = ElectronBranches::from_event(event)?;
 
@@ -337,16 +427,22 @@ fn reco_higgs_to_2el2mu(event: &nano_core::Event) -> Result<Option<f64>, Box<dyn
         return Ok(None);
     }
 
-    Ok(Some(compute_higgs_mass_2el2mu(
-        electrons.pt,
-        electrons.eta,
-        electrons.phi,
-        electrons.mass,
-        muons.pt,
-        muons.eta,
-        muons.phi,
-        muons.mass,
-    )))
+    Ok(Some(
+        CandidateMasses {
+            h_mass: compute_higgs_mass_2el2mu(
+                electrons.pt,
+                electrons.eta,
+                electrons.phi,
+                electrons.mass,
+                muons.pt,
+                muons.eta,
+                muons.phi,
+                muons.mass,
+            ),
+            z_masses,
+        }
+        .selected(id, "2e2mu"),
+    ))
 }
 
 #[cfg(feature = "http")]
@@ -478,7 +574,11 @@ fn reco_zz_to_4l(
     mass: &[f32],
     charge: &[i32],
 ) -> Option<[[usize; 2]; 2]> {
-    let mut best_mass = -1.0_f64;
+    // Match ROOT df103 exactly: the C++ helper says `auto best_mass = -1`,
+    // so the stored best mass is an int and every accepted candidate mass is
+    // truncated before the next comparison. The candidate mass itself remains
+    // the double precision ROOT::Math::PtEtaPhiMVector mass.
+    let mut best_mass = -1_i32;
     let mut best_pair = None;
 
     for i1 in 0..pt.len() {
@@ -490,8 +590,8 @@ fn reco_zz_to_4l(
                 Lepton::new(pt[i1], eta[i1], phi[i1], mass[i1]),
                 Lepton::new(pt[i2], eta[i2], phi[i2], mass[i2]),
             ]);
-            if (Z_MASS - this_mass).abs() < (Z_MASS - best_mass).abs() {
-                best_mass = this_mass;
+            if (Z_MASS - this_mass).abs() < (Z_MASS - f64::from(best_mass)).abs() {
+                best_mass = this_mass as i32;
                 best_pair = Some([i1, i2]);
             }
         }
@@ -517,16 +617,16 @@ fn compute_z_masses_4l(
     eta: &[f32],
     phi: &[f32],
     mass: &[f32],
-) -> [f64; 2] {
+) -> [f32; 2] {
     let mut z_masses = [0.0; 2];
     for (slot, pair) in idx.iter().enumerate() {
         z_masses[slot] = invariant_mass(&[
             Lepton::new(pt[pair[0]], eta[pair[0]], phi[pair[0]], mass[pair[0]]),
             Lepton::new(pt[pair[1]], eta[pair[1]], phi[pair[1]], mass[pair[1]]),
-        ]);
+        ]) as f32;
     }
 
-    if (z_masses[0] - Z_MASS).abs() < (z_masses[1] - Z_MASS).abs() {
+    if (f64::from(z_masses[0]) - Z_MASS).abs() < (f64::from(z_masses[1]) - Z_MASS).abs() {
         z_masses
     } else {
         [z_masses[1], z_masses[0]]
@@ -540,7 +640,7 @@ fn compute_higgs_mass_4l(
     eta: &[f32],
     phi: &[f32],
     mass: &[f32],
-) -> f64 {
+) -> f32 {
     invariant_mass(&[
         Lepton::new(
             pt[idx[0][0]],
@@ -566,7 +666,7 @@ fn compute_higgs_mass_4l(
             phi[idx[1][1]],
             mass[idx[1][1]],
         ),
-    ])
+    ]) as f32
 }
 
 #[cfg(feature = "http")]
@@ -579,7 +679,7 @@ fn compute_z_masses_2el2mu(
     mu_eta: &[f32],
     mu_phi: &[f32],
     mu_mass: &[f32],
-) -> [f64; 2] {
+) -> [f32; 2] {
     let mu_z = invariant_mass(&[
         Lepton::new(mu_pt[0], mu_eta[0], mu_phi[0], mu_mass[0]),
         Lepton::new(mu_pt[1], mu_eta[1], mu_phi[1], mu_mass[1]),
@@ -590,9 +690,9 @@ fn compute_z_masses_2el2mu(
     ]);
 
     if (mu_z - Z_MASS).abs() < (el_z - Z_MASS).abs() {
-        [mu_z, el_z]
+        [mu_z as f32, el_z as f32]
     } else {
-        [el_z, mu_z]
+        [el_z as f32, mu_z as f32]
     }
 }
 
@@ -606,13 +706,13 @@ fn compute_higgs_mass_2el2mu(
     mu_eta: &[f32],
     mu_phi: &[f32],
     mu_mass: &[f32],
-) -> f64 {
+) -> f32 {
     invariant_mass(&[
         Lepton::new(mu_pt[0], mu_eta[0], mu_phi[0], mu_mass[0]),
         Lepton::new(mu_pt[1], mu_eta[1], mu_phi[1], mu_mass[1]),
         Lepton::new(el_pt[0], el_eta[0], el_phi[0], el_mass[0]),
         Lepton::new(el_pt[1], el_eta[1], el_phi[1], el_mass[1]),
-    ])
+    ]) as f32
 }
 
 #[cfg(feature = "http")]
@@ -622,7 +722,7 @@ fn filter_z_dr(idx: &[[usize; 2]; 2], eta: &[f32], phi: &[f32]) -> bool {
 }
 
 #[cfg(feature = "http")]
-fn filter_z_candidates(z_masses: [f64; 2]) -> bool {
+fn filter_z_candidates(z_masses: [f32; 2]) -> bool {
     z_masses[0] > 40.0 && z_masses[0] < 120.0 && z_masses[1] > 12.0 && z_masses[1] < 120.0
 }
 
@@ -706,22 +806,23 @@ fn four_vector(lepton: Lepton) -> (f64, f64, f64, f64) {
 }
 
 #[cfg(feature = "http")]
-fn delta_r(eta1: f32, eta2: f32, phi1: f32, phi2: f32) -> f64 {
-    let deta = f64::from(eta1 - eta2);
-    let dphi = delta_phi(f64::from(phi1), f64::from(phi2));
+fn delta_r(eta1: f32, eta2: f32, phi1: f32, phi2: f32) -> f32 {
+    let deta = eta1 - eta2;
+    let dphi = delta_phi(phi1, phi2);
     (deta * deta + dphi * dphi).sqrt()
 }
 
 #[cfg(feature = "http")]
-fn delta_phi(phi1: f64, phi2: f64) -> f64 {
-    let mut dphi = phi1 - phi2;
-    while dphi > std::f64::consts::PI {
-        dphi -= 2.0 * std::f64::consts::PI;
+fn delta_phi(phi1: f32, phi2: f32) -> f32 {
+    let c = f64::from(std::f32::consts::PI);
+    let mut dphi = f64::from(phi2 - phi1) % (2.0 * c);
+    if dphi < -c {
+        dphi += 2.0 * c;
     }
-    while dphi <= -std::f64::consts::PI {
-        dphi += 2.0 * std::f64::consts::PI;
+    if dphi > c {
+        dphi -= 2.0 * c;
     }
-    dphi
+    dphi as f32
 }
 
 #[cfg(feature = "http")]
@@ -771,6 +872,32 @@ fn print_histogram(values: &[f64]) {
         let width = (count * 40).div_ceil(max_count);
         println!("{low:>5.0}-{high:<5.0} {count:>5} {}", "#".repeat(width));
     }
+}
+
+#[cfg(feature = "http")]
+fn write_selected_dump(path: &str, selected: &[SelectedCandidate]) -> Result<(), Box<dyn Error>> {
+    use std::io::Write;
+
+    let file = std::fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    writeln!(
+        writer,
+        "run,luminosityBlock,event,channel,H_mass,Z1_mass,Z2_mass"
+    )?;
+    for candidate in selected {
+        writeln!(
+            writer,
+            "{},{},{},{},{:.9},{:.9},{:.9}",
+            candidate.run,
+            candidate.luminosity_block,
+            candidate.event,
+            candidate.channel,
+            candidate.h_mass,
+            candidate.z1_mass,
+            candidate.z2_mass
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "http")]

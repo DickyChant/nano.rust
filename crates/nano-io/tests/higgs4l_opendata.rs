@@ -6,6 +6,11 @@ mod higgs4l_opendata;
 
 use higgs4l_opendata::{analyze_source, histogram_bins, histogram_counts, DEFAULT_URL};
 
+const ROOT_DF103_COUNT_4MU: usize = 9_115;
+const ROOT_DF103_COUNT_4E: usize = 5_528;
+const ROOT_DF103_COUNT_2E2MU: usize = 12_065;
+const ROOT_DF103_H_MASS_COUNTS: [usize; 11] = [52, 85, 105, 311, 2_080, 23_370, 647, 28, 10, 5, 2];
+
 #[test]
 fn streams_df103_higgs4l_signal_and_finds_higgs_peak() {
     if env_flag("NANO_NO_NET") {
@@ -23,44 +28,34 @@ fn streams_df103_higgs4l_signal_and_finds_higgs_peak() {
         Err(err) => panic!("failed to analyze ROOT df103 Higgs signal: {err}"),
     };
 
-    assert!(
-        report.total_selected() >= 10,
-        "expected a nontrivial selected Higgs signal sample, got {}",
-        report.total_selected()
+    assert_eq!(
+        report.count_4mu, ROOT_DF103_COUNT_4MU,
+        "4mu selected count must match ROOT df103 exactly"
+    );
+    assert_eq!(
+        report.count_4e, ROOT_DF103_COUNT_4E,
+        "4e selected count must match ROOT df103 exactly"
+    );
+    assert_eq!(
+        report.count_2e2mu, ROOT_DF103_COUNT_2E2MU,
+        "2e2mu selected count must match ROOT df103 exactly"
+    );
+    assert_eq!(
+        report.total_selected(),
+        ROOT_DF103_COUNT_4MU + ROOT_DF103_COUNT_4E + ROOT_DF103_COUNT_2E2MU,
+        "total selected count must match ROOT df103 exactly"
     );
     assert_eq!(
         report.h_masses.len(),
         report.total_selected(),
         "one H_mass per selected candidate"
     );
-    assert!(
-        report.count_4mu > 0 && report.count_4e > 0 && report.count_2e2mu > 0,
-        "expected all three channels to contribute: 4mu={}, 4e={}, 2e2mu={}",
-        report.count_4mu,
-        report.count_4e,
-        report.count_2e2mu
-    );
 
     let bins = histogram_bins();
     let counts = histogram_counts(&report.h_masses, &bins);
-    let peak_bin = counts
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, count)| *count)
-        .map(|(index, _)| index)
-        .expect("nonempty histogram");
-    let peak_range = bins[peak_bin];
-    let higgs_window = report
-        .h_masses
-        .iter()
-        .filter(|mass| **mass >= 115.0 && **mass < 135.0)
-        .count();
-
-    assert!(
-        (120.0..130.0).contains(&peak_range.0)
-            || higgs_window * 2 >= report.total_selected(),
-        "expected Higgs signal to peak near 125 GeV; peak bin={peak_range:?}, 115-135 count={higgs_window}, total={}",
-        report.total_selected()
+    assert_eq!(
+        counts, ROOT_DF103_H_MASS_COUNTS,
+        "H_mass histogram bins must match ROOT df103 exactly"
     );
 
     let bytes_fetched = report.bytes_fetched;

@@ -5,6 +5,14 @@ set -euo pipefail
 # Requires a local ROOT installation with the `root` executable on PATH.
 
 URL="${1:-root://eospublic.cern.ch//eos/root-eos/cms_opendata_2012_nanoaod_skimmed/SMHiggsToZZTo4L.root}"
+if [[ "${1:-}" == "--dump-selected" ]]; then
+  DUMP_PATH="${2:?missing dump path after --dump-selected}"
+  URL="${3:-root://eospublic.cern.ch//eos/root-eos/cms_opendata_2012_nanoaod_skimmed/SMHiggsToZZTo4L.root}"
+elif [[ "${2:-}" == "--dump-selected" ]]; then
+  DUMP_PATH="${3:?missing dump path after --dump-selected}"
+else
+  DUMP_PATH="${NANO_HIGGS4L_DUMP:-}"
+fi
 HEADER="${ROOT_HIGGS4L_HEADER:-/usr/share/doc/root/tutorials/analysis/dataframe/df103_NanoAODHiggsAnalysis_python.h}"
 
 if ! command -v root >/dev/null 2>&1; then
@@ -27,7 +35,11 @@ cat >"$macro" <<ROOT_MACRO
 #include <TSystem.h>
 #include <TH1D.h>
 
+#include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <stdexcept>
 
 #include "$HEADER"
 
@@ -116,7 +128,37 @@ RNode reco_higgs_to_2el2mu_node(RNode df) {
               "Muon_pt, Muon_eta, Muon_phi, Muon_mass)");
 }
 
-void higgs4l_root_crosscheck(const char *url) {
+void dump_selected_channel(RNode df, const char *channel, std::ofstream &out) {
+  auto runs = df.Take<unsigned int>("run");
+  auto lumis = df.Take<unsigned int>("luminosityBlock");
+  auto events = df.Take<unsigned long long>("event");
+  auto h_masses = df.Take<float>("H_mass");
+  auto z_masses = df.Take<RVecF>("Z_mass");
+
+  const auto &run_values = *runs;
+  const auto &lumi_values = *lumis;
+  const auto &event_values = *events;
+  const auto &h_mass_values = *h_masses;
+  const auto &z_mass_values = *z_masses;
+  for (size_t i = 0; i < h_mass_values.size(); ++i) {
+    out << run_values[i] << "," << lumi_values[i] << "," << event_values[i] << ","
+        << channel << "," << std::fixed << std::setprecision(9)
+        << h_mass_values[i] << "," << z_mass_values[i][0] << "," << z_mass_values[i][1] << "\\n";
+  }
+}
+
+void dump_selected(RNode four_mu, RNode four_el, RNode two_el_two_mu, const char *dump_path) {
+  std::ofstream out(dump_path);
+  if (!out) {
+    throw std::runtime_error(std::string("could not open selected dump: ") + dump_path);
+  }
+  out << "run,luminosityBlock,event,channel,H_mass,Z1_mass,Z2_mass\\n";
+  dump_selected_channel(four_mu, "4mu", out);
+  dump_selected_channel(four_el, "4e", out);
+  dump_selected_channel(two_el_two_mu, "2e2mu", out);
+}
+
+void higgs4l_root_crosscheck(const char *url, const char *dump_path = "") {
   ROOT::RDataFrame base("Events", url);
   RNode df(base);
   auto four_mu = reco_higgs_to_4mu_node(df);
@@ -152,7 +194,11 @@ void higgs4l_root_crosscheck(const char *url) {
               << static_cast<long long>(total_hist.GetBinContent(index)) << "\\n";
   }
   std::cout << "peak_bin_gev: " << peak_low << "-" << peak_high << "\\n";
+  if (std::strlen(dump_path) != 0) {
+    dump_selected(four_mu, four_el, two_el_two_mu, dump_path);
+    std::cout << "selected_dump: " << dump_path << "\\n";
+  }
 }
 ROOT_MACRO
 
-root -l -b -q "${macro}(\"${URL}\")"
+root -l -b -q "${macro}(\"${URL}\", \"${DUMP_PATH}\")"
