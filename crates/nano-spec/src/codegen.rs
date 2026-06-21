@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 
 use nano_core::BranchType;
 
+use crate::kir::{KirProgram, Rvalue, Stmt};
 use crate::{
     AnalysisSpec, ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef,
     ObjectCandidateDef, ObjectDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
@@ -206,6 +207,7 @@ impl<'a> Generator<'a> {
 
     fn generate_without_models(&self) -> Result<String, CodegenError> {
         self.validate_supported_spec()?;
+        let kir = self.lower_codegen_kir()?;
 
         let mut source = String::new();
         writeln!(
@@ -218,7 +220,7 @@ impl<'a> Generator<'a> {
         writeln!(source).unwrap();
         writeln!(source, "#[derive(Debug, Clone, Copy, PartialEq)]").unwrap();
         writeln!(source, "pub struct GenRow {{").unwrap();
-        for output in &self.spec().outputs {
+        for output in &kir.outputs {
             writeln!(
                 source,
                 "    pub {}: {},",
@@ -242,8 +244,8 @@ impl<'a> Generator<'a> {
             "    pub fn analyze(event: &nano_core::Event) -> nano_core::Result<Option<GenRow>> {{"
         )
         .unwrap();
-        if self.spec().histograms.is_empty() {
-            self.emit_analyze_body(&mut source, false)?;
+        if kir.histograms.is_empty() {
+            self.emit_analyze_body_from_kir(&mut source, false, &kir)?;
             writeln!(source, "    }}").unwrap();
         } else {
             writeln!(
@@ -268,7 +270,7 @@ impl<'a> Generator<'a> {
                 "    fn analyze_impl(event: &nano_core::Event, histograms: Option<&mut GenHistograms>, systematic: nano_analysis::Systematic) -> nano_core::Result<Option<GenRow>> {{"
             )
             .unwrap();
-            self.emit_analyze_body(&mut source, true)?;
+            self.emit_analyze_body_from_kir(&mut source, true, &kir)?;
             writeln!(source, "    }}").unwrap();
         }
         writeln!(source, "}}").unwrap();
@@ -276,17 +278,223 @@ impl<'a> Generator<'a> {
         Ok(source)
     }
 
-    fn emit_analyze_body(
+    fn lower_codegen_kir(&self) -> Result<KirProgram, CodegenError> {
+        crate::kir::lower_plan_to_kir(self.plan).map_err(|error| {
+            CodegenError::UnsupportedFeature(format!("KIR lowering failed before codegen: {error}"))
+        })
+    }
+
+    fn emit_analyze_body_from_kir(
         &self,
         source: &mut String,
         emit_histograms: bool,
+        kir: &KirProgram,
     ) -> Result<(), CodegenError> {
-        for object in &self.spec().objects {
-            self.emit_object_selection(source, object)?;
-        }
-        self.emit_derived_objects(source)?;
+        let mut requirement_conditions = BTreeMap::new();
+        let mut output_exprs = BTreeMap::new();
+        let mut region_index = 0_usize;
+        let mut pending_region_conditions = Vec::new();
+        let mut emitted_baseline = false;
+        let mut emitted_derived_region_unwraps = false;
+        let mut unwrapped_required = BTreeSet::new();
 
-        if !self.spec().regions.is_empty() {
+        for stmt in &kir.block.stmts {
+            match stmt {
+                Stmt::Let { value, expr } => match expr {
+                    Rvalue::SelectObjects { object } => {
+                        let object = ObjectDef {
+                            name: object.name.clone(),
+                            source: object.source.clone(),
+                            cuts: object.cuts.clone(),
+                        };
+                        self.emit_object_selection(source, &object)?;
+                    }
+                    Rvalue::DeriveObject { object } => match &object.def.source {
+                        DerivedSource::Pair(pair) => {
+                            self.emit_pair_derived_object(source, &object.def, pair)?;
+                        }
+                        DerivedSource::Candidate(candidate) => {
+                            self.emit_candidate_derived_object(source, &object.def, candidate)?;
+                        }
+                    },
+                    Rvalue::Requirement { requirement } => {
+                        let condition = self.emit_region_requirement(
+                            &requirement.lhs,
+                            requirement.op,
+                            requirement.rhs.value,
+                        )?;
+                        requirement_conditions.insert(value.id, condition);
+                    }
+                    Rvalue::Output { expr, .. } => {
+                        output_exprs.insert(value.id, expr.clone());
+                    }
+                    other => {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "KIR rvalue `{other:?}` is not supported by string codegen"
+                        )));
+                    }
+                },
+                Stmt::Require { condition } => {
+                    self.emit_empty_kir_regions(
+                        source,
+                        kir,
+                        &mut region_index,
+                        &mut emitted_baseline,
+                        &mut emitted_derived_region_unwraps,
+                    )?;
+                    let condition = requirement_conditions.remove(condition).ok_or_else(|| {
+                        CodegenError::UnsupportedFeature(format!(
+                            "KIR require references missing condition {condition:?}"
+                        ))
+                    })?;
+                    pending_region_conditions.push(condition);
+                    let Some(region) = kir.regions.get(region_index) else {
+                        return Err(CodegenError::UnsupportedFeature(
+                            "KIR has more requirements than declared regions".to_string(),
+                        ));
+                    };
+                    if pending_region_conditions.len() == region.requirements.len() {
+                        self.emit_kir_region_selection(
+                            source,
+                            region.name.as_str(),
+                            &pending_region_conditions,
+                            &mut emitted_baseline,
+                            &mut emitted_derived_region_unwraps,
+                        )?;
+                        pending_region_conditions.clear();
+                        region_index += 1;
+                    }
+                }
+                Stmt::Return { values } => {
+                    self.emit_remaining_kir_regions(
+                        source,
+                        kir,
+                        &mut region_index,
+                        &mut emitted_baseline,
+                        &mut emitted_derived_region_unwraps,
+                    )?;
+                    for returned in values {
+                        let expr = output_exprs.get(&returned.value).ok_or_else(|| {
+                            CodegenError::UnsupportedFeature(format!(
+                                "KIR return references missing output {:?}",
+                                returned.value
+                            ))
+                        })?;
+                        self.emit_required_output_unwrap(
+                            source,
+                            expr,
+                            &returned.name,
+                            &mut unwrapped_required,
+                        )?;
+                    }
+                    for histogram in &kir.histograms {
+                        self.emit_required_output_unwrap(
+                            source,
+                            &histogram.def.expr,
+                            &histogram.name,
+                            &mut unwrapped_required,
+                        )?;
+                    }
+
+                    if emit_histograms {
+                        self.emit_histogram_fills(source)?;
+                    }
+
+                    writeln!(source, "        Ok(Some(GenRow {{").unwrap();
+                    for returned in values {
+                        let field = checked_ident(&returned.name, "output field")?;
+                        let expr = output_exprs.get(&returned.value).ok_or_else(|| {
+                            CodegenError::UnsupportedFeature(format!(
+                                "KIR return references missing output {:?}",
+                                returned.value
+                            ))
+                        })?;
+                        let expr = self.emit_output_expr(expr, &field)?;
+                        if field == expr {
+                            writeln!(source, "            {field},").unwrap();
+                        } else {
+                            writeln!(source, "            {field}: {expr},").unwrap();
+                        }
+                    }
+                    writeln!(source, "        }}))").unwrap();
+                    return Ok(());
+                }
+                Stmt::ForEach { .. } | Stmt::If { .. } | Stmt::Fill { .. } => {
+                    return Err(CodegenError::UnsupportedFeature(
+                        "loop/if/fill KIR statements are reserved for later typed emitter moves"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Err(CodegenError::UnsupportedFeature(
+            "KIR program completed without returning outputs".to_string(),
+        ))
+    }
+
+    fn emit_empty_kir_regions(
+        &self,
+        source: &mut String,
+        kir: &KirProgram,
+        region_index: &mut usize,
+        emitted_baseline: &mut bool,
+        emitted_derived_region_unwraps: &mut bool,
+    ) -> Result<(), CodegenError> {
+        while kir
+            .regions
+            .get(*region_index)
+            .is_some_and(|region| region.requirements.is_empty())
+        {
+            let region = &kir.regions[*region_index];
+            self.emit_kir_region_selection(
+                source,
+                region.name.as_str(),
+                &[],
+                emitted_baseline,
+                emitted_derived_region_unwraps,
+            )?;
+            *region_index += 1;
+        }
+        Ok(())
+    }
+
+    fn emit_remaining_kir_regions(
+        &self,
+        source: &mut String,
+        kir: &KirProgram,
+        region_index: &mut usize,
+        emitted_baseline: &mut bool,
+        emitted_derived_region_unwraps: &mut bool,
+    ) -> Result<(), CodegenError> {
+        while *region_index < kir.regions.len() {
+            let region = &kir.regions[*region_index];
+            if !region.requirements.is_empty() {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "KIR region `{}` was not fully emitted before return",
+                    region.name
+                )));
+            }
+            self.emit_kir_region_selection(
+                source,
+                region.name.as_str(),
+                &[],
+                emitted_baseline,
+                emitted_derived_region_unwraps,
+            )?;
+            *region_index += 1;
+        }
+        Ok(())
+    }
+
+    fn emit_kir_region_selection(
+        &self,
+        source: &mut String,
+        region_name: &str,
+        conditions: &[String],
+        emitted_baseline: &mut bool,
+        emitted_derived_region_unwraps: &mut bool,
+    ) -> Result<(), CodegenError> {
+        if !*emitted_baseline {
             writeln!(
                 source,
                 "        let baseline = nano_analysis::Ev::new(event)"
@@ -298,43 +506,15 @@ impl<'a> Generator<'a> {
                 "            .expect(\"true generated preselection should always pass\");"
             )
             .unwrap();
-            self.emit_region_selections(source, "baseline")?;
+            *emitted_baseline = true;
         }
-
-        let mut unwrapped_required = BTreeSet::new();
-        for output in &self.spec().outputs {
-            self.emit_required_output_unwrap(
-                source,
-                &output.expr,
-                &output.name,
-                &mut unwrapped_required,
-            )?;
-        }
-        for histogram in &self.spec().histograms {
-            self.emit_required_output_unwrap(
-                source,
-                &histogram.expr,
-                &histogram.name,
-                &mut unwrapped_required,
-            )?;
-        }
-
-        if emit_histograms {
-            self.emit_histogram_fills(source)?;
-        }
-
-        writeln!(source, "        Ok(Some(GenRow {{").unwrap();
-        for output in &self.spec().outputs {
-            let field = checked_ident(&output.name, "output field")?;
-            let expr = self.emit_output_expr(&output.expr, &field)?;
-            if field == expr {
-                writeln!(source, "            {field},").unwrap();
-            } else {
-                writeln!(source, "            {field}: {expr},").unwrap();
+        if !*emitted_derived_region_unwraps {
+            for derived_name in self.derived_region_objects() {
+                self.emit_derived_unwrap(source, &derived_name)?;
             }
+            *emitted_derived_region_unwraps = true;
         }
-        writeln!(source, "        }}))").unwrap();
-        Ok(())
+        self.emit_region_selection(source, region_name, "baseline", conditions)
     }
 
     fn generate_with_models(&self) -> Result<String, CodegenError> {
@@ -693,31 +873,6 @@ impl<'a> Generator<'a> {
             "nano_analysis::EventWeight::nominal()".to_string(),
             |expr, factor| format!("{expr}.times({})", f64_literal(*factor)),
         )
-    }
-
-    fn emit_region_selections(
-        &self,
-        source: &mut String,
-        baseline_ident: &str,
-    ) -> Result<(), CodegenError> {
-        for derived_name in self.derived_region_objects() {
-            self.emit_derived_unwrap(source, &derived_name)?;
-        }
-        for region in &self.spec().regions {
-            let conditions = region
-                .require
-                .iter()
-                .map(|requirement| {
-                    self.emit_region_requirement(
-                        &requirement.lhs,
-                        requirement.op,
-                        requirement.rhs.value,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.emit_region_selection(source, &region.name, baseline_ident, &conditions)?;
-        }
-        Ok(())
     }
 
     fn emit_required_output_unwrap(
@@ -1187,20 +1342,6 @@ impl<'a> Generator<'a> {
         writeln!(source, "    min").unwrap();
         writeln!(source, "}}").unwrap();
         writeln!(source).unwrap();
-        Ok(())
-    }
-
-    fn emit_derived_objects(&self, source: &mut String) -> Result<(), CodegenError> {
-        for derived in self.ordered_derived_objects()? {
-            match &derived.source {
-                DerivedSource::Pair(pair) => {
-                    self.emit_pair_derived_object(source, derived, pair)?;
-                }
-                DerivedSource::Candidate(candidate) => {
-                    self.emit_candidate_derived_object(source, derived, candidate)?;
-                }
-            }
-        }
         Ok(())
     }
 
@@ -2206,43 +2347,6 @@ impl<'a> Generator<'a> {
             })
     }
 
-    fn ordered_derived_objects(&self) -> Result<Vec<&DerivedObjectDef>, CodegenError> {
-        let mut ordered = Vec::with_capacity(self.spec().derived_objects.len());
-        let mut visiting = BTreeSet::new();
-        let mut visited = BTreeSet::new();
-        for derived in &self.spec().derived_objects {
-            self.visit_derived(derived, &mut visiting, &mut visited, &mut ordered)?;
-        }
-        Ok(ordered)
-    }
-
-    fn visit_derived<'b>(
-        &'b self,
-        derived: &'b DerivedObjectDef,
-        visiting: &mut BTreeSet<String>,
-        visited: &mut BTreeSet<String>,
-        ordered: &mut Vec<&'b DerivedObjectDef>,
-    ) -> Result<(), CodegenError> {
-        if visited.contains(&derived.name) {
-            return Ok(());
-        }
-        if !visiting.insert(derived.name.clone()) {
-            return Err(CodegenError::UnsupportedFeature(format!(
-                "derived object dependency cycle includes `{}`",
-                derived.name
-            )));
-        }
-        for dependency in derived_dependencies(derived) {
-            if let Ok(dep) = self.derived_object(&dependency) {
-                self.visit_derived(dep, visiting, visited, ordered)?;
-            }
-        }
-        visiting.remove(&derived.name);
-        visited.insert(derived.name.clone());
-        ordered.push(derived);
-        Ok(())
-    }
-
     fn validate_model_region_expr(&self, expr: &Expr, context: &str) -> Result<(), CodegenError> {
         match expr {
             Expr::Count(object) => {
@@ -3065,13 +3169,6 @@ fn collect_derived_objects_in_expr(
             }
         }
         _ => {}
-    }
-}
-
-fn derived_dependencies(derived: &DerivedObjectDef) -> Vec<String> {
-    match &derived.source {
-        DerivedSource::Pair(pair) => pair.exclude.clone(),
-        DerivedSource::Candidate(candidate) => candidate.items.clone(),
     }
 }
 
