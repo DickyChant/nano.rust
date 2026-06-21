@@ -1,0 +1,25 @@
+analysis muon_hist_shape_correction year Run2018;
+
+weight nominal;
+correction jes kind scale collection good_muon attr pt up 1.05 down 0.95;
+
+object good_muon : Muon {
+  pt > 30 GeV;
+  abs(eta) < 2.4;
+}
+
+region signal {
+  count(good_muon) >= 1;
+}
+
+define n_good_muon = count(good_muon);
+alias lead_muon_pt = leading(good_muon).pt;
+
+output n_good_muon;
+output lead_muon_pt;
+
+histogram n_good_muon_hist {
+  expr = count(good_muon);
+  bins = 5;
+  range = [0.0, 5.0];
+}

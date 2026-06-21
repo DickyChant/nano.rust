@@ -3891,6 +3891,14 @@ mod tests {
     const MUON_TAGGER_SPEC_TOML: &str = include_str!("../examples/muon_tagger.toml");
     const DIMUON_SPEC_TOML: &str = include_str!("../examples/dimuon.toml");
     const DIMUON_SPEC_ADL: &str = include_str!("../examples/dimuon.adl");
+    const MUON_WEIGHT_SYSTEMATIC_SPEC_TOML: &str =
+        include_str!("../examples/muon_hist_weight_systematic.toml");
+    const MUON_WEIGHT_SYSTEMATIC_SPEC_ADL: &str =
+        include_str!("../examples/muon_hist_weight_systematic.adl");
+    const MUON_SHAPE_CORRECTION_SPEC_TOML: &str =
+        include_str!("../examples/muon_hist_shape_correction.toml");
+    const MUON_SHAPE_CORRECTION_SPEC_ADL: &str =
+        include_str!("../examples/muon_hist_shape_correction.adl");
     const HIGGS4MU_MINIMAL_SPEC_TOML: &str = include_str!("../examples/higgs4mu_minimal.toml");
     const HIGGS2E2MU_MINIMAL_SPEC_TOML: &str = include_str!("../examples/higgs2e2mu_minimal.toml");
     const EXAMPLE_SPECS: &[(&str, &str)] = &[
@@ -4172,6 +4180,16 @@ mod tests {
         for (name, toml, adl) in [
             ("muon", MUON_SPEC_TOML, MUON_SPEC_ADL),
             ("dimuon", DIMUON_SPEC_TOML, DIMUON_SPEC_ADL),
+            (
+                "muon weight systematic",
+                MUON_WEIGHT_SYSTEMATIC_SPEC_TOML,
+                MUON_WEIGHT_SYSTEMATIC_SPEC_ADL,
+            ),
+            (
+                "muon shape correction",
+                MUON_SHAPE_CORRECTION_SPEC_TOML,
+                MUON_SHAPE_CORRECTION_SPEC_ADL,
+            ),
         ] {
             let toml_spec =
                 AnalysisSpec::from_toml_str(toml).unwrap_or_else(|_| panic!("parse {name} TOML"));
@@ -4204,6 +4222,16 @@ mod tests {
         for (name, toml, adl) in [
             ("muon", MUON_SPEC_TOML, MUON_SPEC_ADL),
             ("dimuon", DIMUON_SPEC_TOML, DIMUON_SPEC_ADL),
+            (
+                "muon weight systematic",
+                MUON_WEIGHT_SYSTEMATIC_SPEC_TOML,
+                MUON_WEIGHT_SYSTEMATIC_SPEC_ADL,
+            ),
+            (
+                "muon shape correction",
+                MUON_SHAPE_CORRECTION_SPEC_TOML,
+                MUON_SHAPE_CORRECTION_SPEC_ADL,
+            ),
         ] {
             let catalogue = catalogue();
             let toml_spec =
@@ -4214,13 +4242,21 @@ mod tests {
                 validate(&toml_spec, &catalogue).unwrap_or_else(|_| panic!("validate {name} TOML"));
             let adl_plan =
                 validate(&adl_spec, &catalogue).unwrap_or_else(|_| panic!("validate {name} ADL"));
+            let mut toml_histograms = interpret::InterpretedHistograms::new(&toml_plan);
+            let mut adl_histograms = interpret::InterpretedHistograms::new(&adl_plan);
 
             for event in synthetic_muon_events() {
                 let toml_row =
-                    interpret::interpret(&toml_plan, &event).expect("interpret TOML plan");
-                let adl_row = interpret::interpret(&adl_plan, &event).expect("interpret ADL plan");
+                    interpret::interpret_and_fill(&toml_plan, &event, &mut toml_histograms)
+                        .expect("interpret TOML plan");
+                let adl_row = interpret::interpret_and_fill(&adl_plan, &event, &mut adl_histograms)
+                    .expect("interpret ADL plan");
                 assert_eq!(adl_row, toml_row, "{name} interpreted row differs");
             }
+            assert_eq!(
+                adl_histograms, toml_histograms,
+                "{name} interpreted histograms differ"
+            );
         }
     }
 
@@ -4245,6 +4281,97 @@ object good_muon : Muon {
         .expect_err("bad unit should fail");
 
         assert!(error.to_string().contains("unsupported unit `TeV`"));
+    }
+
+    #[test]
+    fn adl_rejects_malformed_systematic() {
+        let bad_kind = AnalysisSpec::from_adl_str(
+            r#"
+analysis bad_systematic year Run2018;
+weight nominal;
+systematic muon_weight kind shape up 2.0 down 0.5;
+object good_muon : Muon {}
+"#,
+        )
+        .expect_err("bad systematic kind should fail");
+        assert!(bad_kind
+            .to_string()
+            .contains("unsupported kind `shape`; expected `weight`"));
+
+        let missing_down = AnalysisSpec::from_adl_str(
+            r#"
+analysis missing_systematic_down year Run2018;
+weight nominal;
+systematic muon_weight kind weight up 2.0;
+object good_muon : Muon {}
+"#,
+        )
+        .expect_err("missing systematic down factor should fail");
+        assert!(missing_down.to_string().contains("expected `down`"));
+    }
+
+    #[test]
+    fn adl_rejects_malformed_correction() {
+        let bad_kind = AnalysisSpec::from_adl_str(
+            r#"
+analysis bad_correction year Run2018;
+weight nominal;
+correction jes kind shift collection good_muon attr pt up 1.05 down 0.95;
+object good_muon : Muon {}
+"#,
+        )
+        .expect_err("bad correction kind should fail");
+        assert!(bad_kind
+            .to_string()
+            .contains("unsupported kind `shift`; expected `scale`"));
+
+        let missing_up = AnalysisSpec::from_adl_str(
+            r#"
+analysis missing_correction_up year Run2018;
+weight nominal;
+correction jes kind scale collection good_muon attr pt down 0.95;
+object good_muon : Muon {}
+"#,
+        )
+        .expect_err("missing correction up factor should fail");
+        assert!(missing_up.to_string().contains("expected `up`"));
+    }
+
+    #[test]
+    fn adl_correction_unknown_collection_and_attr_reach_validator() {
+        let unknown_collection = AnalysisSpec::from_adl_str(
+            r#"
+analysis unknown_collection year Run2018;
+weight nominal;
+correction jes kind scale collection ghost_muon attr pt up 1.05 down 0.95;
+object good_muon : Muon {}
+"#,
+        )
+        .expect("parse ADL with unknown correction collection");
+        let errors =
+            validate(&unknown_collection, &catalogue()).expect_err("validation should fail");
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::UndefinedObject { object, .. } if object == "ghost_muon"
+        )));
+
+        let unknown_attr = AnalysisSpec::from_adl_str(
+            r#"
+analysis unknown_attr year Run2018;
+weight nominal;
+correction jes kind scale collection good_muon attr pt up 1.05 down 0.95;
+object good_muon : Muon {}
+"#,
+        )
+        .expect("parse ADL with correction attr missing from catalogue");
+        let catalogue_text = NANOV9_CATALOGUE.replace("\"Muon_pt\":", "\"Muon_missing_pt\":");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(&catalogue_text, "v9").expect("parse catalogue");
+        let errors = validate(&unknown_attr, &catalogue).expect_err("validation should fail");
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::MissingBranch { branch, .. } if branch == "Muon_pt"
+        )));
     }
 
     #[test]

@@ -14,6 +14,9 @@
 //! output <name>;
 //! output <name> = <expr>;
 //! histogram <name> { expr = <expr>; bins = <usize>; range = [<lo>, <hi>]; }
+//! weight nominal;
+//! systematic <name> kind weight up <factor> down <factor>;
+//! correction <name> kind scale collection <object> attr <attr> up <factor> down <factor>;
 //! ```
 //!
 //! Pair objects also accept `comb(<object>, 2)`, `same_flavor`,
@@ -26,7 +29,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     analysis_spec_from_raw, validate_identifier, AnalysisSpec, ParseError, RawAnalysis,
-    RawAnalysisSpec, RawDerivedObject, RawHistogram, RawObject, RawOutput, RawRegion,
+    RawAnalysisSpec, RawCorrection, RawDerivedObject, RawHistogram, RawObject, RawOutput,
+    RawRegion, RawSystematic, RawWeight,
 };
 
 pub fn parse_adl(input: &str) -> Result<AnalysisSpec, ParseError> {
@@ -42,6 +46,9 @@ struct Parser {
     regions: BTreeMap<String, RawRegion>,
     outputs: Vec<RawOutput>,
     histograms: Vec<RawHistogram>,
+    weight: Option<RawWeight>,
+    systematic: Vec<RawSystematic>,
+    corrections: Vec<RawCorrection>,
     aliases: BTreeMap<String, String>,
     output_names: BTreeSet<String>,
 }
@@ -57,6 +64,9 @@ impl Parser {
             regions: BTreeMap::new(),
             outputs: Vec::new(),
             histograms: Vec::new(),
+            weight: None,
+            systematic: Vec::new(),
+            corrections: Vec::new(),
             aliases: BTreeMap::new(),
             output_names: BTreeSet::new(),
         }
@@ -76,8 +86,14 @@ impl Parser {
                 self.parse_output()?;
             } else if self.consume_keyword("histogram") {
                 self.parse_histogram()?;
+            } else if self.consume_keyword("weight") {
+                self.parse_weight()?;
+            } else if self.consume_keyword("systematic") {
+                self.parse_systematic()?;
+            } else if self.consume_keyword("correction") {
+                self.parse_correction()?;
             } else {
-                return self.err("expected `analysis`, `object`, `region`, `define`, `alias`, `output`, or `histogram`");
+                return self.err("expected `analysis`, `object`, `region`, `define`, `alias`, `output`, `histogram`, `weight`, `systematic`, or `correction`");
             }
         }
 
@@ -93,10 +109,10 @@ impl Parser {
             regions: self.regions,
             outputs: self.outputs,
             histograms: self.histograms,
-            weight: None,
+            weight: self.weight,
             systematics: Vec::new(),
-            systematic: Vec::new(),
-            corrections: Vec::new(),
+            systematic: self.systematic,
+            corrections: self.corrections,
             channels: Vec::new(),
         })
     }
@@ -305,6 +321,60 @@ impl Parser {
         Ok(())
     }
 
+    fn parse_weight(&mut self) -> Result<(), ParseError> {
+        if self.weight.is_some() {
+            return self.err("duplicate `weight` declaration");
+        }
+        self.expect_keyword("nominal")?;
+        self.expect_char(';')?;
+        self.weight = Some(RawWeight {
+            nominal: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn parse_systematic(&mut self) -> Result<(), ParseError> {
+        let name = self.parse_identifier("systematic name")?;
+        self.expect_keyword("kind")?;
+        let kind = self.parse_identifier("systematic kind")?;
+        self.expect_keyword("up")?;
+        let up = self.parse_number("systematic up factor")?;
+        self.expect_keyword("down")?;
+        let down = self.parse_number("systematic down factor")?;
+        self.expect_char(';')?;
+        self.systematic.push(RawSystematic {
+            name,
+            kind,
+            up,
+            down,
+        });
+        Ok(())
+    }
+
+    fn parse_correction(&mut self) -> Result<(), ParseError> {
+        let name = self.parse_identifier("correction name")?;
+        self.expect_keyword("kind")?;
+        let kind = self.parse_identifier("correction kind")?;
+        self.expect_keyword("collection")?;
+        let collection = self.parse_identifier("correction collection")?;
+        self.expect_keyword("attr")?;
+        let attr = self.parse_identifier("correction attribute")?;
+        self.expect_keyword("up")?;
+        let up = self.parse_number("correction up factor")?;
+        self.expect_keyword("down")?;
+        let down = self.parse_number("correction down factor")?;
+        self.expect_char(';')?;
+        self.corrections.push(RawCorrection {
+            name,
+            kind,
+            collection,
+            attr,
+            up,
+            down,
+        });
+        Ok(())
+    }
+
     fn insert_object(&mut self, name: String, object: RawObject) -> Result<(), ParseError> {
         if self.derived.contains_key(&name) || self.objects.insert(name.clone(), object).is_some() {
             return Err(ParseError::InvalidSpec(format!(
@@ -400,6 +470,27 @@ impl Parser {
         let ident = self.input[start..self.pos].to_string();
         validate_identifier(&ident, context)?;
         Ok(ident)
+    }
+
+    fn parse_number(&mut self, context: &str) -> Result<f64, ParseError> {
+        self.skip_ws();
+        let start = self.pos;
+        while let Some(ch) = self.peek_char() {
+            if ch.is_whitespace() || ch == ';' {
+                break;
+            }
+            self.pos += ch.len_utf8();
+        }
+        if start == self.pos {
+            return self.err(&format!("expected {context}"));
+        }
+        let token = &self.input[start..self.pos];
+        token.parse::<f64>().map_err(|_| {
+            ParseError::InvalidSpec(format!(
+                "failed to parse ADL at line {}: invalid {context} `{token}`",
+                self.line()
+            ))
+        })
     }
 
     fn expect_char(&mut self, expected: char) -> Result<(), ParseError> {
