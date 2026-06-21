@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::plot::ascii_histogram;
-use crate::session::{self, RootInspection, RunSummary, SpecSummary};
+use crate::session::{self, RootInspection, RunOptions, RunSummary, SpecSummary};
 
 pub fn run() -> io::Result<()> {
     enable_raw_mode()?;
@@ -58,6 +58,7 @@ struct App {
     spec_output: String,
     run_input: String,
     run_parallel: bool,
+    run_insecure: bool,
     run_output: String,
 }
 
@@ -96,6 +97,9 @@ impl App {
             KeyCode::Char('p') if self.active == ActivePane::Run => {
                 self.run_parallel = !self.run_parallel;
             }
+            KeyCode::Char('u') if self.active == ActivePane::Run => {
+                self.run_insecure = !self.run_insecure;
+            }
             KeyCode::Char(value) => self.active_input().push(value),
             _ => {}
         }
@@ -126,11 +130,17 @@ impl App {
                 };
             }
             ActivePane::Run => {
-                let input = PathBuf::from(self.run_input.trim());
-                self.run_output = match session::run_muon_dag([input], self.run_parallel) {
-                    Ok(summary) => format_run_summary(&summary),
-                    Err(error) => error.to_string(),
-                };
+                let input = self.run_input.trim();
+                if input.is_empty() {
+                    self.run_output = "enter an input ROOT path or URL before running".to_string();
+                } else {
+                    let options = RunOptions::new(self.run_parallel).insecure(self.run_insecure);
+                    self.run_output =
+                        match session::run_muon_dag_with_options([PathBuf::from(input)], options) {
+                            Ok(summary) => format_run_summary(&summary),
+                            Err(error) => error.to_string(),
+                        };
+                }
             }
         }
     }
@@ -153,7 +163,7 @@ impl App {
             ])
             .split(frame.size());
 
-        let help = "Tab: pane  Enter: run pane  q/Esc: quit  root: i toggles insecure  spec: k shows kernel  run: p toggles parallel";
+        let help = "Tab: pane  Enter: run pane  q/Esc: quit  root: i toggles insecure  spec: k shows kernel  run: p toggles parallel, u toggles insecure";
         frame.render_widget(Paragraph::new(help), chunks[0]);
         frame.render_widget(self.root_pane(), chunks[1]);
         frame.render_widget(self.spec_pane(), chunks[2]);
@@ -177,9 +187,10 @@ impl App {
 
     fn run_pane(&self) -> Paragraph<'_> {
         let body = format!(
-            "input root: {}\nparallel: {}\n\n{}",
+            "input root: {}\nparallel: {}\ninsecure TLS: {}\n\n{}",
             self.run_input,
             if self.run_parallel { "on" } else { "off" },
+            if self.run_insecure { "on" } else { "off" },
             self.run_output
         );
         pane("Run Muon DAG", self.active == ActivePane::Run, body)
@@ -242,10 +253,38 @@ fn format_root_inspection(report: &RootInspection) -> String {
 
 fn format_run_summary(summary: &RunSummary) -> String {
     format!(
-        "OK run ({})\nevents_seen: {}\nevents_selected: {}\n\nlead_muon_pt_histogram:\n{}",
+        "OK run ({})\nevents_seen: {}\nevents_selected: {}\ncutflow:\n  events_seen: {}\n  events_selected: {}\n\nDAG\n{}\n\nlead_muon_pt_histogram:\n{}",
         summary.mode,
         summary.events_seen,
         summary.events_selected,
+        summary.cutflow.events_seen,
+        summary.cutflow.events_selected,
+        format_dag(summary),
         ascii_histogram(&summary.plot_values, 10, None)
+    )
+}
+
+fn format_dag(summary: &RunSummary) -> String {
+    let chunk_count = summary
+        .dag_nodes
+        .iter()
+        .filter(|node| node.kind == "map")
+        .count();
+    let lines = summary
+        .dag_nodes
+        .iter()
+        .map(|node| {
+            format!(
+                "{} [{}] {} - {}",
+                node.id, node.kind, node.state, node.label
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "nodes={} chunks={}\n{}",
+        summary.dag_nodes.len(),
+        chunk_count,
+        lines
     )
 }

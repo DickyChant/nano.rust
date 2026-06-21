@@ -8,7 +8,7 @@ use axum::Router;
 use serde::Deserialize;
 
 use crate::plot::histogram_svg;
-use crate::session::{self, RootInspection, RunSummary, SpecSummary};
+use crate::session::{self, RootInspection, RunOptions, RunSummary, SpecSummary};
 
 pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let app = Router::new().route("/", get(dashboard));
@@ -57,11 +57,17 @@ fn render_dashboard(query: &DashboardQuery) -> String {
         }
         Some("run") => {
             if let Some(input) = query.input.as_deref().filter(|value| !value.is_empty()) {
-                run_result =
-                    match session::run_muon_dag([PathBuf::from(input)], query.parallel.is_some()) {
-                        Ok(summary) => run_summary_html(&summary),
-                        Err(error) => error_html(&error.to_string()),
-                    };
+                let options =
+                    RunOptions::new(query.parallel.is_some()).insecure(query.insecure.is_some());
+                run_result = match session::run_muon_dag_with_options(
+                    [PathBuf::from(input.trim())],
+                    options,
+                ) {
+                    Ok(summary) => run_summary_html(&summary),
+                    Err(error) => error_html(&error.to_string()),
+                };
+            } else {
+                run_result = error_html("enter an input ROOT path or URL before running");
             }
         }
         _ => {}
@@ -120,6 +126,7 @@ fn render_dashboard(query: &DashboardQuery) -> String {
         <input type="hidden" name="action" value="run">
         <label for="input">Input ROOT path</label>
         <input id="input" name="input" type="text" value="{input}">
+        <label class="check"><input name="insecure" type="checkbox" {insecure}> Insecure TLS</label>
         <label class="check"><input name="parallel" type="checkbox" {parallel}> Parallel</label>
         <button type="submit">Run</button>
       </form>
@@ -176,13 +183,45 @@ fn run_summary_html(summary: &RunSummary) -> String {
     let svg = histogram_svg(&summary.plot_values)
         .map(|svg| format!("<div class=\"svg-wrap\">{svg}</div>"))
         .unwrap_or_else(|error| error_html(&format!("failed to render SVG histogram: {error}")));
+    let cutflow = format!(
+        "cutflow:\n  events_seen: {}\n  events_selected: {}",
+        summary.cutflow.events_seen, summary.cutflow.events_selected
+    );
+    let dag = dag_html(summary);
     format!(
-        "<pre>OK run ({})\nevents_seen: {}\nevents_selected: {}\nplot_values: {}</pre>{}",
+        "<pre>OK run ({})\nevents_seen: {}\nevents_selected: {}\n{}\nplot: lead_muon_pt values={}</pre>{}{}",
         escape(&summary.mode),
         summary.events_seen,
         summary.events_selected,
+        escape(&cutflow),
         summary.plot_values.len(),
+        dag,
         svg
+    )
+}
+
+fn dag_html(summary: &RunSummary) -> String {
+    let chunk_count = summary
+        .dag_nodes
+        .iter()
+        .filter(|node| node.kind == "map")
+        .count();
+    let lines = summary
+        .dag_nodes
+        .iter()
+        .map(|node| {
+            format!(
+                "{} [{}] {} - {}",
+                node.id, node.kind, node.state, node.label
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "<pre>DAG nodes={} chunks={}\n{}</pre>",
+        summary.dag_nodes.len(),
+        chunk_count,
+        escape(&lines)
     )
 }
 

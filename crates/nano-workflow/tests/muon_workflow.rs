@@ -9,6 +9,7 @@ use nano_producers::{MuonProducer, MuonSkimRow};
 use nano_workflow::{
     export_portable_graph, import_portable_graph, merge_partials, plan_muon_workflow, run_chunk,
     ExecutionMode, Executor, KernelRegistry, PortableGraph, RunChunkRequest, RunStats,
+    WorkflowNodeKind,
 };
 
 #[test]
@@ -62,6 +63,40 @@ fn serial_and_parallel_outputs_match_single_pass() {
         }
     );
     assert_eq!(read_skim_rows(&output), expected_rows);
+}
+
+#[test]
+fn workflow_plan_node_summaries_report_kinds_and_chunk_count() {
+    let fixture = Fixture::new("node_summaries");
+    let input = fixture.path("input.root");
+    let output = fixture.path("skim.root");
+    write_synthetic_input(
+        &input,
+        vec![vec![(31.0, 0.1)], vec![(45.0, -0.3)], vec![(55.0, 0.4)]],
+    );
+
+    let plan = plan_muon_workflow([&input], input_schema(), 2, fixture.path("cache"), &output)
+        .expect("workflow plans");
+    let nodes = plan.node_summaries();
+
+    assert_eq!(nodes.len(), 5);
+    assert_eq!(
+        nodes.iter().map(|node| node.kind).collect::<Vec<_>>(),
+        vec![
+            WorkflowNodeKind::Source,
+            WorkflowNodeKind::Map,
+            WorkflowNodeKind::Map,
+            WorkflowNodeKind::Reduce,
+            WorkflowNodeKind::Sink,
+        ]
+    );
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|node| node.kind == WorkflowNodeKind::Map)
+            .count(),
+        2
+    );
 }
 
 #[test]

@@ -18,7 +18,7 @@ pub use error::{Result, WorkflowError};
 pub use executor::{ExecutionMode, ExecutionReport, Executor, RunStats, VerifiedExecutionReport};
 pub use planner::{
     plan_muon_workflow, plan_workflow, plan_workflow_with_kernel_id, MapDone, MapNode, ReduceDone,
-    ReduceNode, SinkNode, SourceNode, WorkflowPlan,
+    ReduceNode, SinkNode, SourceNode, WorkflowNodeKind, WorkflowNodeSummary, WorkflowPlan,
 };
 pub use portable::{
     export_portable_graph, import_portable_graph, import_portable_graph_with_registry,

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use nano_core::{BranchSchema, Event};
 use nano_producers::{MuonProducer, MuonSkimRow};
+use serde::{Deserialize, Serialize};
 
 use crate::artifacts::{ChunkSpec, EntryRange, MergedOutput, PartialOutput};
 use crate::error::Result;
@@ -61,6 +62,58 @@ pub struct WorkflowPlan {
     pub chunk_size: usize,
     pub kernel: Kernel,
     pub kernel_id: String,
+}
+
+impl WorkflowPlan {
+    pub fn node_summaries(&self) -> Vec<WorkflowNodeSummary> {
+        let mut nodes = Vec::with_capacity(self.sources.len() + self.maps.len() + 2);
+        nodes.extend(self.sources.iter().map(|source| WorkflowNodeSummary {
+            id: format!("source-{}", source.id),
+            kind: WorkflowNodeKind::Source,
+            label: source.path.display().to_string(),
+            chunk: None,
+        }));
+        nodes.extend(self.maps.iter().map(|map| WorkflowNodeSummary {
+            id: format!("map-{}", map.id),
+            kind: WorkflowNodeKind::Map,
+            label: format!(
+                "{} entries {}-{}",
+                map.chunk.source, map.chunk.entry_range.start, map.chunk.entry_range.end
+            ),
+            chunk: Some(map.chunk.clone()),
+        }));
+        nodes.push(WorkflowNodeSummary {
+            id: format!("reduce-{}", self.reduce.id),
+            kind: WorkflowNodeKind::Reduce,
+            label: self.reduce.artifact_path.display().to_string(),
+            chunk: None,
+        });
+        nodes.push(WorkflowNodeSummary {
+            id: "sink-0".to_string(),
+            kind: WorkflowNodeKind::Sink,
+            label: self.sink.output_path.display().to_string(),
+            chunk: None,
+        });
+        nodes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowNodeKind {
+    Source,
+    Map,
+    Reduce,
+    Sink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowNodeSummary {
+    pub id: String,
+    pub kind: WorkflowNodeKind,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk: Option<ChunkSpec>,
 }
 
 pub fn plan_muon_workflow(
@@ -136,7 +189,8 @@ where
     for source in &sources {
         let mut start = 0_usize;
         let mut events_in_chunk = 0_usize;
-        let iterator = nano_io::events_chunked(&source.path, &schema, chunk_size)?;
+        let source_string = source.path.display().to_string();
+        let iterator = source_events(&source.path, &source_string, &schema, chunk_size)?;
 
         for event in iterator {
             let _ = event?;
@@ -185,10 +239,11 @@ where
 }
 
 fn map_node(cache_dir: &Path, id: usize, source: &Path, start: usize, len: usize) -> MapNode {
+    let source_string = source.display().to_string();
     MapNode {
         id,
         chunk: ChunkSpec {
-            source: source.display().to_string(),
+            source: source_string,
             entry_range: EntryRange {
                 start,
                 end: start + len,
@@ -197,4 +252,39 @@ fn map_node(cache_dir: &Path, id: usize, source: &Path, start: usize, len: usize
         artifact_path: cache_dir.join(format!("map-{id}.json")),
         manifest_path: cache_dir.join(format!("map-{id}.manifest.json")),
     }
+}
+
+#[cfg(feature = "http")]
+fn source_events(
+    path: &Path,
+    source: &str,
+    schema: &BranchSchema,
+    chunk_size: usize,
+) -> Result<Box<dyn Iterator<Item = nano_io::Result<Event>>>> {
+    if is_http_url(source) {
+        Ok(Box::new(nano_io::events_url_chunked(
+            source, schema, chunk_size,
+        )?))
+    } else {
+        Ok(Box::new(nano_io::events_chunked(path, schema, chunk_size)?))
+    }
+}
+
+#[cfg(not(feature = "http"))]
+fn source_events(
+    path: &Path,
+    source: &str,
+    schema: &BranchSchema,
+    chunk_size: usize,
+) -> Result<Box<dyn Iterator<Item = nano_io::Result<Event>>>> {
+    if is_http_url(source) {
+        return Err(crate::error::WorkflowError::UnsupportedSource(format!(
+            "HTTP source `{source}` requires the nano-workflow `http` feature"
+        )));
+    }
+    Ok(Box::new(nano_io::events_chunked(path, schema, chunk_size)?))
+}
+
+fn is_http_url(source: &str) -> bool {
+    source.starts_with("http://") || source.starts_with("https://")
 }

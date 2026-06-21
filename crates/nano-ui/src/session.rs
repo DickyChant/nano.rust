@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nano_rootio::RootFile;
 use nano_spec::{codegen, AnalysisSpec, Catalogue, ParseError, SpecError};
-use nano_workflow::{plan_muon_workflow, ExecutionMode, Executor, MergedOutput};
+use nano_workflow::{
+    plan_muon_workflow, ExecutionMode, ExecutionReport, Executor, WorkflowNodeKind,
+};
 
 const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 const DEFAULT_CATALOGUE_VERSION: &str = "v9";
@@ -64,12 +66,58 @@ pub struct RunSummary {
     pub events_selected: u64,
     pub cutflow: CutflowSummary,
     pub plot_values: Vec<f64>,
+    pub dag_nodes: Vec<DagNodeSummary>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct CutflowSummary {
     pub events_seen: u64,
     pub events_selected: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunOptions {
+    pub parallel: bool,
+    pub insecure: bool,
+}
+
+impl RunOptions {
+    pub fn new(parallel: bool) -> Self {
+        Self {
+            parallel,
+            insecure: false,
+        }
+    }
+
+    pub fn insecure(mut self, insecure: bool) -> Self {
+        self.insecure = insecure;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DagNodeSummary {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub state: DagNodeState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum DagNodeState {
+    Pending,
+    Running,
+    Done,
+}
+
+impl fmt::Display for DagNodeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => f.write_str("Pending"),
+            Self::Running => f.write_str("Running"),
+            Self::Done => f.write_str("Done"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -217,55 +265,109 @@ pub fn run_muon_dag(
     inputs: impl IntoIterator<Item = impl AsRef<Path>>,
     parallel: bool,
 ) -> Result<RunSummary> {
+    run_muon_dag_with_options(inputs, RunOptions::new(parallel))
+}
+
+pub fn run_muon_dag_with_options(
+    inputs: impl IntoIterator<Item = impl AsRef<Path>>,
+    options: RunOptions,
+) -> Result<RunSummary> {
     let inputs = inputs
         .into_iter()
         .map(|path| path.as_ref().to_path_buf())
         .collect::<Vec<_>>();
-    if inputs.is_empty() {
-        return Err(SessionError::Workflow {
-            message: "run_muon_dag requires at least one input".to_string(),
-        });
-    }
-    if let Some(url) = inputs
-        .iter()
-        .map(|path| path.to_string_lossy())
-        .find(|source| is_http_url(source))
+    if inputs.is_empty()
+        || inputs
+            .iter()
+            .any(|path| path.as_os_str().to_string_lossy().trim().is_empty())
     {
         return Err(SessionError::Workflow {
-            message: format!(
-                "planning remote workflow input `{url}` is not supported by the current local DAG planner"
-            ),
+            message: "run_muon_dag requires at least one input".to_string(),
         });
     }
 
     let root = unique_session_dir("nano-ui-muon-dag")?;
     let cache_dir = root.join("cache");
     let output_path = root.join("skim.root");
-    let plan = plan_muon_workflow(
-        inputs.iter(),
-        nano_workflow::muon_schema(),
-        DEFAULT_CHUNK_SIZE,
-        &cache_dir,
-        &output_path,
-    )
-    .map_err(|error| SessionError::Workflow {
-        message: error.to_string(),
-    })?;
-    let mode = if parallel {
+    let plan_run = || {
+        let plan = plan_muon_workflow(
+            inputs.iter(),
+            nano_workflow::muon_schema(),
+            DEFAULT_CHUNK_SIZE,
+            &cache_dir,
+            &output_path,
+        )
+        .map_err(|error| SessionError::Workflow {
+            message: error.to_string(),
+        })?;
+        let dag_nodes = dag_nodes_from_plan(&plan, DagNodeState::Pending);
+        let mode = if options.parallel {
+            ExecutionMode::Parallel
+        } else {
+            ExecutionMode::Serial
+        };
+        let report = Executor::new()
+            .run(&plan, mode)
+            .map_err(|error| SessionError::Workflow {
+                message: error.to_string(),
+            })?;
+
+        Ok(run_summary(inputs, &dag_nodes, &report))
+    };
+
+    if options.insecure {
+        with_http_insecure_env(plan_run)
+    } else {
+        plan_run()
+    }
+}
+
+fn with_http_insecure_env<T>(run: impl FnOnce() -> Result<T>) -> Result<T> {
+    let previous = std::env::var_os("NANO_HTTP_INSECURE");
+    std::env::set_var("NANO_HTTP_INSECURE", "1");
+    let result = run();
+    match previous {
+        Some(value) => std::env::set_var("NANO_HTTP_INSECURE", value),
+        None => std::env::remove_var("NANO_HTTP_INSECURE"),
+    }
+    result
+}
+
+fn dag_nodes_from_plan(
+    plan: &nano_workflow::WorkflowPlan,
+    state: DagNodeState,
+) -> Vec<DagNodeSummary> {
+    plan.node_summaries()
+        .into_iter()
+        .map(|node| DagNodeSummary {
+            id: node.id,
+            kind: workflow_node_kind_label(node.kind).to_string(),
+            label: node.label,
+            state,
+        })
+        .collect()
+}
+
+fn workflow_node_kind_label(kind: WorkflowNodeKind) -> &'static str {
+    match kind {
+        WorkflowNodeKind::Source => "source",
+        WorkflowNodeKind::Map => "map",
+        WorkflowNodeKind::Reduce => "reduce",
+        WorkflowNodeKind::Sink => "sink",
+    }
+}
+
+fn run_summary(
+    inputs: Vec<PathBuf>,
+    planned_nodes: &[DagNodeSummary],
+    report: &ExecutionReport,
+) -> RunSummary {
+    let mode = if report.mode == ExecutionMode::Parallel {
         ExecutionMode::Parallel
     } else {
         ExecutionMode::Serial
     };
-    let report = Executor::new()
-        .run(&plan, mode)
-        .map_err(|error| SessionError::Workflow {
-            message: error.to_string(),
-        })?;
-
-    Ok(run_summary(inputs, mode, &report.merged))
-}
-
-fn run_summary(inputs: Vec<PathBuf>, mode: ExecutionMode, merged: &MergedOutput) -> RunSummary {
+    let merged = &report.merged;
     let cutflow = merged.cutflow;
     RunSummary {
         inputs,
@@ -283,6 +385,13 @@ fn run_summary(inputs: Vec<PathBuf>, mode: ExecutionMode, merged: &MergedOutput)
             .rows
             .iter()
             .map(|row| f64::from(row.lead_muon_pt))
+            .collect(),
+        dag_nodes: planned_nodes
+            .iter()
+            .map(|node| DagNodeSummary {
+                state: DagNodeState::Done,
+                ..node.clone()
+            })
             .collect(),
     }
 }
@@ -449,7 +558,44 @@ mod tests {
 
         assert_eq!(summary.events_seen, 3);
         assert_eq!(summary.events_selected, 2);
+        assert_eq!(summary.cutflow.events_seen, 3);
+        assert_eq!(summary.cutflow.events_selected, 2);
         assert_eq!(summary.plot_values, vec![31.0, 45.0]);
+    }
+
+    #[test]
+    fn run_muon_dag_exposes_done_dag_node_view() {
+        let fixture = Fixture::new("run-dag-view");
+        let input = fixture.path("input.root");
+        write_synthetic_input(&input, vec![vec![(31.0, 0.1)], vec![(45.0, -0.3)]]);
+
+        let summary = run_muon_dag([&input], false).expect("workflow runs");
+
+        assert_eq!(
+            summary
+                .dag_nodes
+                .iter()
+                .map(|node| node.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["source", "map", "reduce", "sink"]
+        );
+        assert!(summary
+            .dag_nodes
+            .iter()
+            .all(|node| node.state == DagNodeState::Done));
+    }
+
+    #[cfg(feature = "web")]
+    #[test]
+    fn run_muon_dag_plot_values_render_non_empty_svg() {
+        let fixture = Fixture::new("run-dag-svg");
+        let input = fixture.path("input.root");
+        write_synthetic_input(&input, vec![vec![(31.0, 0.1)], vec![(45.0, -0.3)]]);
+
+        let summary = run_muon_dag([&input], false).expect("workflow runs");
+        let svg = crate::plot::histogram_svg(&summary.plot_values).expect("SVG renders");
+
+        assert!(svg.contains("<svg"));
     }
 
     fn muon_spec_path() -> PathBuf {
