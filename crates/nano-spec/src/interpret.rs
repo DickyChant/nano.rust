@@ -252,7 +252,12 @@ pub fn interpret_and_fill(
         BlockOutcome::Continue => Err(InterpretError::InvalidExpression(
             "KIR program completed without returning outputs".to_string(),
         )),
-        BlockOutcome::Return(row) => Ok(row),
+        BlockOutcome::Return(row) => {
+            if row.is_some() && !plan.spec.has_weight_systematic() {
+                evaluator.fill_nominal_histograms()?;
+            }
+            Ok(row)
+        }
     }
 }
 
@@ -402,6 +407,28 @@ impl<'a> KirEvaluator<'a> {
         histogram
             .get_mut(systematic)
             .fill_weighted(value, weight.value());
+        Ok(())
+    }
+
+    fn fill_nominal_histograms(&mut self) -> Result<()> {
+        let weight = self.weight_for(Systematic::Nominal);
+        for histogram in &self.program.histograms {
+            let value =
+                eval_numeric_expr(&histogram.def.expr, &self.selected, &self.derived, None)?
+                    .as_f64();
+            let Some(histograms) = &mut self.histograms else {
+                return Ok(());
+            };
+            let Some(output) = histograms.get_mut(&histogram.name) else {
+                return Err(InterpretError::InvalidExpression(format!(
+                    "histogram `{}` was not initialized",
+                    histogram.name
+                )));
+            };
+            output
+                .get_mut(Systematic::Nominal)
+                .fill_weighted(value, weight.value());
+        }
         Ok(())
     }
 

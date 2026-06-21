@@ -337,7 +337,8 @@ pub fn lower_to_kir(core: &CoreIr) -> Result<KirProgram, KirError> {
     Ok(program)
 }
 
-pub(crate) fn lower_plan_to_kir(plan: &ResolvedPlan) -> Result<KirProgram, KirError> {
+/// Lower a validated semantic plan into executable KIR.
+pub fn lower_plan_to_kir(plan: &ResolvedPlan) -> Result<KirProgram, KirError> {
     let catalogue = catalogue_from_schema(plan.read_branches.specs());
     let core = crate::lower(&plan.spec, &catalogue).map_err(format_spec_errors)?;
     let mut program = lower_to_kir(&core)?;

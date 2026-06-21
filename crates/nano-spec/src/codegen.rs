@@ -402,13 +402,15 @@ impl<'a> Generator<'a> {
                             &mut unwrapped_required,
                         )?;
                     }
-                    for histogram in &kir.histograms {
-                        self.emit_required_output_unwrap(
-                            source,
-                            &histogram.def.expr,
-                            &histogram.name,
-                            &mut unwrapped_required,
-                        )?;
+                    if !(emit_histograms && self.spec().has_weight_systematic()) {
+                        for histogram in &kir.histograms {
+                            self.emit_required_output_unwrap(
+                                source,
+                                &histogram.def.expr,
+                                &histogram.name,
+                                &mut unwrapped_required,
+                            )?;
+                        }
                     }
 
                     if emit_histograms && !self.spec().has_weight_systematic() {
@@ -1166,7 +1168,26 @@ impl<'a> Generator<'a> {
                 if !unwrapped.insert(name.clone()) {
                     return Ok(());
                 }
-                writeln!(source, "        let Some({name}) = {name} else {{").unwrap();
+                if self
+                    .spec()
+                    .outputs
+                    .iter()
+                    .any(|output| output.name == output_name && output.expr == *expr)
+                {
+                    writeln!(source, "        let Some({name}) = {name} else {{").unwrap();
+                } else {
+                    let Expr::LeadingAttr { object, attr } = expr else {
+                        unreachable!("matched leading expression")
+                    };
+                    let selected = selected_objects_ident(object)?;
+                    let item = format!("{name}_item");
+                    let attr = checked_ident(attr, "leading attribute")?;
+                    writeln!(
+                        source,
+                        "        let Some({name}) = {selected}.iter().map(|{item}| {item}.{attr}).reduce(f32::max) else {{"
+                    )
+                    .unwrap();
+                }
                 writeln!(source, "            return Ok(None);").unwrap();
                 writeln!(source, "        }};").unwrap();
                 Ok(())
@@ -2038,9 +2059,9 @@ impl<'a> Generator<'a> {
     }
 
     fn emit_cut(&self, object: &ObjectDef, cut: &crate::Cut) -> Result<String, CodegenError> {
-        let lhs = self.emit_cut_value_expr(&cut.lhs, &object.name)?;
+        let lhs = as_f64_expr(self.emit_cut_value_expr(&cut.lhs, &object.name)?);
         let op = cmp_op(cut.op);
-        let rhs = numeric_literal_for_expr(&cut.lhs, cut.rhs.value);
+        let rhs = f64_literal(cut.rhs.value);
         Ok(format!("({lhs} {op} {rhs})"))
     }
 
@@ -3496,7 +3517,9 @@ mod tests {
         assert!(source.contains("struct SignalRegion;"));
         assert!(source.contains("impl nano_analysis::Region for SignalRegion"));
         assert!(source.contains("let good_muon_pt = good_muon_item.get::<f32>(\"pt\")?;"));
-        assert!(source.contains("if (good_muon_pt > 30.0_f32) && (good_muon_eta.abs() < 2.4_f32)"));
+        assert!(source.contains(
+            "if ((good_muon_pt as f64) > 30.0_f64) && ((good_muon_eta.abs() as f64) < 2.4_f64)"
+        ));
         assert!(source.contains("let baseline = nano_analysis::Ev::new(event)"));
         assert!(source.contains("baseline.select::<SignalRegion>(|_| n_good_muon >= 1_u32)"));
         assert!(source.contains("n_good_muon,"));

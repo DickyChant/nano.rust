@@ -95,3 +95,17 @@ pub mod muon_hist_weight_systematic {
         "/generated_muon_hist_weight_systematic.rs"
     ));
 }
+
+#[allow(
+    dead_code,
+    non_snake_case,
+    unused_parens,
+    clippy::collapsible_if,
+    clippy::double_parens,
+    clippy::manual_range_contains,
+    clippy::neg_cmp_op_on_partial_ord,
+    clippy::unnecessary_cast
+)]
+pub mod fuzz {
+    include!(concat!(env!("OUT_DIR"), "/generated_fuzz_modules.rs"));
+}
