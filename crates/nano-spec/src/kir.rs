@@ -16,8 +16,8 @@ use crate::core::{
     self, CoreIr, ExprKind, PrimitiveArg, PrimitiveError, PrimitiveRegistry, Type,
 };
 use crate::{
-    Catalogue, CatalogueBranch, CmpOp, Cut, DerivedObjectDef, HistogramDef, Quantity,
-    ResolvedPlan, SpecError,
+    Catalogue, CatalogueBranch, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr,
+    HistogramDef, Quantity, ResolvedPlan, SpecError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -36,6 +36,7 @@ pub struct TypedValue {
 pub struct KirProgram {
     pub name: String,
     pub block: Block,
+    pub read_branches: Vec<BranchSpec>,
     pub objects: Vec<KirObject>,
     pub derived_objects: Vec<KirDerivedObject>,
     pub regions: Vec<KirRegion>,
@@ -69,6 +70,9 @@ pub enum Stmt {
         value: ValueId,
         weight: Option<ValueId>,
     },
+    Require {
+        condition: ValueId,
+    },
     Return {
         values: Vec<NamedValue>,
     },
@@ -97,6 +101,19 @@ pub enum Rvalue {
         op: CmpOp,
         lhs: ValueId,
         rhs: ValueId,
+    },
+    SelectObjects {
+        object: KirObject,
+    },
+    DeriveObject {
+        object: KirDerivedObject,
+    },
+    Requirement {
+        requirement: KirRequirement,
+    },
+    Output {
+        expr: crate::Expr,
+        ty: Type,
     },
 }
 
@@ -256,6 +273,7 @@ pub fn lower_to_kir(core: &CoreIr) -> Result<KirProgram, KirError> {
     let program = KirProgram {
         name: core.name.clone(),
         block,
+        read_branches: Vec::new(),
         objects: core
             .objects
             .iter()
@@ -361,8 +379,136 @@ pub(crate) fn lower_plan_to_kir(plan: &ResolvedPlan) -> Result<KirProgram, KirEr
             def: histogram.clone(),
         })
         .collect();
+    program.read_branches = plan.read_branches.specs().to_vec();
+    program.block = executable_block(&program)?;
     verify(&program)?;
     Ok(program)
+}
+
+fn executable_block(program: &KirProgram) -> Result<Block, KirError> {
+    let mut block = Block::default();
+    let mut next_value = 0_usize;
+
+    for object in &program.objects {
+        let value = TypedValue {
+            id: ValueId(next_value),
+            ty: Type::ObjectSet,
+        };
+        next_value += 1;
+        block.stmts.push(Stmt::Let {
+            value,
+            expr: Rvalue::SelectObjects {
+                object: object.clone(),
+            },
+        });
+    }
+
+    for object in ordered_derived_objects(program)? {
+        let value = TypedValue {
+            id: ValueId(next_value),
+            ty: Type::Candidate,
+        };
+        next_value += 1;
+        block.stmts.push(Stmt::Let {
+            value,
+            expr: Rvalue::DeriveObject {
+                object: object.clone(),
+            },
+        });
+    }
+
+    for region in &program.regions {
+        for requirement in &region.requirements {
+            let condition = ValueId(next_value);
+            next_value += 1;
+            block.stmts.push(Stmt::Let {
+                value: TypedValue {
+                    id: condition,
+                    ty: Type::Bool,
+                },
+                expr: Rvalue::Requirement {
+                    requirement: requirement.clone(),
+                },
+            });
+            block.stmts.push(Stmt::Require { condition });
+        }
+    }
+
+    let mut returned = Vec::with_capacity(program.outputs.len());
+    for output in &program.outputs {
+        let value = ValueId(next_value);
+        next_value += 1;
+        block.stmts.push(Stmt::Let {
+            value: TypedValue {
+                id: value,
+                ty: output_expr_type(&output.expr),
+            },
+            expr: Rvalue::Output {
+                expr: output.expr.clone(),
+                ty: output_expr_type(&output.expr),
+            },
+        });
+        returned.push(NamedValue {
+            name: output.name.clone(),
+            value,
+        });
+    }
+    block.stmts.push(Stmt::Return { values: returned });
+
+    Ok(block)
+}
+
+fn ordered_derived_objects(program: &KirProgram) -> Result<Vec<&KirDerivedObject>, KirError> {
+    let mut ordered: Vec<&KirDerivedObject> = Vec::with_capacity(program.derived_objects.len());
+    let mut pending = program.derived_objects.iter().collect::<Vec<_>>();
+
+    while !pending.is_empty() {
+        let Some(index) = pending.iter().position(|object| {
+            derived_dependencies(&object.def).into_iter().all(|dependency| {
+                !program
+                    .derived_objects
+                    .iter()
+                    .any(|derived| derived.name == dependency)
+                    || ordered.iter().any(|derived| derived.name == dependency)
+            })
+        }) else {
+            return Err(KirError::Lower(
+                "derived object dependency cycle or unresolved dependency".to_string(),
+            ));
+        };
+        ordered.push(pending.remove(index));
+    }
+
+    Ok(ordered)
+}
+
+fn derived_dependencies(object: &DerivedObjectDef) -> Vec<String> {
+    match &object.source {
+        DerivedSource::Pair(pair) => pair.exclude.clone(),
+        DerivedSource::Candidate(candidate) => candidate.items.clone(),
+    }
+}
+
+fn output_expr_type(expr: &Expr) -> Type {
+    match expr {
+        Expr::Count(_) | Expr::CountWhere { .. } => Type::Int,
+        Expr::All { .. } | Expr::Any { .. } | Expr::EitherPairPt { .. } => Type::Bool,
+        Expr::Attr { .. }
+        | Expr::Literal(_)
+        | Expr::Binary { .. }
+        | Expr::Abs(_)
+        | Expr::Sqrt(_)
+        | Expr::SumAttr { .. }
+        | Expr::ClosestMass { .. }
+        | Expr::OtherMass { .. }
+        | Expr::LeadingAttr { .. }
+        | Expr::PairDeltaR
+        | Expr::PairLeadingPt
+        | Expr::PairSubleadingPt
+        | Expr::CandidateMinDeltaR
+        | Expr::CandidateLeadingPt
+        | Expr::CandidateSubleadingPt => Type::Float,
+    }
 }
 
 pub fn verify(program: &KirProgram) -> Result<(), KirError> {
@@ -440,6 +586,9 @@ fn verify_block(
                     }
                 }
             }
+            Stmt::Require { condition } => {
+                require_type(*condition, Type::Bool, values)?;
+            }
             Stmt::Return { values: returned } => {
                 for returned in returned {
                     if !values.contains_key(&returned.value) {
@@ -494,6 +643,10 @@ fn verify_rvalue(
                 .validate_call(core::primitive_name_for_cmp(*op), &[lhs, rhs])?
                 .ty)
         }
+        Rvalue::SelectObjects { .. } => Ok(Type::ObjectSet),
+        Rvalue::DeriveObject { .. } => Ok(Type::Candidate),
+        Rvalue::Requirement { .. } => Ok(Type::Bool),
+        Rvalue::Output { ty, .. } => Ok(ty.clone()),
     }
 }
 

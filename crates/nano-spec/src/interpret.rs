@@ -10,8 +10,9 @@ use std::fmt;
 
 use nano_core::{BranchType, Event, ObjectView};
 
+use crate::kir::{Block, KirObject, KirProgram, Rvalue, Stmt, ValueId};
 use crate::{
-    ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ObjectCandidateDef, ObjectDef,
+    ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ObjectCandidateDef,
     ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
 };
 
@@ -104,6 +105,7 @@ impl From<crate::kir::KirError> for InterpretError {
 type Result<T> = std::result::Result<T, InterpretError>;
 type SelectedObjects = HashMap<String, Vec<SelectedObject>>;
 type DerivedObjects = HashMap<String, Option<DerivedObject>>;
+type RuntimeValues = HashMap<ValueId, RuntimeValue>;
 
 #[derive(Debug, Clone, PartialEq)]
 struct SelectedObject {
@@ -137,6 +139,20 @@ enum NumericValue {
     F64(f64),
     I64(i64),
     U64(u64),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum RuntimeValue {
+    ObjectSet,
+    Candidate,
+    Bool(bool),
+    Output(Option<Value>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum BlockOutcome {
+    Continue,
+    Return(Option<OutputRow>),
 }
 
 impl NumericValue {
@@ -176,31 +192,129 @@ pub fn interpret(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>
 
     let kir = crate::kir::lower_plan_to_kir(plan)?;
     crate::kir::verify(&kir)?;
-    execute_verified_kir(plan, event)
+    execute_verified_kir(&kir, event)
 }
 
-fn execute_verified_kir(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>> {
-    let selected = select_objects(plan, event)?;
-    let derived = derive_objects(plan, &selected)?;
+fn execute_verified_kir(program: &KirProgram, event: &Event) -> Result<Option<OutputRow>> {
+    let mut evaluator = KirEvaluator::new(program, event);
+    match evaluator.execute_block(&program.block)? {
+        BlockOutcome::Continue => Err(InterpretError::InvalidExpression(
+            "KIR program completed without returning outputs".to_string(),
+        )),
+        BlockOutcome::Return(row) => Ok(row),
+    }
+}
 
-    for region in &plan.spec.regions {
-        for requirement in &region.require {
-            let lhs = eval_numeric_expr(&requirement.lhs, &selected, &derived, None)?;
-            if !compare(lhs.as_f64(), requirement.op, requirement.rhs.value) {
-                return Ok(None);
-            }
+struct KirEvaluator<'a> {
+    program: &'a KirProgram,
+    event: &'a Event,
+    values: RuntimeValues,
+    selected: SelectedObjects,
+    derived: DerivedObjects,
+}
+
+impl<'a> KirEvaluator<'a> {
+    fn new(program: &'a KirProgram, event: &'a Event) -> Self {
+        Self {
+            program,
+            event,
+            values: HashMap::new(),
+            selected: HashMap::with_capacity(program.objects.len()),
+            derived: HashMap::with_capacity(program.derived_objects.len()),
         }
     }
 
-    let mut values = Vec::with_capacity(plan.spec.outputs.len());
-    for output in &plan.spec.outputs {
-        let Some(value) = eval_output_expr(&output.expr, &selected, &derived)? else {
-            return Ok(None);
-        };
-        values.push((output.name.clone(), value));
+    fn execute_block(&mut self, block: &Block) -> Result<BlockOutcome> {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { value, expr } => {
+                    let runtime = self.eval_rvalue(expr)?;
+                    if matches!(runtime, RuntimeValue::Output(None)) {
+                        return Ok(BlockOutcome::Return(None));
+                    }
+                    self.values.insert(value.id, runtime);
+                }
+                Stmt::Require { condition } => {
+                    let RuntimeValue::Bool(passed) = self.value(*condition)? else {
+                        return Err(InterpretError::InvalidExpression(format!(
+                            "KIR require expected bool value {condition:?}"
+                        )));
+                    };
+                    if !passed {
+                        return Ok(BlockOutcome::Return(None));
+                    }
+                }
+                Stmt::Return { values } => {
+                    let mut row = Vec::with_capacity(values.len());
+                    for returned in values {
+                        let RuntimeValue::Output(value) = self.value(returned.value)? else {
+                            return Err(InterpretError::InvalidExpression(format!(
+                                "KIR return expected output value {:?}",
+                                returned.value
+                            )));
+                        };
+                        let Some(value) = value else {
+                            return Ok(BlockOutcome::Return(None));
+                        };
+                        row.push((returned.name.clone(), value));
+                    }
+                    return Ok(BlockOutcome::Return(Some(OutputRow::new(row))));
+                }
+                Stmt::ForEach { .. } | Stmt::If { .. } | Stmt::Fill { .. } => {
+                    return Err(InterpretError::Unsupported(
+                        "this interpreter move executes flat analysis KIR; loop/fill control is reserved for the emitter move".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(BlockOutcome::Continue)
     }
 
-    Ok(Some(OutputRow::new(values)))
+    fn eval_rvalue(&mut self, expr: &Rvalue) -> Result<RuntimeValue> {
+        match expr {
+            Rvalue::SelectObjects { object } => {
+                let selected = select_object(self.program, self.event, object)?;
+                self.selected.insert(object.name.clone(), selected);
+                Ok(RuntimeValue::ObjectSet)
+            }
+            Rvalue::DeriveObject { object } => {
+                let value = derive_object(&object.def, &self.selected, &self.derived)?;
+                self.derived.insert(object.name.clone(), value);
+                Ok(RuntimeValue::Candidate)
+            }
+            Rvalue::Requirement { requirement } => {
+                let lhs =
+                    eval_numeric_expr(&requirement.lhs, &self.selected, &self.derived, None)?;
+                Ok(RuntimeValue::Bool(compare(
+                    lhs.as_f64(),
+                    requirement.op,
+                    requirement.rhs.value,
+                )))
+            }
+            Rvalue::Output { expr, .. } => Ok(RuntimeValue::Output(eval_output_expr(
+                expr,
+                &self.selected,
+                &self.derived,
+            )?)),
+            Rvalue::Literal(_)
+            | Rvalue::Quantity(_)
+            | Rvalue::ObjectRef(_)
+            | Rvalue::CandidateRef(_)
+            | Rvalue::Attr { .. }
+            | Rvalue::DerivedAttr { .. }
+            | Rvalue::Call { .. }
+            | Rvalue::Compare { .. } => Err(InterpretError::Unsupported(format!(
+                "KIR rvalue `{expr:?}` is not part of flat executable interpretation yet"
+            ))),
+        }
+    }
+
+    fn value(&self, id: ValueId) -> Result<RuntimeValue> {
+        self.values
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| InterpretError::InvalidExpression(format!("KIR value {id:?} missing")))
+    }
 }
 
 /// Interpret one event with a multi-channel union plan.
@@ -234,40 +348,13 @@ pub fn interpret_union(plan: &ResolvedPlan, event: &Event) -> Result<Vec<Channel
     Ok(rows)
 }
 
-fn select_objects(plan: &ResolvedPlan, event: &Event) -> Result<SelectedObjects> {
-    let mut selected = HashMap::with_capacity(plan.spec.objects.len());
-
-    for object in &plan.spec.objects {
-        let collection = event.collection(&object.source)?;
-        let mut objects = Vec::new();
-
-        for item in collection.iter() {
-            let mut leading_values = HashMap::new();
-            if passes_object_cuts(plan, object, item)? {
-                for attr in leading_attrs_for_object(plan, &object.name) {
-                    let value = read_object_attr(plan, &object.source, item, &attr)?;
-                    leading_values.insert(attr, value);
-                }
-                objects.push(SelectedObject {
-                    source_index: item.index(),
-                    leading_values,
-                });
-            }
-        }
-
-        selected.insert(object.name.clone(), objects);
-    }
-
-    Ok(selected)
-}
-
 fn passes_object_cuts(
-    plan: &ResolvedPlan,
-    object: &ObjectDef,
+    program: &KirProgram,
+    object: &KirObject,
     item: &ObjectView<'_>,
 ) -> Result<bool> {
     for cut in &object.cuts {
-        let lhs = eval_object_numeric_expr(plan, &object.name, &object.source, &cut.lhs, item)?;
+        let lhs = eval_object_numeric_expr(program, &object.name, &object.source, &cut.lhs, item)?;
         if !compare(lhs.as_f64(), cut.op, cut.rhs.value) {
             return Ok(false);
         }
@@ -275,33 +362,40 @@ fn passes_object_cuts(
     Ok(true)
 }
 
-fn derive_objects(plan: &ResolvedPlan, selected: &SelectedObjects) -> Result<DerivedObjects> {
-    let mut derived = HashMap::with_capacity(plan.spec.derived_objects.len());
-    let mut pending = plan.spec.derived_objects.iter().collect::<Vec<_>>();
+fn select_object(
+    program: &KirProgram,
+    event: &Event,
+    object: &KirObject,
+) -> Result<Vec<SelectedObject>> {
+    let collection = event.collection(&object.source)?;
+    let mut objects = Vec::new();
 
-    while !pending.is_empty() {
-        let Some(index) = pending.iter().position(|object| {
-            derived_dependencies(object).into_iter().all(|dependency| {
-                !plan
-                    .spec
-                    .derived_objects
-                    .iter()
-                    .any(|derived| derived.name == dependency)
-                    || derived.contains_key(&dependency)
-            })
-        }) else {
-            return Err(InterpretError::InvalidExpression(
-                "derived object dependency cycle or unresolved dependency".to_string(),
-            ));
-        };
-        let object = pending.remove(index);
-        let value = match &object.source {
-            DerivedSource::Pair(pair) => derive_pair(pair, selected, &derived)?,
-            DerivedSource::Candidate(candidate) => derive_candidate(candidate, selected, &derived)?,
-        };
-        derived.insert(object.name.clone(), value);
+    for item in collection.iter() {
+        let mut leading_values = HashMap::new();
+        if passes_object_cuts(program, object, item)? {
+            for attr in leading_attrs_for_object(program, &object.name) {
+                let value = read_object_attr(program, &object.source, item, &attr)?;
+                leading_values.insert(attr, value);
+            }
+            objects.push(SelectedObject {
+                source_index: item.index(),
+                leading_values,
+            });
+        }
     }
-    Ok(derived)
+
+    Ok(objects)
+}
+
+fn derive_object(
+    object: &DerivedObjectDef,
+    selected: &SelectedObjects,
+    derived: &DerivedObjects,
+) -> Result<Option<DerivedObject>> {
+    match &object.source {
+        DerivedSource::Pair(pair) => derive_pair(pair, selected, derived),
+        DerivedSource::Candidate(candidate) => derive_candidate(candidate, selected, derived),
+    }
 }
 
 fn derive_pair(
@@ -671,33 +765,26 @@ fn derived_object<'a>(
         .ok_or_else(|| InterpretError::MissingObject(name.to_string()))
 }
 
-fn derived_dependencies(object: &DerivedObjectDef) -> Vec<String> {
-    match &object.source {
-        DerivedSource::Pair(pair) => pair.exclude.clone(),
-        DerivedSource::Candidate(candidate) => candidate.items.clone(),
-    }
-}
-
-fn leading_attrs_for_object(plan: &ResolvedPlan, object_name: &str) -> Vec<String> {
+fn leading_attrs_for_object(program: &KirProgram, object_name: &str) -> Vec<String> {
     let mut attrs = Vec::new();
-    for output in &plan.spec.outputs {
+    for output in &program.outputs {
         if let Expr::LeadingAttr { object, attr } = &output.expr {
             if object == object_name && !attrs.contains(attr) {
                 attrs.push(attr.clone());
             }
         }
     }
-    for region in &plan.spec.regions {
-        for requirement in &region.require {
+    for region in &program.regions {
+        for requirement in &region.requirements {
             collect_leading_attrs(&requirement.lhs, object_name, &mut attrs);
             collect_selected_attrs(&requirement.lhs, object_name, &mut attrs);
         }
     }
-    for output in &plan.spec.outputs {
+    for output in &program.outputs {
         collect_selected_attrs(&output.expr, object_name, &mut attrs);
     }
-    for derived in &plan.spec.derived_objects {
-        match &derived.source {
+    for derived in &program.derived_objects {
+        match &derived.def.source {
             DerivedSource::Pair(pair) if pair.object == object_name => {
                 for attr in ["pt", "eta", "phi", "mass"] {
                     push_attr(&mut attrs, attr);
@@ -791,7 +878,7 @@ fn collect_candidate_filter_attrs(expr: &Expr, attrs: &mut Vec<String>) {
 }
 
 fn eval_object_numeric_expr(
-    plan: &ResolvedPlan,
+    program: &KirProgram,
     current_object: &str,
     source: &str,
     expr: &Expr,
@@ -799,19 +886,21 @@ fn eval_object_numeric_expr(
 ) -> Result<NumericValue> {
     match expr {
         Expr::Attr { object, attr } if object == current_object => {
-            read_object_attr(plan, source, item, attr)
+            read_object_attr(program, source, item, attr)
         }
         Expr::Attr { object, .. } => Err(InterpretError::Unsupported(format!(
             "object `{current_object}` cut references `{object}`; this slice only supports cuts on the object being selected"
         ))),
         Expr::Literal(value) => Ok(NumericValue::F64(*value)),
         Expr::Binary { op, lhs, rhs } => {
-            let lhs = eval_object_numeric_expr(plan, current_object, source, lhs, item)?.as_f64();
-            let rhs = eval_object_numeric_expr(plan, current_object, source, rhs, item)?.as_f64();
+            let lhs =
+                eval_object_numeric_expr(program, current_object, source, lhs, item)?.as_f64();
+            let rhs =
+                eval_object_numeric_expr(program, current_object, source, rhs, item)?.as_f64();
             Ok(NumericValue::F64(eval_arithmetic(*op, lhs, rhs)))
         }
         Expr::Abs(inner) => Ok(eval_object_numeric_expr(
-            plan,
+            program,
             current_object,
             source,
             inner,
@@ -819,7 +908,7 @@ fn eval_object_numeric_expr(
         )?
         .abs()),
         Expr::Sqrt(inner) => Ok(NumericValue::F64(
-            eval_object_numeric_expr(plan, current_object, source, inner, item)?
+            eval_object_numeric_expr(program, current_object, source, inner, item)?
                 .as_f64()
                 .sqrt(),
         )),
@@ -830,15 +919,16 @@ fn eval_object_numeric_expr(
 }
 
 fn read_object_attr(
-    plan: &ResolvedPlan,
+    program: &KirProgram,
     source: &str,
     item: &ObjectView<'_>,
     attr: &str,
 ) -> Result<NumericValue> {
     let branch = format!("{source}_{attr}");
-    let branch_type = plan
+    let branch_type = program
         .read_branches
-        .find(&branch)
+        .iter()
+        .find(|spec| spec.name == branch)
         .ok_or_else(|| InterpretError::MissingBranch(branch.clone()))?
         .branch_type;
 
