@@ -44,3 +44,20 @@ footer { max-width: 900px; margin: 2rem auto; padding: 1.5rem; color: var(--mute
 .postlist { list-style: none; padding: 0; }
 .postlist li { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.2rem; margin: 0.8rem 0; }
 .postlist .date { color: var(--muted); font-size: 0.85rem; }
+
+/* Responsive: plots/images rescale to the viewport; tables, players, and code
+   never force horizontal page overflow on a phone. */
+img { max-width: 100%; height: auto; }
+.post img, .figure img { max-width: 100%; height: auto; display: block; margin: 1.2rem auto; border-radius: 8px; }
+.post table { display: block; width: 100%; overflow-x: auto; border-collapse: collapse; }
+.post th, .post td { padding: 0.35rem 0.65rem; border: 1px solid var(--border); }
+#player { max-width: 100%; overflow-x: auto; }
+#player .asciinema-player, .ap-player { max-width: 100%; }
+@media (max-width: 640px) {
+  main { padding: 1.2rem 0.9rem; }
+  .hero { padding: 2.5rem 1rem 1.8rem; }
+  .hero h1 { font-size: 2.3rem; }
+  .figure { padding: 0 0.5rem; }
+  .post pre { padding: 0.7rem 0.6rem; font-size: 0.85em; }
+  .cards { gap: 0.8rem; }
+}
