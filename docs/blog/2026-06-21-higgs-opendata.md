@@ -27,17 +27,20 @@ analysis (`--plot`).*
 
 *(No player? Raw cast: [`demo-higgs.cast`](../demo-higgs.cast).)*
 
-> **What this demo proves (and what it doesn't, yet).** This validates the
-> pure-Rust **I/O and physics** against ROOT — bit-identical — and externalizes
-> the analysis *knobs* to a [config](#the-config-that-steers-it). But the
-> selection/reconstruction here is still hand-written Rust
-> (`examples/higgs4l_opendata.rs`). The framework's deeper promise —
-> *physicist writes a spec, the compiler-enforced kernel is **generated***, with
-> no hand-written `.rs` to review — is demonstrated today on the
-> [muon channel](2026-06-21-spec-to-code.html) (spec → validate → codegen →
-> typestate kernel, proven equal to the reference). Making **this** Higgs
-> analysis spec-driven (extending the semantic IR with 4ℓ combinatorics so the
-> kernel is generated from a spec and proven bit-identical) is in progress.
+> **This analysis is now spec-driven — the framework's promise, demonstrated.**
+> The selection + reconstruction below is **generated from a spec**, not
+> hand-written: a physicist writes `higgs4l*.toml` (objects, cuts, Z-candidate
+> reconstruction, masses); `nano-spec` validates it and **codegens** a
+> `nano-analysis` typestate kernel; the Rust compiler is the gate. The generated
+> kernel is **bit-identical to the hand-written df103 reference** on synthetic
+> events for all three channels (`interpret == codegen` too), **and reproduces
+> the exact open-data counts == ROOT** (4μ=9115, 4e=5528, 2e2μ=12065, total
+> 26708, peak 23370). The hand-written `higgs4l_opendata.rs` is now just the
+> *golden reference*, not the shipped analysis. **Honest caveat:** it currently
+> takes **one spec per channel** (the region model is conjunctive — a single
+> multi-channel spec needs a union producer, the next enhancement). The
+> [muon channel](2026-06-21-spec-to-code.html) shows the same chain on a simpler
+> analysis.
 
 ## The analysis
 
@@ -51,9 +54,53 @@ For each of the **4μ**, **4e**, and **2e2μ** channels (`examples/higgs4l_opend
    Apply ΔR separation and the mass windows (Z₁ ∈ [40,120], Z₂ ∈ [12,120] GeV).
 3. **Reconstruct the Higgs** — the invariant mass of the four selected leptons.
 
-Each step maps directly to a df103 stage; the code is written to be *read* — it's
-the human-reviewed physics, with the framework providing the typed, remote-on-demand
-I/O underneath.
+Each step maps directly to a df103 stage — and the physicist writes them **as a
+spec**, reviewed as physics, not as Rust.
+
+## The spec that *generates* the analysis
+
+This is the whole 4μ analysis — `crates/nano-spec/examples/higgs4l.toml`. There is
+no hand-written event loop behind it: `nano-spec` validates this and **codegens**
+the typed kernel, which is bit-identical to the df103 reference and to ROOT.
+
+```toml
+[objects.good_muon]
+source = "Muon"
+
+[derived.z1]                              # Z1 = opposite-charge pair nearest m_Z
+kind = "pair"; object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "nearest_mass_truncated"; target = "91.2 GeV"
+
+[derived.z2]                              # Z2 = best remaining pair
+kind = "pair"; object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "leading_pt"; exclude = ["z1"]
+
+[derived.h]                               # H = Z1 + Z2
+kind = "combine"; items = ["z1", "z2"]
+
+[regions.signal]
+require = [
+  "count(good_muon) == 4",
+  "all(good_muon, pt > 5 GeV)",
+  "all(good_muon, abs(eta) < 2.4)",
+  "all(good_muon, abs(pfRelIso04_all) < 0.40)",
+  "all(good_muon, sqrt(dxy*dxy + dz*dz) / sqrt(dxyErr*dxyErr + dzErr*dzErr) < 4.0)",
+  "count(good_muon, charge == 1) == 2",
+  "count(good_muon, charge == -1) == 2",
+  "closest_mass(z1, z2, 91.2 GeV) > 40 GeV",   # Z1 window
+  "other_mass(z1, z2, 91.2 GeV)  > 12 GeV",    # Z2 window
+]
+
+[[outputs]]
+name = "h_mass"
+expr = "h.mass"
+```
+
+A physicist reviews *that* — `sip3d`, the Z windows, the pairing rule — and the
+**compiler** guarantees the generated kernel implements it. (4e and 2e2μ are
+sibling specs; a single multi-channel spec is the next enhancement.)
 
 ## The config that steers it
 
