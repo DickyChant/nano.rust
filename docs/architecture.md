@@ -54,9 +54,16 @@ verified IR with pluggable back-ends.
 | ~~Cranelift / LLVM JIT~~ | lower IR to a codegen backend ourselves | nothing reusable — rejected | — |
 
 The compiled kernel is expressed *in the `nano-analysis` typestate* — `Raw →
-Baseline → Scored<M> → Region → Weighted<R> → fill` — so stage order, region
-typing, weight-before-fill, units, and exhaustive systematics are all
-compiler-checked. The interpreter trades that for not needing a toolchain.
+Baseline → Scored<M> → Region → Weighted<R> → fill`. The typestate *makes
+invalid states unrepresentable* for code written in it (stage order, region
+typing, score-before-use, weight-before-fill, units, exhaustive systematics).
+**Honest status of what codegen emits today:** the generated kernels exercise
+region gating and (for `[[model]]` specs) `Ev::infer`/`score`; `Weighted<R>`/
+`fill`/systematic *emission* and a richer unit lattice (`Unit` is currently
+`GeV`/dimensionless — a first slice) are still being wired, so treat
+"compiler-checked weights/units/systematics" as the typestate's *capability*,
+not yet what every generated row uses. The interpreter trades the compiler
+guarantee for not needing a toolchain.
 
 ### 2. Workflow DAG IR — how the kernel runs across files
 
@@ -71,12 +78,23 @@ compiler-checked. The interpreter trades that for not needing a toolchain.
 
 ## The distinctive property
 
-In a normal "verify, then interpret bytecode" stack, the verifier and the
-executor are separate mechanisms. Here, **some back-ends route execution back
-through `rustc`** (codegen + AOT, and JIT): the executor *is* the verifier. The
-correctness guarantee and the execution are the same mechanism — which is the
-whole reason the project is in Rust, and why "if it compiles, it's safe to
-parallelize" is a property of the *executor*, not a separate proof.
+Correctness here is enforced by **two verifiers that compose** — not by rustc
+alone:
+
+1. **The front-end validator** (`nano-spec::validate`) checks *domain facts* rustc
+   can't know: the branch exists for the era with the right type, units are
+   present, objects/regions are defined, a model output is produced before use.
+2. **rustc** checks the *structure of the generated Rust*: because the codegen
+   target is the `nano-analysis` typestate, stage/region/weight-before-fill/score-
+   before-use/exhaustive-systematic violations are compile errors, and a kernel
+   with no shared mutable state is safe to parallelize.
+
+The distinctive bit vs a normal "verify, then interpret bytecode" stack: for the
+**compiled / JIT** back-ends the second verifier *is the compiler that also
+produces the executable* — so those structural guarantees and the execution are
+the same mechanism (this is why "if it compiles, it's safe to parallelize" is a
+property of the executor). Branch existence etc. remain the *validator's* job,
+not rustc's — don't conflate the two.
 
 The **interpreter** is the one back-end that does not get the compiler guarantee
 — it relies on the spec validator instead. That is exactly why the compiled /

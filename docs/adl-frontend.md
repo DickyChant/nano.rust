@@ -20,11 +20,15 @@ muon.adl  ─┼─parse→ AnalysisSpec ─validate→ ResolvedPlan ─→ code
 muon.yaml ─┘                                          (one IR, all back-ends)
 ```
 
+**Status: this is a design/plan — the ADL parser is not built yet** (see the plan
+below); today the front-end is TOML/YAML.
+
 **What we adopt:** ADL's *syntax and object model* (the abstraction physicists
-already know). **What we do NOT adopt:** ADL's interpreter/runtime (CutLang). We
-map ADL onto our **compiler-enforced harness** — so an ADL analysis gets the hard
-Rust guarantee (types, units, stage order, exhaustive systematics) and is
-**bit-identical to ROOT**, which ADL/CutLang does not provide today. *That
+already know). **What we do NOT adopt:** ADL's interpreter/runtime (CutLang). The
+plan is to map ADL onto our **harness** — so an ADL analysis *would* inherit the
+same validator+rustc guarantees the TOML front-end gets (and the
+bit-identical-to-ROOT self-check) once the parser lowers ADL into the same IR.
+ADL/CutLang don't provide that hard guarantee. *That
 combination — ADL abstraction + a hard compiler gate — is the novel contribution.*
 
 ## Why ADL is more abstract than our TOML
