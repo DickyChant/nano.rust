@@ -1,0 +1,12 @@
+{"version": 2, "width": 100, "height": 30, "timestamp": 1782001155, "env": {"SHELL": "/usr/bin/bash"}}
+[0.003, "o", "\u001b[1;36m# ROOT's df102 dimuon tutorial file -- inspect it over HTTPS, no download:\u001b[0m\r\n"]
+[1.304, "o", "\u001b[1;32m$\u001b[0m target/debug/nano inspect 'https://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/Run2012BC_DoubleMuParked_Muons.root' --insecure | head -7\r\n"]
+[2.008, "o", "Inspect: `nano inspect https://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/Run2012BC_DoubleMuParked_Muons.root` requires HTTP support; rebuild with `--features http`\r\n"]
+[2.008, "o", "\r\n"]
+[3.511, "o", "\u001b[1;36m# reproduce df102: pair opposite-charge muons, compute the dimuon mass:\u001b[0m\r\n"]
+[4.812, "o", "\u001b[1;32m$\u001b[0m target/debug/examples/dimuon_opendata 'https://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/Run2012BC_DoubleMuParked_Muons.root' 20000 --insecure | tail -20\r\n"]
+[5.515, "o", "Error: \"dimuon_opendata requires the nano-io `http` feature\"\r\n"]
+[5.515, "o", "\r\n"]
+[7.016, "o", "\u001b[1;36m# the Z peak is in the 80-100 GeV bin; ~0.03% of the 2 GB file fetched.\u001b[0m\r\n"]
+[8.317, "o", "\u001b[1;36m# and the first events match ROOT (xrootd) bit-for-bit -- see the blog table.\u001b[0m\r\n"]
+[11.12, "x", "0"]
