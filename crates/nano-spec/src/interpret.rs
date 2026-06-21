@@ -11,8 +11,8 @@ use std::fmt;
 use nano_core::{BranchType, Event, ObjectView};
 
 use crate::{
-    CmpOp, DerivedObjectDef, DerivedSource, Expr, ObjectCandidateDef, ObjectDef, ObjectPairDef,
-    PairConstraint, PairSelection, ResolvedPlan,
+    ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ObjectCandidateDef, ObjectDef,
+    ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
 };
 
 /// One typed output cell produced by the interpreter.
@@ -109,10 +109,13 @@ struct DerivedObject {
     constituents: Vec<Constituent>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Constituent {
     object: String,
     index: usize,
+    pt: NumericValue,
+    eta: NumericValue,
+    phi: NumericValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -270,6 +273,9 @@ fn derive_pair(
             if !passes_pair_constraints(pair, first, second)? {
                 continue;
             }
+            if !passes_pair_filters(pair, first, second)? {
+                continue;
+            }
             let candidate = combine_selected(&pair.object, [first, second])?;
             if !candidate.mass.is_finite() || candidate.mass <= 0.0 {
                 continue;
@@ -289,7 +295,7 @@ fn derive_pair(
 }
 
 fn derive_candidate(
-    candidate: &ObjectCandidateDef,
+    candidate_def: &ObjectCandidateDef,
     selected: &SelectedObjects,
     derived: &DerivedObjects,
 ) -> Result<Option<DerivedObject>> {
@@ -300,7 +306,7 @@ fn derive_candidate(
     let mut pz = 0.0;
     let mut constituents = Vec::new();
 
-    for item in &candidate.items {
+    for item in &candidate_def.items {
         if let Some(objects) = selected.get(item) {
             let occurrence = occurrences.entry(item.as_str()).or_insert(0);
             let Some(object) = objects.get(*occurrence) else {
@@ -314,6 +320,21 @@ fn derive_candidate(
             constituents.push(Constituent {
                 object: item.clone(),
                 index: object.source_index,
+                pt: object
+                    .leading_values
+                    .get("pt")
+                    .copied()
+                    .unwrap_or(NumericValue::F64(0.0)),
+                eta: object
+                    .leading_values
+                    .get("eta")
+                    .copied()
+                    .unwrap_or(NumericValue::F64(0.0)),
+                phi: object
+                    .leading_values
+                    .get("phi")
+                    .copied()
+                    .unwrap_or(NumericValue::F64(0.0)),
             });
             *occurrence += 1;
         } else if let Some(object) = derived_object(derived, item)? {
@@ -329,7 +350,7 @@ fn derive_candidate(
 
     let (mass, pt) = mass_pt(energy, px, py, pz);
     if mass.is_finite() && mass > 0.0 {
-        Ok(Some(DerivedObject {
+        let candidate = DerivedObject {
             mass,
             pt,
             energy,
@@ -337,7 +358,12 @@ fn derive_candidate(
             py,
             pz,
             constituents,
-        }))
+        };
+        if passes_candidate_filters(&candidate, &candidate_def.filters)? {
+            Ok(Some(candidate))
+        } else {
+            Ok(None)
+        }
     } else {
         Ok(None)
     }
@@ -361,6 +387,86 @@ fn passes_pair_constraints(
     Ok(true)
 }
 
+fn passes_pair_filters(
+    pair: &ObjectPairDef,
+    first: &SelectedObject,
+    second: &SelectedObject,
+) -> Result<bool> {
+    for filter in &pair.filters {
+        let lhs = eval_pair_filter_expr(&filter.lhs, first, second)?;
+        if !compare(lhs, filter.op, filter.rhs.value) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn eval_pair_filter_expr(
+    expr: &Expr,
+    first: &SelectedObject,
+    second: &SelectedObject,
+) -> Result<f64> {
+    match expr {
+        Expr::PairDeltaR => Ok(delta_r(
+            attr_f64(first, "eta"),
+            attr_f64(first, "phi"),
+            attr_f64(second, "eta"),
+            attr_f64(second, "phi"),
+        )),
+        Expr::PairLeadingPt => Ok(attr_f64(first, "pt").max(attr_f64(second, "pt"))),
+        Expr::PairSubleadingPt => Ok(attr_f64(first, "pt").min(attr_f64(second, "pt"))),
+        other => Err(InterpretError::InvalidExpression(format!(
+            "unsupported pair filter expression `{other}`"
+        ))),
+    }
+}
+
+fn passes_candidate_filters(candidate: &DerivedObject, filters: &[Cut]) -> Result<bool> {
+    for filter in filters {
+        let lhs = eval_candidate_filter_expr(&filter.lhs, candidate)?;
+        if !compare(lhs, filter.op, filter.rhs.value) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn eval_candidate_filter_expr(expr: &Expr, candidate: &DerivedObject) -> Result<f64> {
+    match expr {
+        Expr::CandidateLeadingPt => Ok(candidate
+            .constituents
+            .iter()
+            .map(|item| item.pt.as_f64())
+            .fold(f64::NEG_INFINITY, f64::max)),
+        Expr::CandidateSubleadingPt => {
+            let mut pts = candidate
+                .constituents
+                .iter()
+                .map(|item| item.pt.as_f64())
+                .collect::<Vec<_>>();
+            pts.sort_by(|left, right| right.total_cmp(left));
+            Ok(pts.get(1).copied().unwrap_or(f64::NEG_INFINITY))
+        }
+        Expr::CandidateMinDeltaR => {
+            let mut min = f64::INFINITY;
+            for (left_pos, left) in candidate.constituents.iter().enumerate() {
+                for right in &candidate.constituents[left_pos + 1..] {
+                    min = min.min(delta_r(
+                        left.eta.as_f64(),
+                        left.phi.as_f64(),
+                        right.eta.as_f64(),
+                        right.phi.as_f64(),
+                    ));
+                }
+            }
+            Ok(min)
+        }
+        other => Err(InterpretError::InvalidExpression(format!(
+            "unsupported candidate filter expression `{other}`"
+        ))),
+    }
+}
+
 fn combine_selected<'a>(
     object: &str,
     items: impl IntoIterator<Item = &'a SelectedObject>,
@@ -379,6 +485,21 @@ fn combine_selected<'a>(
         constituents.push(Constituent {
             object: object.to_string(),
             index: item.source_index,
+            pt: item
+                .leading_values
+                .get("pt")
+                .copied()
+                .unwrap_or(NumericValue::F64(0.0)),
+            eta: item
+                .leading_values
+                .get("eta")
+                .copied()
+                .unwrap_or(NumericValue::F64(0.0)),
+            phi: item
+                .leading_values
+                .get("phi")
+                .copied()
+                .unwrap_or(NumericValue::F64(0.0)),
         });
     }
     let (mass, pt) = mass_pt(energy, px, py, pz);
@@ -420,6 +541,18 @@ fn mass_pt(energy: f64, px: f64, py: f64, pz: f64) -> (f64, f64) {
             .sqrt(),
         (px * px + py * py).sqrt(),
     )
+}
+
+fn delta_r(left_eta: f64, left_phi: f64, right_eta: f64, right_phi: f64) -> f64 {
+    let deta = left_eta - right_eta;
+    let mut dphi = left_phi - right_phi;
+    while dphi > std::f64::consts::PI {
+        dphi -= 2.0 * std::f64::consts::PI;
+    }
+    while dphi <= -std::f64::consts::PI {
+        dphi += 2.0 * std::f64::consts::PI;
+    }
+    (deta * deta + dphi * dphi).sqrt()
 }
 
 fn derived_object<'a>(
@@ -494,7 +627,11 @@ fn leading_attrs_for_object(plan: &ResolvedPlan, object_name: &str) -> Vec<Strin
     for region in &plan.spec.regions {
         for requirement in &region.require {
             collect_leading_attrs(&requirement.lhs, object_name, &mut attrs);
+            collect_selected_attrs(&requirement.lhs, object_name, &mut attrs);
         }
+    }
+    for output in &plan.spec.outputs {
+        collect_selected_attrs(&output.expr, object_name, &mut attrs);
     }
     for derived in &plan.spec.derived_objects {
         match &derived.source {
@@ -507,12 +644,18 @@ fn leading_attrs_for_object(plan: &ResolvedPlan, object_name: &str) -> Vec<Strin
                         push_attr(&mut attrs, "charge");
                     }
                 }
+                for filter in &pair.filters {
+                    collect_pair_filter_attrs(&filter.lhs, &mut attrs);
+                }
             }
             DerivedSource::Candidate(candidate)
                 if candidate.items.iter().any(|item| item == object_name) =>
             {
                 for attr in ["pt", "eta", "phi", "mass"] {
                     push_attr(&mut attrs, attr);
+                }
+                for filter in &candidate.filters {
+                    collect_candidate_filter_attrs(&filter.lhs, &mut attrs);
                 }
             }
             _ => {}
@@ -533,6 +676,53 @@ fn collect_leading_attrs(expr: &Expr, object_name: &str, attrs: &mut Vec<String>
             attrs.push(attr.clone());
         }
         Expr::Abs(inner) => collect_leading_attrs(inner, object_name, attrs),
+        Expr::Sqrt(inner) => collect_leading_attrs(inner, object_name, attrs),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_leading_attrs(lhs, object_name, attrs);
+            collect_leading_attrs(rhs, object_name, attrs);
+        }
+        _ => {}
+    }
+}
+
+fn collect_selected_attrs(expr: &Expr, object_name: &str, attrs: &mut Vec<String>) {
+    match expr {
+        Expr::Attr { object, attr } if object == object_name => push_attr(attrs, attr),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_selected_attrs(lhs, object_name, attrs);
+            collect_selected_attrs(rhs, object_name, attrs);
+        }
+        Expr::Abs(inner) | Expr::Sqrt(inner) => collect_selected_attrs(inner, object_name, attrs),
+        Expr::CountWhere { object, predicate }
+        | Expr::All { object, predicate }
+        | Expr::Any { object, predicate }
+            if object == object_name =>
+        {
+            collect_selected_attrs(&predicate.lhs, object_name, attrs);
+        }
+        Expr::SumAttr { object, attr } if object == object_name => push_attr(attrs, attr),
+        _ => {}
+    }
+}
+
+fn collect_pair_filter_attrs(expr: &Expr, attrs: &mut Vec<String>) {
+    match expr {
+        Expr::PairDeltaR => {
+            push_attr(attrs, "eta");
+            push_attr(attrs, "phi");
+        }
+        Expr::PairLeadingPt | Expr::PairSubleadingPt => push_attr(attrs, "pt"),
+        _ => {}
+    }
+}
+
+fn collect_candidate_filter_attrs(expr: &Expr, attrs: &mut Vec<String>) {
+    match expr {
+        Expr::CandidateMinDeltaR => {
+            push_attr(attrs, "eta");
+            push_attr(attrs, "phi");
+        }
+        Expr::CandidateLeadingPt | Expr::CandidateSubleadingPt => push_attr(attrs, "pt"),
         _ => {}
     }
 }
@@ -551,6 +741,12 @@ fn eval_object_numeric_expr(
         Expr::Attr { object, .. } => Err(InterpretError::Unsupported(format!(
             "object `{current_object}` cut references `{object}`; this slice only supports cuts on the object being selected"
         ))),
+        Expr::Literal(value) => Ok(NumericValue::F64(*value)),
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs = eval_object_numeric_expr(plan, current_object, source, lhs, item)?.as_f64();
+            let rhs = eval_object_numeric_expr(plan, current_object, source, rhs, item)?.as_f64();
+            Ok(NumericValue::F64(eval_arithmetic(*op, lhs, rhs)))
+        }
         Expr::Abs(inner) => Ok(eval_object_numeric_expr(
             plan,
             current_object,
@@ -559,6 +755,11 @@ fn eval_object_numeric_expr(
             item,
         )?
         .abs()),
+        Expr::Sqrt(inner) => Ok(NumericValue::F64(
+            eval_object_numeric_expr(plan, current_object, source, inner, item)?
+                .as_f64()
+                .sqrt(),
+        )),
         other => Err(InterpretError::Unsupported(format!(
             "object cut expression `{other}` is not supported by the interpreter"
         ))),
@@ -614,6 +815,11 @@ fn eval_output_expr(
             })?;
             Ok(Some(Value::U32(count)))
         }
+        Expr::CountWhere { object, predicate } => {
+            let count = count_where(selected, derived, object, predicate)?;
+            Ok(Some(Value::U32(count)))
+        }
+        Expr::SumAttr { object, attr } => Ok(Some(Value::F64(sum_attr(selected, object, attr)?))),
         Expr::LeadingAttr { object, attr } => {
             let Some(value) = leading_value(selected, object, attr)? else {
                 return Ok(None);
@@ -640,6 +846,12 @@ fn eval_output_expr(
                 ))),
             }
         }
+        Expr::All { object, predicate } => Ok(Some(Value::Bool(collection_all(
+            selected, derived, object, predicate,
+        )?))),
+        Expr::Any { object, predicate } => Ok(Some(Value::Bool(collection_any(
+            selected, derived, object, predicate,
+        )?))),
         other => Err(InterpretError::Unsupported(format!(
             "output expression `{other}` is not supported by the interpreter"
         ))),
@@ -683,7 +895,18 @@ fn eval_numeric_expr(
                 ))),
             }
         }
+        Expr::Literal(value) => Ok(NumericValue::F64(*value)),
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs = eval_numeric_expr(lhs, selected, derived, current)?.as_f64();
+            let rhs = eval_numeric_expr(rhs, selected, derived, current)?.as_f64();
+            Ok(NumericValue::F64(eval_arithmetic(*op, lhs, rhs)))
+        }
         Expr::Abs(inner) => Ok(eval_numeric_expr(inner, selected, derived, current)?.abs()),
+        Expr::Sqrt(inner) => Ok(NumericValue::F64(
+            eval_numeric_expr(inner, selected, derived, current)?
+                .as_f64()
+                .sqrt(),
+        )),
         Expr::Count(object) => {
             let count = selected
                 .get(object)
@@ -691,6 +914,24 @@ fn eval_numeric_expr(
                 .len();
             Ok(NumericValue::U64(count as u64))
         }
+        Expr::CountWhere { object, predicate } => Ok(NumericValue::U64(u64::from(count_where(
+            selected, derived, object, predicate,
+        )?))),
+        Expr::SumAttr { object, attr } => Ok(NumericValue::F64(sum_attr(selected, object, attr)?)),
+        Expr::All { object, predicate } => Ok(NumericValue::U64(
+            if collection_all(selected, derived, object, predicate)? {
+                1
+            } else {
+                0
+            },
+        )),
+        Expr::Any { object, predicate } => Ok(NumericValue::U64(
+            if collection_any(selected, derived, object, predicate)? {
+                1
+            } else {
+                0
+            },
+        )),
         Expr::LeadingAttr { object, attr } => {
             leading_value(selected, object, attr)?.ok_or_else(|| {
                 InterpretError::InvalidExpression(format!(
@@ -698,6 +939,14 @@ fn eval_numeric_expr(
                 ))
             })
         }
+        Expr::PairDeltaR
+        | Expr::PairLeadingPt
+        | Expr::PairSubleadingPt
+        | Expr::CandidateMinDeltaR
+        | Expr::CandidateLeadingPt
+        | Expr::CandidateSubleadingPt => Err(InterpretError::InvalidExpression(format!(
+            "filter-only expression `{expr}` is not valid here"
+        ))),
     }
 }
 
@@ -725,6 +974,109 @@ fn leading_value(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(_, value)| value))
+}
+
+fn count_where(
+    selected: &SelectedObjects,
+    derived: &DerivedObjects,
+    object: &str,
+    predicate: &Cut,
+) -> Result<u32> {
+    let objects = selected
+        .get(object)
+        .ok_or_else(|| InterpretError::MissingObject(object.to_string()))?;
+    let mut count = 0_u32;
+    for selected_object in objects {
+        if eval_collection_predicate(selected, derived, object, selected_object, predicate)? {
+            count = count.checked_add(1).ok_or_else(|| {
+                InterpretError::NumericConversion(format!("count({object}, ...) overflowed u32"))
+            })?;
+        }
+    }
+    Ok(count)
+}
+
+fn sum_attr(selected: &SelectedObjects, object: &str, attr: &str) -> Result<f64> {
+    let objects = selected
+        .get(object)
+        .ok_or_else(|| InterpretError::MissingObject(object.to_string()))?;
+    Ok(objects
+        .iter()
+        .map(|selected_object| {
+            selected_object
+                .leading_values
+                .get(attr)
+                .copied()
+                .map(NumericValue::as_f64)
+                .ok_or_else(|| {
+                    InterpretError::InvalidExpression(format!(
+                        "attribute `{attr}` was not materialized for `{object}`"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .sum())
+}
+
+fn collection_all(
+    selected: &SelectedObjects,
+    derived: &DerivedObjects,
+    object: &str,
+    predicate: &Cut,
+) -> Result<bool> {
+    let objects = selected
+        .get(object)
+        .ok_or_else(|| InterpretError::MissingObject(object.to_string()))?;
+    for selected_object in objects {
+        if !eval_collection_predicate(selected, derived, object, selected_object, predicate)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn collection_any(
+    selected: &SelectedObjects,
+    derived: &DerivedObjects,
+    object: &str,
+    predicate: &Cut,
+) -> Result<bool> {
+    let objects = selected
+        .get(object)
+        .ok_or_else(|| InterpretError::MissingObject(object.to_string()))?;
+    for selected_object in objects {
+        if eval_collection_predicate(selected, derived, object, selected_object, predicate)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn eval_collection_predicate(
+    selected: &SelectedObjects,
+    derived: &DerivedObjects,
+    object: &str,
+    selected_object: &SelectedObject,
+    predicate: &Cut,
+) -> Result<bool> {
+    let lhs = eval_numeric_expr(
+        &predicate.lhs,
+        selected,
+        derived,
+        Some((object, selected_object)),
+    )?;
+    Ok(compare(lhs.as_f64(), predicate.op, predicate.rhs.value))
+}
+
+fn eval_arithmetic(op: ArithOp, lhs: f64, rhs: f64) -> f64 {
+    match op {
+        ArithOp::Add => lhs + rhs,
+        ArithOp::Sub => lhs - rhs,
+        ArithOp::Mul => lhs * rhs,
+        ArithOp::Div => lhs / rhs,
+        ArithOp::Pow => lhs.powf(rhs),
+    }
 }
 
 fn compare(lhs: f64, op: CmpOp, rhs: f64) -> bool {

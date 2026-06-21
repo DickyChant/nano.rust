@@ -6,10 +6,15 @@ use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
 use nano_gen_demo::GeneratedProducer;
 use nano_io::writer::{write_events, OutputBranch};
 use nano_producers::{MuonProducer, MuonSkimRow};
+use nano_spec::interpret::{interpret, Value};
+use nano_spec::{validate, AnalysisSpec, Catalogue};
 use nano_workflow::{
     merge_partials, muon_schema, plan_workflow_with_kernel_id, run_chunk, ExecutionMode, Executor,
     KernelRegistry, RunChunkRequest,
 };
+
+const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
+const SELECTION_ALL_SPEC: &str = include_str!("../../nano-spec/examples/selection_all.toml");
 
 #[test]
 fn generated_muon_producer_matches_handwritten_producer_on_synthetic_events() {
@@ -24,6 +29,76 @@ fn generated_muon_producer_matches_handwritten_producer_on_synthetic_events() {
             .map(|row| (row.n_good_muon, row.lead_muon_pt));
 
         assert_eq!(generated, handwritten, "entry {entry}");
+    }
+}
+
+#[test]
+fn generated_selection_all_matches_handwritten_reference() {
+    for entry in 0..selection_columns_len() {
+        let event = selection_event(entry);
+        let generated = nano_gen_demo::selection_all::GeneratedProducer::analyze(&event)
+            .unwrap()
+            .map(|row| row.n_good_muon);
+        let handwritten = handwritten_all(&event).map(|row| row.n_good_muon);
+        assert_eq!(generated, handwritten, "entry {entry}");
+    }
+}
+
+#[test]
+fn generated_charge_balance_matches_handwritten_reference() {
+    for entry in 0..selection_columns_len() {
+        let event = selection_event(entry);
+        let generated = nano_gen_demo::selection_charge_balance::GeneratedProducer::analyze(&event)
+            .unwrap()
+            .map(|row| row.n_good_muon);
+        let handwritten = handwritten_charge_balance(&event).map(|row| row.n_good_muon);
+        assert_eq!(generated, handwritten, "entry {entry}");
+    }
+}
+
+#[test]
+fn generated_sip3d_arithmetic_matches_handwritten_reference() {
+    for entry in 0..selection_columns_len() {
+        let event = selection_event(entry);
+        let generated = nano_gen_demo::selection_sip3d::GeneratedProducer::analyze(&event)
+            .unwrap()
+            .map(|row| row.n_good_muon);
+        let handwritten = handwritten_sip3d(&event).map(|row| row.n_good_muon);
+        assert_eq!(generated, handwritten, "entry {entry}");
+    }
+}
+
+#[test]
+fn generated_pair_dr_filter_matches_handwritten_reference() {
+    for entry in 0..selection_columns_len() {
+        let event = selection_event(entry);
+        let generated = nano_gen_demo::selection_pair_dr::GeneratedProducer::analyze(&event)
+            .unwrap()
+            .map(|row| row.z_mass.to_bits());
+        let handwritten = handwritten_pair_dr(&event).map(|row| row.z_mass.to_bits());
+        assert_eq!(generated, handwritten, "entry {entry}");
+    }
+}
+
+#[test]
+fn interpreted_selection_all_matches_generated_code() {
+    let spec = AnalysisSpec::from_toml_str(SELECTION_ALL_SPEC).unwrap();
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let plan = validate(&spec, &catalogue).unwrap();
+
+    for entry in 0..selection_columns_len() {
+        let event = selection_event(entry);
+        let generated = nano_gen_demo::selection_all::GeneratedProducer::analyze(&event)
+            .unwrap()
+            .map(|row| row.n_good_muon);
+        let interpreted =
+            interpret(&plan, &event)
+                .unwrap()
+                .map(|row| match row.get("n_good_muon").unwrap() {
+                    Value::U32(value) => value,
+                    value => panic!("unexpected interpreted value {value:?}"),
+                });
+        assert_eq!(generated, interpreted, "entry {entry}");
     }
 }
 
@@ -166,6 +241,263 @@ fn write_synthetic_input(path: &Path, muons: Vec<Vec<(f32, f32)>>) {
         ],
     )
     .unwrap();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CountRow {
+    n_good_muon: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ZRow {
+    z_mass: f64,
+}
+
+fn handwritten_all(event: &Event) -> Option<CountRow> {
+    let collection = event.collection("Muon").unwrap();
+    let mut count = 0_u32;
+    let mut all_pass = true;
+    for item in collection.iter() {
+        count += 1;
+        all_pass &= item.get::<f32>("pt").unwrap() > 5.0;
+    }
+    all_pass.then_some(CountRow { n_good_muon: count })
+}
+
+fn handwritten_charge_balance(event: &Event) -> Option<CountRow> {
+    let collection = event.collection("Muon").unwrap();
+    let mut count = 0_u32;
+    let mut charge_sum = 0_i32;
+    let mut positives = 0_u32;
+    for item in collection.iter() {
+        if item.get::<f32>("pt").unwrap() > 5.0 {
+            count += 1;
+            let charge = item.get::<i32>("charge").unwrap();
+            charge_sum += charge;
+            if charge > 0 {
+                positives += 1;
+            }
+        }
+    }
+    (charge_sum == 0 && positives == 1).then_some(CountRow { n_good_muon: count })
+}
+
+fn handwritten_sip3d(event: &Event) -> Option<CountRow> {
+    let collection = event.collection("Muon").unwrap();
+    let mut count = 0_u32;
+    for item in collection.iter() {
+        let dxy = item.get::<f32>("dxy").unwrap();
+        let dz = item.get::<f32>("dz").unwrap();
+        let dxy_err = item.get::<f32>("dxyErr").unwrap();
+        let dz_err = item.get::<f32>("dzErr").unwrap();
+        let sip3d = ((f64::from(dxy).powf(2.0) + f64::from(dz).powf(2.0)).sqrt())
+            / ((f64::from(dxy_err).powf(2.0) + f64::from(dz_err).powf(2.0)).sqrt());
+        if sip3d < 4.0 && dxy.abs() < 0.5 && dz.abs() < 1.0 {
+            count += 1;
+        }
+    }
+    Some(CountRow { n_good_muon: count })
+}
+
+fn handwritten_pair_dr(event: &Event) -> Option<ZRow> {
+    let collection = event.collection("Muon").unwrap();
+    let mut selected = collection
+        .iter()
+        .filter_map(|item| {
+            let pt = item.get::<f32>("pt").unwrap();
+            (pt > 5.0).then(|| SelectedMuon {
+                pt,
+                eta: item.get::<f32>("eta").unwrap(),
+                phi: item.get::<f32>("phi").unwrap(),
+                mass: item.get::<f32>("mass").unwrap(),
+                charge: item.get::<i32>("charge").unwrap(),
+            })
+        })
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| right.pt.total_cmp(&left.pt));
+
+    for (left_pos, first) in selected.iter().enumerate() {
+        for second in &selected[left_pos + 1..] {
+            if first.charge * second.charge >= 0 {
+                continue;
+            }
+            if delta_r(first.eta, first.phi, second.eta, second.phi) <= 0.3 {
+                continue;
+            }
+            if first.pt.max(second.pt) <= 20.0 || first.pt.min(second.pt) <= 10.0 {
+                continue;
+            }
+            let mass = invariant_mass([*first, *second]);
+            if mass.is_finite() && mass > 0.0 {
+                return Some(ZRow { z_mass: mass });
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectedMuon {
+    pt: f32,
+    eta: f32,
+    phi: f32,
+    mass: f32,
+    charge: i32,
+}
+
+fn invariant_mass(items: [SelectedMuon; 2]) -> f64 {
+    let mut energy = 0.0;
+    let mut px = 0.0;
+    let mut py = 0.0;
+    let mut pz = 0.0;
+    for item in items {
+        let pt = f64::from(item.pt);
+        let eta = f64::from(item.eta);
+        let phi = f64::from(item.phi);
+        let mass = f64::from(item.mass);
+        let item_px = pt * phi.cos();
+        let item_py = pt * phi.sin();
+        let item_pz = pt * eta.sinh();
+        energy += (item_px * item_px + item_py * item_py + item_pz * item_pz + mass * mass).sqrt();
+        px += item_px;
+        py += item_py;
+        pz += item_pz;
+    }
+    (energy * energy - px * px - py * py - pz * pz)
+        .max(0.0)
+        .sqrt()
+}
+
+fn delta_r(left_eta: f32, left_phi: f32, right_eta: f32, right_phi: f32) -> f64 {
+    let deta = f64::from(left_eta - right_eta);
+    let mut dphi = f64::from(left_phi - right_phi);
+    while dphi > std::f64::consts::PI {
+        dphi -= 2.0 * std::f64::consts::PI;
+    }
+    while dphi <= -std::f64::consts::PI {
+        dphi += 2.0 * std::f64::consts::PI;
+    }
+    (deta * deta + dphi * dphi).sqrt()
+}
+
+fn selection_event(entry: usize) -> Event {
+    Event::from_columns(selection_schema(), selection_columns(), entry).unwrap()
+}
+
+fn selection_columns_len() -> usize {
+    5
+}
+
+fn selection_schema() -> BranchSchema {
+    BranchSchema::new([
+        BranchSpec::new("nMuon", BranchType::U32),
+        BranchSpec::new("Muon_charge", BranchType::VecI32),
+        BranchSpec::new("Muon_dxy", BranchType::VecF32),
+        BranchSpec::new("Muon_dxyErr", BranchType::VecF32),
+        BranchSpec::new("Muon_dz", BranchType::VecF32),
+        BranchSpec::new("Muon_dzErr", BranchType::VecF32),
+        BranchSpec::new("Muon_eta", BranchType::VecF32),
+        BranchSpec::new("Muon_mass", BranchType::VecF32),
+        BranchSpec::new("Muon_phi", BranchType::VecF32),
+        BranchSpec::new("Muon_pt", BranchType::VecF32),
+    ])
+    .unwrap()
+}
+
+fn selection_columns() -> Vec<(String, BranchColumn)> {
+    vec![
+        ("nMuon".to_string(), BranchColumn::U32(vec![2, 2, 2, 2, 0])),
+        (
+            "Muon_pt".to_string(),
+            BranchColumn::VecF32(vec![
+                vec![25.0, 15.0],
+                vec![6.0, 4.0],
+                vec![22.0, 12.0],
+                vec![30.0, 25.0],
+                vec![],
+            ]),
+        ),
+        (
+            "Muon_eta".to_string(),
+            BranchColumn::VecF32(vec![
+                vec![0.0, 1.0],
+                vec![0.2, -0.1],
+                vec![0.1, -0.3],
+                vec![0.0, 0.01],
+                vec![],
+            ]),
+        ),
+        (
+            "Muon_phi".to_string(),
+            BranchColumn::VecF32(vec![
+                vec![0.0, 1.0],
+                vec![0.1, 0.2],
+                vec![0.4, 2.9],
+                vec![0.0, 0.01],
+                vec![],
+            ]),
+        ),
+        (
+            "Muon_mass".to_string(),
+            BranchColumn::VecF32(vec![
+                vec![0.105, 0.105],
+                vec![0.105, 0.105],
+                vec![0.105, 0.105],
+                vec![0.105, 0.105],
+                vec![],
+            ]),
+        ),
+        (
+            "Muon_charge".to_string(),
+            BranchColumn::VecI32(vec![
+                vec![1, -1],
+                vec![1, -1],
+                vec![1, 1],
+                vec![1, -1],
+                vec![],
+            ]),
+        ),
+        (
+            "Muon_dxy".to_string(),
+            BranchColumn::VecF32(vec![
+                vec![0.01, 0.02],
+                vec![0.2, 0.01],
+                vec![0.6, 0.01],
+                vec![0.01, 0.01],
+                vec![],
+            ]),
+        ),
+        (
+            "Muon_dz".to_string(),
+            BranchColumn::VecF32(vec![
+                vec![0.02, 0.03],
+                vec![0.2, 0.01],
+                vec![0.1, 1.2],
+                vec![0.01, 0.01],
+                vec![],
+            ]),
+        ),
+        (
+            "Muon_dxyErr".to_string(),
+            BranchColumn::VecF32(vec![
+                vec![0.02, 0.02],
+                vec![0.03, 0.02],
+                vec![0.02, 0.02],
+                vec![0.02, 0.02],
+                vec![],
+            ]),
+        ),
+        (
+            "Muon_dzErr".to_string(),
+            BranchColumn::VecF32(vec![
+                vec![0.02, 0.02],
+                vec![0.03, 0.02],
+                vec![0.02, 0.02],
+                vec![0.02, 0.02],
+                vec![],
+            ]),
+        ),
+    ]
 }
 
 struct Fixture {

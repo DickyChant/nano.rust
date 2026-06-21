@@ -12,8 +12,8 @@ use std::fmt::Write as _;
 use nano_core::BranchType;
 
 use crate::{
-    AnalysisSpec, CmpOp, DerivedObjectDef, DerivedSource, Expr, ModelDef, ObjectCandidateDef,
-    ObjectDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
+    AnalysisSpec, ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef,
+    ObjectCandidateDef, ObjectDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
 };
 
 /// Generate compilable Rust producer source from a validated plan.
@@ -296,6 +296,16 @@ impl<'a> Generator<'a> {
             checked_ident(&output.name, "output name")?;
             match &output.expr {
                 Expr::Count(object) => {
+                    self.object(object)?;
+                }
+                Expr::CountWhere { object, .. } => {
+                    self.object(object)?;
+                }
+                Expr::SumAttr { object, attr } => {
+                    self.object(object)?;
+                    self.require_supported_object_attr(object, attr, "sum output")?;
+                }
+                Expr::All { object, .. } | Expr::Any { object, .. } => {
                     self.object(object)?;
                 }
                 Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
@@ -607,6 +617,14 @@ impl<'a> Generator<'a> {
         for cut in &object.cuts {
             collect_attr_names_for_current_object(&cut.lhs, object_name, &mut attrs)?;
         }
+        for region in &self.spec().regions {
+            for requirement in &region.require {
+                collect_selected_attr_names(&requirement.lhs, object_name, &mut attrs)?;
+            }
+        }
+        for output in &self.spec().outputs {
+            collect_selected_attr_names(&output.expr, object_name, &mut attrs)?;
+        }
         for output in &self.spec().outputs {
             if let Expr::LeadingAttr { object, attr } = &output.expr {
                 if object == object_name {
@@ -636,6 +654,14 @@ impl<'a> Generator<'a> {
         object_name: &str,
     ) -> Result<BTreeSet<String>, CodegenError> {
         let mut attrs = BTreeSet::new();
+        for region in &self.spec().regions {
+            for requirement in &region.require {
+                collect_selected_attr_names(&requirement.lhs, object_name, &mut attrs)?;
+            }
+        }
+        for output in &self.spec().outputs {
+            collect_selected_attr_names(&output.expr, object_name, &mut attrs)?;
+        }
         for derived in &self.spec().derived_objects {
             match &derived.source {
                 DerivedSource::Pair(pair) => {
@@ -652,6 +678,9 @@ impl<'a> Generator<'a> {
                             attrs.insert("charge".to_string());
                         }
                     }
+                    for filter in &pair.filters {
+                        collect_pair_filter_attr_names(&filter.lhs, &mut attrs);
+                    }
                 }
                 DerivedSource::Candidate(candidate) => {
                     if candidate.items.iter().any(|item| item == object_name) {
@@ -659,6 +688,9 @@ impl<'a> Generator<'a> {
                         attrs.insert("eta".to_string());
                         attrs.insert("phi".to_string());
                         attrs.insert("mass".to_string());
+                        for filter in &candidate.filters {
+                            collect_candidate_filter_attr_names(&filter.lhs, &mut attrs);
+                        }
                     }
                 }
             }
@@ -693,10 +725,13 @@ impl<'a> Generator<'a> {
             return Ok(());
         }
 
-        writeln!(source, "#[derive(Debug, Clone, Copy, PartialEq, Eq)]").unwrap();
+        writeln!(source, "#[derive(Debug, Clone, Copy, PartialEq)]").unwrap();
         writeln!(source, "struct GenConstituent {{").unwrap();
         writeln!(source, "    object: &'static str,").unwrap();
         writeln!(source, "    index: usize,").unwrap();
+        writeln!(source, "    pt: f32,").unwrap();
+        writeln!(source, "    eta: f32,").unwrap();
+        writeln!(source, "    phi: f32,").unwrap();
         writeln!(source, "}}").unwrap();
         writeln!(source).unwrap();
         writeln!(
@@ -732,6 +767,86 @@ impl<'a> Generator<'a> {
         .unwrap();
         writeln!(source, "        (px * px + py * py).sqrt(),").unwrap();
         writeln!(source, "    )").unwrap();
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
+        writeln!(
+            source,
+            "fn gen_delta_r(left_eta: f32, left_phi: f32, right_eta: f32, right_phi: f32) -> f64 {{"
+        )
+        .unwrap();
+        writeln!(source, "    let deta = f64::from(left_eta - right_eta);").unwrap();
+        writeln!(
+            source,
+            "    let mut dphi = f64::from(left_phi - right_phi);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    while dphi > std::f64::consts::PI {{ dphi -= 2.0 * std::f64::consts::PI; }}"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    while dphi <= -std::f64::consts::PI {{ dphi += 2.0 * std::f64::consts::PI; }}"
+        )
+        .unwrap();
+        writeln!(source, "    (deta * deta + dphi * dphi).sqrt()").unwrap();
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
+        writeln!(
+            source,
+            "fn gen_candidate_leading_pt(items: &[GenConstituent]) -> f32 {{"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    items.iter().map(|item| item.pt).fold(f32::NEG_INFINITY, f32::max)"
+        )
+        .unwrap();
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
+        writeln!(
+            source,
+            "fn gen_candidate_subleading_pt(items: &[GenConstituent]) -> f32 {{"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    let mut pts = items.iter().map(|item| item.pt).collect::<Vec<_>>();"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    pts.sort_by(|left, right| right.total_cmp(left));"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    pts.get(1).copied().unwrap_or(f32::NEG_INFINITY)"
+        )
+        .unwrap();
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
+        writeln!(
+            source,
+            "fn gen_candidate_min_delta_r(items: &[GenConstituent]) -> f64 {{"
+        )
+        .unwrap();
+        writeln!(source, "    let mut min = f64::INFINITY;").unwrap();
+        writeln!(
+            source,
+            "    for (left_pos, left) in items.iter().enumerate() {{"
+        )
+        .unwrap();
+        writeln!(source, "        for right in &items[left_pos + 1..] {{").unwrap();
+        writeln!(
+            source,
+            "            min = min.min(gen_delta_r(left.eta, left.phi, right.eta, right.phi));"
+        )
+        .unwrap();
+        writeln!(source, "        }}").unwrap();
+        writeln!(source, "    }}").unwrap();
+        writeln!(source, "    min").unwrap();
         writeln!(source, "}}").unwrap();
         writeln!(source).unwrap();
         Ok(())
@@ -866,6 +981,19 @@ impl<'a> Generator<'a> {
             }
         }
 
+        for filter in &pair.filters {
+            let lhs = self.emit_pair_filter_expr(&filter.lhs)?;
+            writeln!(
+                source,
+                "                if !({lhs} {} {}) {{",
+                cmp_op(filter.op),
+                numeric_literal_for_expr(&filter.lhs, filter.rhs.value)
+            )
+            .unwrap();
+            writeln!(source, "                    continue;").unwrap();
+            writeln!(source, "                }}").unwrap();
+        }
+
         writeln!(
             source,
             "                let (e1, px1, py1, pz1) = gen_four_vector(first.pt, first.eta, first.phi, first.mass);"
@@ -899,13 +1027,13 @@ impl<'a> Generator<'a> {
         .unwrap();
         writeln!(
             source,
-            "                    GenConstituent {{ object: {}, index: first.source_index }},",
+            "                    GenConstituent {{ object: {}, index: first.source_index, pt: first.pt, eta: first.eta, phi: first.phi }},",
             rust_string(&pair.object)
         )
         .unwrap();
         writeln!(
             source,
-            "                    GenConstituent {{ object: {}, index: second.source_index }},",
+            "                    GenConstituent {{ object: {}, index: second.source_index, pt: second.pt, eta: second.eta, phi: second.phi }},",
             rust_string(&pair.object)
         )
         .unwrap();
@@ -948,6 +1076,19 @@ impl<'a> Generator<'a> {
         writeln!(source, "        }}").unwrap();
         writeln!(source).unwrap();
         Ok(())
+    }
+
+    fn emit_pair_filter_expr(&self, expr: &Expr) -> Result<String, CodegenError> {
+        match expr {
+            Expr::PairDeltaR => {
+                Ok("gen_delta_r(first.eta, first.phi, second.eta, second.phi)".to_string())
+            }
+            Expr::PairLeadingPt => Ok("first.pt.max(second.pt)".to_string()),
+            Expr::PairSubleadingPt => Ok("first.pt.min(second.pt)".to_string()),
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "pair filter expression `{other}` is not supported by codegen"
+            ))),
+        }
     }
 
     fn emit_candidate_derived_object(
@@ -1004,7 +1145,7 @@ impl<'a> Generator<'a> {
                 writeln!(source, "                pz += item_pz;").unwrap();
                 writeln!(
                     source,
-                    "                {used_ident}.push(GenConstituent {{ object: {}, index: {local_ident}.source_index }});",
+                    "                {used_ident}.push(GenConstituent {{ object: {}, index: {local_ident}.source_index, pt: {local_ident}.pt, eta: {local_ident}.eta, phi: {local_ident}.phi }});",
                     rust_string(item)
                 )
                 .unwrap();
@@ -1044,26 +1185,57 @@ impl<'a> Generator<'a> {
         )
         .unwrap();
         writeln!(source, "            if mass.is_finite() && mass > 0.0 {{").unwrap();
+        for filter in &candidate.filters {
+            let lhs = self.emit_candidate_filter_expr(&filter.lhs, &used_ident)?;
+            writeln!(
+                source,
+                "                if !({lhs} {} {}) {{",
+                cmp_op(filter.op),
+                numeric_literal_for_expr(&filter.lhs, filter.rhs.value)
+            )
+            .unwrap();
+            writeln!(source, "                    candidate_complete = false;").unwrap();
+            writeln!(source, "                }}").unwrap();
+        }
+        writeln!(source, "                if candidate_complete {{").unwrap();
         writeln!(
             source,
-            "                let constituents = Box::leak({used_ident}.into_boxed_slice());"
+            "                    let constituents = Box::leak({used_ident}.into_boxed_slice());"
         )
         .unwrap();
         writeln!(
             source,
-            "                {derived_ident} = Some({derived_type} {{ mass, pt, energy, px, py, pz, constituents }});"
+            "                    {derived_ident} = Some({derived_type} {{ mass, pt, energy, px, py, pz, constituents }});"
         )
         .unwrap();
+        writeln!(source, "                }}").unwrap();
         writeln!(source, "            }}").unwrap();
         writeln!(source, "        }}").unwrap();
         writeln!(source).unwrap();
         Ok(())
     }
 
+    fn emit_candidate_filter_expr(
+        &self,
+        expr: &Expr,
+        used_ident: &str,
+    ) -> Result<String, CodegenError> {
+        match expr {
+            Expr::CandidateMinDeltaR => Ok(format!("gen_candidate_min_delta_r(&{used_ident})")),
+            Expr::CandidateLeadingPt => Ok(format!("gen_candidate_leading_pt(&{used_ident})")),
+            Expr::CandidateSubleadingPt => {
+                Ok(format!("gen_candidate_subleading_pt(&{used_ident})"))
+            }
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "candidate filter expression `{other}` is not supported by codegen"
+            ))),
+        }
+    }
+
     fn emit_cut(&self, object: &ObjectDef, cut: &crate::Cut) -> Result<String, CodegenError> {
         let lhs = self.emit_cut_value_expr(&cut.lhs, &object.name)?;
         let op = cmp_op(cut.op);
-        let rhs = f32_literal(cut.rhs.value);
+        let rhs = numeric_literal_for_expr(&cut.lhs, cut.rhs.value);
         Ok(format!("({lhs} {op} {rhs})"))
     }
 
@@ -1075,9 +1247,78 @@ impl<'a> Generator<'a> {
             Expr::Attr { object, .. } => Err(CodegenError::UnsupportedFeature(format!(
                 "object cut references `{object}`; this slice only supports cuts on the object being selected"
             ))),
+            Expr::Literal(value) => Ok(f64_literal(*value)),
+            Expr::Binary { op, lhs, rhs } => {
+                let lhs = as_f64_expr(self.emit_cut_value_expr(lhs, object_name)?);
+                let rhs = as_f64_expr(self.emit_cut_value_expr(rhs, object_name)?);
+                if matches!(op, ArithOp::Pow) {
+                    Ok(format!("{lhs}.powf({rhs})"))
+                } else {
+                    Ok(format!("({lhs} {} {rhs})", arith_op(*op)))
+                }
+            }
             Expr::Abs(inner) => Ok(format!("{}.abs()", self.emit_cut_value_expr(inner, object_name)?)),
+            Expr::Sqrt(inner) => Ok(format!(
+                "{}.sqrt()",
+                as_f64_expr(self.emit_cut_value_expr(inner, object_name)?)
+            )),
             other => Err(CodegenError::UnsupportedFeature(format!(
                 "object cut expression `{other}` is not supported by this slice"
+            ))),
+        }
+    }
+
+    fn emit_selected_predicate(
+        &self,
+        object: &str,
+        item_ident: &str,
+        predicate: &Cut,
+    ) -> Result<String, CodegenError> {
+        let lhs = self.emit_selected_value_expr(&predicate.lhs, object, item_ident)?;
+        Ok(format!(
+            "({} {} {})",
+            as_f64_expr(lhs),
+            cmp_op(predicate.op),
+            f64_literal(predicate.rhs.value)
+        ))
+    }
+
+    fn emit_selected_value_expr(
+        &self,
+        expr: &Expr,
+        object_name: &str,
+        item_ident: &str,
+    ) -> Result<String, CodegenError> {
+        match expr {
+            Expr::Attr { object, attr } if object == object_name => Ok(format!(
+                "{item_ident}.{}",
+                checked_ident(attr, "selected attribute")?
+            )),
+            Expr::Attr { object, .. } => Err(CodegenError::UnsupportedFeature(format!(
+                "collection predicate for `{object_name}` references `{object}`"
+            ))),
+            Expr::Literal(value) => Ok(f64_literal(*value)),
+            Expr::Binary { op, lhs, rhs } => {
+                let lhs =
+                    as_f64_expr(self.emit_selected_value_expr(lhs, object_name, item_ident)?);
+                let rhs =
+                    as_f64_expr(self.emit_selected_value_expr(rhs, object_name, item_ident)?);
+                if matches!(op, ArithOp::Pow) {
+                    Ok(format!("{lhs}.powf({rhs})"))
+                } else {
+                    Ok(format!("({lhs} {} {rhs})", arith_op(*op)))
+                }
+            }
+            Expr::Abs(inner) => Ok(format!(
+                "{}.abs()",
+                self.emit_selected_value_expr(inner, object_name, item_ident)?
+            )),
+            Expr::Sqrt(inner) => Ok(format!(
+                "{}.sqrt()",
+                as_f64_expr(self.emit_selected_value_expr(inner, object_name, item_ident)?)
+            )),
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "collection predicate expression `{other}` is not supported by codegen"
             ))),
         }
     }
@@ -1094,6 +1335,44 @@ impl<'a> Generator<'a> {
                 let rhs = checked_count_rhs(rhs, "region requirement")?;
                 Ok(format!("{lhs} {} {rhs}_u32", cmp_op(op)))
             }
+            Expr::CountWhere { object, predicate } => {
+                let selected = selected_objects_ident(object)?;
+                let item = format!("{}_count_item", checked_ident(object, "count object")?);
+                let predicate = self.emit_selected_predicate(object, &item, predicate)?;
+                let rhs = checked_count_rhs(rhs, "region requirement")?;
+                Ok(format!(
+                    "({selected}.iter().filter(|{item}| {predicate}).count() as u32) {} {rhs}_u32",
+                    cmp_op(op)
+                ))
+            }
+            Expr::SumAttr { object, attr } => {
+                let selected = selected_objects_ident(object)?;
+                let item = format!("{}_sum_item", checked_ident(object, "sum object")?);
+                let attr = checked_ident(attr, "sum attribute")?;
+                Ok(format!(
+                    "{selected}.iter().map(|{item}| {item}.{attr} as f64).sum::<f64>() {} {}",
+                    cmp_op(op),
+                    f64_literal(rhs)
+                ))
+            }
+            Expr::All { object, predicate } => {
+                let predicate = self.emit_collection_bool_expr("all", object, predicate)?;
+                Ok(bool_comparison_expr(
+                    predicate,
+                    op,
+                    rhs,
+                    "region requirement",
+                )?)
+            }
+            Expr::Any { object, predicate } => {
+                let predicate = self.emit_collection_bool_expr("any", object, predicate)?;
+                Ok(bool_comparison_expr(
+                    predicate,
+                    op,
+                    rhs,
+                    "region requirement",
+                )?)
+            }
             Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
                 let lhs = derived_attr_expr(object, attr)?;
                 Ok(format!("{lhs} {} {}", cmp_op(op), f64_literal(rhs)))
@@ -1104,9 +1383,47 @@ impl<'a> Generator<'a> {
         }
     }
 
+    fn emit_collection_bool_expr(
+        &self,
+        method: &str,
+        object: &str,
+        predicate: &Cut,
+    ) -> Result<String, CodegenError> {
+        let selected = selected_objects_ident(object)?;
+        let item = format!(
+            "{}_{}_item",
+            checked_ident(object, "predicate object")?,
+            method
+        );
+        let predicate = self.emit_selected_predicate(object, &item, predicate)?;
+        Ok(format!("{selected}.iter().{method}(|{item}| {predicate})"))
+    }
+
     fn emit_output_expr(&self, expr: &Expr, output_name: &str) -> Result<String, CodegenError> {
         match expr {
             Expr::Count(object) => count_ident(object),
+            Expr::CountWhere { object, predicate } => {
+                let selected = selected_objects_ident(object)?;
+                let item = format!("{}_count_item", checked_ident(object, "count object")?);
+                let predicate = self.emit_selected_predicate(object, &item, predicate)?;
+                Ok(format!(
+                    "{selected}.iter().filter(|{item}| {predicate}).count() as u32"
+                ))
+            }
+            Expr::SumAttr { object, attr } => {
+                let selected = selected_objects_ident(object)?;
+                let item = format!("{}_sum_item", checked_ident(object, "sum object")?);
+                let attr = checked_ident(attr, "sum attribute")?;
+                Ok(format!(
+                    "{selected}.iter().map(|{item}| {item}.{attr} as f64).sum::<f64>()"
+                ))
+            }
+            Expr::All { object, predicate } => {
+                self.emit_collection_bool_expr("all", object, predicate)
+            }
+            Expr::Any { object, predicate } => {
+                self.emit_collection_bool_expr("any", object, predicate)
+            }
             Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
                 derived_attr_expr(object, attr)
             }
@@ -1120,6 +1437,9 @@ impl<'a> Generator<'a> {
     fn output_type(&self, expr: &Expr) -> Result<&'static str, CodegenError> {
         match expr {
             Expr::Count(_) => Ok("u32"),
+            Expr::CountWhere { .. } => Ok("u32"),
+            Expr::SumAttr { .. } => Ok("f64"),
+            Expr::All { .. } | Expr::Any { .. } => Ok("bool"),
             Expr::Attr { object, .. } if self.derived_object(object).is_ok() => Ok("f64"),
             Expr::LeadingAttr { .. } => Ok("f32"),
             other => Err(CodegenError::UnsupportedFeature(format!(
@@ -1137,7 +1457,13 @@ impl<'a> Generator<'a> {
             Expr::Attr { object, .. } => Err(CodegenError::UnsupportedFeature(format!(
                 "object `{object_name}` cut references `{object}`; this slice only supports cuts on the object being selected"
             ))),
+            Expr::Literal(_) => Ok(()),
+            Expr::Binary { lhs, rhs, .. } => {
+                self.validate_cut_expr(object_name, lhs)?;
+                self.validate_cut_expr(object_name, rhs)
+            }
             Expr::Abs(inner) => self.validate_cut_expr(object_name, inner),
+            Expr::Sqrt(inner) => self.validate_cut_expr(object_name, inner),
             other => Err(CodegenError::UnsupportedFeature(format!(
                 "object cut expression `{other}` is not supported by this slice"
             ))),
@@ -1150,11 +1476,41 @@ impl<'a> Generator<'a> {
                 self.object(object)?;
                 Ok(())
             }
+            Expr::CountWhere { object, predicate }
+            | Expr::All { object, predicate }
+            | Expr::Any { object, predicate } => {
+                self.object(object)?;
+                self.validate_selected_expr(object, &predicate.lhs)
+            }
+            Expr::SumAttr { object, attr } => {
+                self.object(object)?;
+                self.require_supported_object_attr(object, attr, context)
+            }
             Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
                 self.validate_derived_attr(object, attr, context)
             }
             other => Err(CodegenError::UnsupportedFeature(format!(
                 "{context} expression `{other}` is not supported by this slice"
+            ))),
+        }
+    }
+
+    fn validate_selected_expr(&self, object_name: &str, expr: &Expr) -> Result<(), CodegenError> {
+        match expr {
+            Expr::Attr { object, attr } if object == object_name => {
+                self.require_supported_object_attr(object, attr, "collection predicate")
+            }
+            Expr::Attr { object, .. } => Err(CodegenError::UnsupportedFeature(format!(
+                "collection predicate for `{object_name}` references `{object}`"
+            ))),
+            Expr::Literal(_) => Ok(()),
+            Expr::Binary { lhs, rhs, .. } => {
+                self.validate_selected_expr(object_name, lhs)?;
+                self.validate_selected_expr(object_name, rhs)
+            }
+            Expr::Abs(inner) | Expr::Sqrt(inner) => self.validate_selected_expr(object_name, inner),
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "collection predicate expression `{other}` is not supported by codegen"
             ))),
         }
     }
@@ -1254,6 +1610,9 @@ impl<'a> Generator<'a> {
                         )));
                     }
                 }
+                for filter in &pair.filters {
+                    self.validate_pair_filter(&pair.object, &filter.lhs)?;
+                }
                 for excluded in &pair.exclude {
                     self.derived_object(excluded)?;
                 }
@@ -1280,8 +1639,37 @@ impl<'a> Generator<'a> {
                         self.derived_object(item)?;
                     }
                 }
+                for filter in &candidate.filters {
+                    self.validate_candidate_filter(&filter.lhs)?;
+                }
                 Ok(())
             }
+        }
+    }
+
+    fn validate_pair_filter(&self, object: &str, expr: &Expr) -> Result<(), CodegenError> {
+        match expr {
+            Expr::PairDeltaR => {
+                self.require_f32_attr(object, "eta", "pair delta-R filter")?;
+                self.require_f32_attr(object, "phi", "pair delta-R filter")
+            }
+            Expr::PairLeadingPt | Expr::PairSubleadingPt => {
+                self.require_f32_attr(object, "pt", "pair pT filter")
+            }
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "pair filter expression `{other}` is not supported by codegen"
+            ))),
+        }
+    }
+
+    fn validate_candidate_filter(&self, expr: &Expr) -> Result<(), CodegenError> {
+        match expr {
+            Expr::CandidateMinDeltaR | Expr::CandidateLeadingPt | Expr::CandidateSubleadingPt => {
+                Ok(())
+            }
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "candidate filter expression `{other}` is not supported by codegen"
+            ))),
         }
     }
 
@@ -1841,10 +2229,82 @@ fn collect_attr_names_for_current_object(
         Expr::Attr { object, .. } => Err(CodegenError::UnsupportedFeature(format!(
             "object `{object_name}` cut references `{object}`; this slice only supports cuts on the object being selected"
         ))),
+        Expr::Literal(_) => Ok(()),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_attr_names_for_current_object(lhs, object_name, attrs)?;
+            collect_attr_names_for_current_object(rhs, object_name, attrs)
+        }
         Expr::Abs(inner) => collect_attr_names_for_current_object(inner, object_name, attrs),
+        Expr::Sqrt(inner) => collect_attr_names_for_current_object(inner, object_name, attrs),
         other => Err(CodegenError::UnsupportedFeature(format!(
             "object cut expression `{other}` is not supported by this slice"
         ))),
+    }
+}
+
+fn collect_selected_attr_names(
+    expr: &Expr,
+    object_name: &str,
+    attrs: &mut BTreeSet<String>,
+) -> Result<(), CodegenError> {
+    match expr {
+        Expr::Attr { object, attr } if object == object_name => {
+            attrs.insert(attr.clone());
+            Ok(())
+        }
+        Expr::Attr { .. } | Expr::Literal(_) | Expr::Count(_) | Expr::LeadingAttr { .. } => Ok(()),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_selected_attr_names(lhs, object_name, attrs)?;
+            collect_selected_attr_names(rhs, object_name, attrs)
+        }
+        Expr::Abs(inner) | Expr::Sqrt(inner) => {
+            collect_selected_attr_names(inner, object_name, attrs)
+        }
+        Expr::CountWhere { object, predicate }
+        | Expr::All { object, predicate }
+        | Expr::Any { object, predicate }
+            if object == object_name =>
+        {
+            collect_selected_attr_names(&predicate.lhs, object_name, attrs)
+        }
+        Expr::CountWhere { .. } | Expr::All { .. } | Expr::Any { .. } => Ok(()),
+        Expr::SumAttr { object, attr } if object == object_name => {
+            attrs.insert(attr.clone());
+            Ok(())
+        }
+        Expr::SumAttr { .. } => Ok(()),
+        Expr::PairDeltaR
+        | Expr::PairLeadingPt
+        | Expr::PairSubleadingPt
+        | Expr::CandidateMinDeltaR
+        | Expr::CandidateLeadingPt
+        | Expr::CandidateSubleadingPt => Ok(()),
+    }
+}
+
+fn collect_pair_filter_attr_names(expr: &Expr, attrs: &mut BTreeSet<String>) {
+    match expr {
+        Expr::PairDeltaR => {
+            attrs.insert("eta".to_string());
+            attrs.insert("phi".to_string());
+        }
+        Expr::PairLeadingPt | Expr::PairSubleadingPt => {
+            attrs.insert("pt".to_string());
+        }
+        _ => {}
+    }
+}
+
+fn collect_candidate_filter_attr_names(expr: &Expr, attrs: &mut BTreeSet<String>) {
+    match expr {
+        Expr::CandidateMinDeltaR => {
+            attrs.insert("eta".to_string());
+            attrs.insert("phi".to_string());
+        }
+        Expr::CandidateLeadingPt | Expr::CandidateSubleadingPt => {
+            attrs.insert("pt".to_string());
+        }
+        _ => {}
     }
 }
 
@@ -1984,6 +2444,47 @@ fn cmp_op(op: CmpOp) -> &'static str {
     }
 }
 
+fn arith_op(op: ArithOp) -> &'static str {
+    match op {
+        ArithOp::Add => "+",
+        ArithOp::Sub => "-",
+        ArithOp::Mul => "*",
+        ArithOp::Div => "/",
+        ArithOp::Pow => ".powf",
+    }
+}
+
+fn as_f64_expr(expr: String) -> String {
+    format!("({expr} as f64)")
+}
+
+fn numeric_literal_for_expr(expr: &Expr, value: f64) -> String {
+    match expr {
+        Expr::PairLeadingPt
+        | Expr::PairSubleadingPt
+        | Expr::CandidateLeadingPt
+        | Expr::CandidateSubleadingPt
+        | Expr::Attr { .. }
+        | Expr::Abs(_) => f32_literal(value),
+        _ => f64_literal(value),
+    }
+}
+
+fn bool_comparison_expr(
+    predicate: String,
+    op: CmpOp,
+    rhs: f64,
+    context: &str,
+) -> Result<String, CodegenError> {
+    match (op, rhs) {
+        (CmpOp::Eq, 1.0) | (CmpOp::Ne, 0.0) => Ok(predicate),
+        (CmpOp::Ne, 1.0) | (CmpOp::Eq, 0.0) => Ok(format!("!({predicate})")),
+        _ => Err(CodegenError::UnsupportedFeature(format!(
+            "{context}: boolean predicate comparisons support only == 1, != 0, == 0, or != 1"
+        ))),
+    }
+}
+
 fn f32_literal(value: f64) -> String {
     format!("{value:?}_f32")
 }
@@ -2020,7 +2521,18 @@ fn collect_derived_objects_in_expr(
         {
             objects.insert(object.clone());
         }
-        Expr::Abs(inner) => collect_derived_objects_in_expr(inner, spec, objects),
+        Expr::Abs(inner) | Expr::Sqrt(inner) => {
+            collect_derived_objects_in_expr(inner, spec, objects)
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_derived_objects_in_expr(lhs, spec, objects);
+            collect_derived_objects_in_expr(rhs, spec, objects);
+        }
+        Expr::CountWhere { predicate, .. }
+        | Expr::All { predicate, .. }
+        | Expr::Any { predicate, .. } => {
+            collect_derived_objects_in_expr(&predicate.lhs, spec, objects);
+        }
         _ => {}
     }
 }
@@ -2035,7 +2547,11 @@ fn derived_dependencies(derived: &DerivedObjectDef) -> Vec<String> {
 fn expr_counts_object(expr: &Expr, object_name: &str) -> bool {
     match expr {
         Expr::Count(object) => object == object_name,
-        Expr::Abs(inner) => expr_counts_object(inner, object_name),
+        Expr::CountWhere { object, .. } => object == object_name,
+        Expr::Abs(inner) | Expr::Sqrt(inner) => expr_counts_object(inner, object_name),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_counts_object(lhs, object_name) || expr_counts_object(rhs, object_name)
+        }
         _ => false,
     }
 }

@@ -146,14 +146,16 @@ pub enum DerivedSource {
 pub struct ObjectPairDef {
     pub object: String,
     pub constraints: Vec<PairConstraint>,
+    pub filters: Vec<Cut>,
     pub selection: PairSelection,
     pub exclude: Vec<String>,
 }
 
 /// Candidate assembly from selected objects and/or previously derived objects.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ObjectCandidateDef {
     pub items: Vec<String>,
+    pub filters: Vec<Cut>,
 }
 
 /// Pair-level constraints.
@@ -242,13 +244,58 @@ pub enum Unit {
     Dimensionless,
 }
 
-/// Expression nodes for the first semantic slice.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Arithmetic operators inside numeric expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Pow,
+}
+
+/// Expression nodes for the semantic selection IR.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Expr {
-    Attr { object: String, attr: String },
+    Attr {
+        object: String,
+        attr: String,
+    },
+    Literal(f64),
+    Binary {
+        op: ArithOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
     Abs(Box<Expr>),
+    Sqrt(Box<Expr>),
     Count(String),
-    LeadingAttr { object: String, attr: String },
+    CountWhere {
+        object: String,
+        predicate: Box<Cut>,
+    },
+    SumAttr {
+        object: String,
+        attr: String,
+    },
+    All {
+        object: String,
+        predicate: Box<Cut>,
+    },
+    Any {
+        object: String,
+        predicate: Box<Cut>,
+    },
+    LeadingAttr {
+        object: String,
+        attr: String,
+    },
+    PairDeltaR,
+    PairLeadingPt,
+    PairSubleadingPt,
+    CandidateMinDeltaR,
+    CandidateLeadingPt,
+    CandidateSubleadingPt,
 }
 
 /// Comparison operators supported in cuts and region requirements.
@@ -278,7 +325,7 @@ pub struct RegionDef {
 }
 
 /// Named output expression.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OutputDef {
     pub name: String,
     pub expr: Expr,
@@ -507,6 +554,10 @@ fn validate_cut(object: &ObjectDef, index: usize, cut: &Cut, ctx: &mut Validatio
             context,
             detail: "object cuts must compare branch attributes, not counts".to_string(),
         }),
+        Some(ExprType::Bool) => ctx.errors.push(SpecError::InvalidExpression {
+            context,
+            detail: "object cuts must compare numeric expressions, not predicates".to_string(),
+        }),
         None => {}
     }
 }
@@ -534,7 +585,35 @@ fn validate_requirement(
                 &requirement.rhs,
                 ctx.errors,
             ),
+            ExprType::Bool => {
+                validate_quantity_unit(
+                    &context,
+                    &requirement.lhs,
+                    Dimension::Dimensionless,
+                    &requirement.rhs,
+                    ctx.errors,
+                );
+                validate_bool_requirement(&context, requirement, ctx.errors);
+            }
         }
+    }
+}
+
+fn validate_bool_requirement(
+    context: &str,
+    requirement: &Requirement,
+    errors: &mut Vec<SpecError>,
+) {
+    let valid_rhs = requirement.rhs.value == 0.0 || requirement.rhs.value == 1.0;
+    let valid_op = matches!(requirement.op, CmpOp::Eq | CmpOp::Ne);
+    if !valid_rhs || !valid_op {
+        errors.push(SpecError::InvalidExpression {
+            context: context.to_string(),
+            detail: format!(
+                "boolean predicate `{}` supports only == 1, != 0, == 0, or != 1",
+                requirement.lhs
+            ),
+        });
     }
 }
 
@@ -566,6 +645,10 @@ fn validate_derived_object(derived: &DerivedObjectDef, ctx: &mut ValidationConte
                     }
                     PairConstraint::SameFlavor => {}
                 }
+            }
+
+            for (index, filter) in pair.filters.iter().enumerate() {
+                validate_pair_filter(pair, index, filter, &context, ctx);
             }
 
             match &pair.selection {
@@ -626,8 +709,75 @@ fn validate_derived_object(derived: &DerivedObjectDef, ctx: &mut ValidationConte
             for item in &candidate.items {
                 validate_candidate_item(item, &context, ctx);
             }
+            for (index, filter) in candidate.filters.iter().enumerate() {
+                validate_candidate_filter(index, filter, &context, ctx);
+            }
         }
     }
+}
+
+fn validate_pair_filter(
+    pair: &ObjectPairDef,
+    index: usize,
+    filter: &Cut,
+    parent_context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    let context = format!("{parent_context} filter {}", index + 1);
+    let Some(dimension) = validate_filter_expr(&filter.lhs, FilterContext::Pair, &context, ctx)
+    else {
+        return;
+    };
+    validate_quantity_unit(&context, &filter.lhs, dimension, &filter.rhs, ctx.errors);
+    let Some(source) = ctx.object_sources.get(pair.object.as_str()) else {
+        return;
+    };
+    match filter.lhs {
+        Expr::PairDeltaR => {
+            require_attr_branch_type(
+                source,
+                "eta",
+                BranchType::VecF32,
+                "f32 vector branch for pair delta-R",
+                &context,
+                ctx,
+            );
+            require_attr_branch_type(
+                source,
+                "phi",
+                BranchType::VecF32,
+                "f32 vector branch for pair delta-R",
+                &context,
+                ctx,
+            );
+        }
+        Expr::PairLeadingPt | Expr::PairSubleadingPt => {
+            require_attr_branch_type(
+                source,
+                "pt",
+                BranchType::VecF32,
+                "f32 vector branch for pair pT filter",
+                &context,
+                ctx,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn validate_candidate_filter(
+    index: usize,
+    filter: &Cut,
+    parent_context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    let context = format!("{parent_context} filter {}", index + 1);
+    let Some(dimension) =
+        validate_filter_expr(&filter.lhs, FilterContext::Candidate, &context, ctx)
+    else {
+        return;
+    };
+    validate_quantity_unit(&context, &filter.lhs, dimension, &filter.rhs, ctx.errors);
 }
 
 fn validate_candidate_item(item: &str, context: &str, ctx: &mut ValidationContext<'_>) {
@@ -647,12 +797,48 @@ fn validate_candidate_item(item: &str, context: &str, ctx: &mut ValidationContex
 fn validate_expr(expr: &Expr, context: &str, ctx: &mut ValidationContext<'_>) -> Option<ExprType> {
     match expr {
         Expr::Attr { object, attr } => validate_attr(object, attr, context, ctx),
+        Expr::Literal(_) => Some(ExprType::Numeric(Dimension::Dimensionless)),
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs_type = validate_expr(lhs, context, ctx);
+            let rhs_type = validate_expr(rhs, context, ctx);
+            match (lhs_type, rhs_type) {
+                (Some(ExprType::Numeric(lhs)), Some(ExprType::Numeric(rhs))) => {
+                    validate_binary_dimension(*op, lhs, rhs, context, expr, ctx)
+                }
+                (Some(_), Some(_)) => {
+                    ctx.errors.push(SpecError::InvalidExpression {
+                        context: context.to_string(),
+                        detail: format!("arithmetic expression `{expr}` requires numeric operands"),
+                    });
+                    None
+                }
+                _ => None,
+            }
+        }
         Expr::Abs(inner) => match validate_expr(inner, context, ctx) {
             Some(ExprType::Numeric(dimension)) => Some(ExprType::Numeric(dimension)),
             Some(ExprType::Count) => {
                 ctx.errors.push(SpecError::InvalidExpression {
                     context: context.to_string(),
                     detail: "abs(...) requires a numeric attribute".to_string(),
+                });
+                None
+            }
+            Some(ExprType::Bool) => {
+                ctx.errors.push(SpecError::InvalidExpression {
+                    context: context.to_string(),
+                    detail: "abs(...) requires a numeric expression".to_string(),
+                });
+                None
+            }
+            None => None,
+        },
+        Expr::Sqrt(inner) => match validate_expr(inner, context, ctx) {
+            Some(ExprType::Numeric(dimension)) => Some(ExprType::Numeric(dimension)),
+            Some(_) => {
+                ctx.errors.push(SpecError::InvalidExpression {
+                    context: context.to_string(),
+                    detail: "sqrt(...) requires a numeric expression".to_string(),
                 });
                 None
             }
@@ -678,7 +864,133 @@ fn validate_expr(expr: &Expr, context: &str, ctx: &mut ValidationContext<'_>) ->
             ctx.required.require_counter(source);
             Some(ExprType::Count)
         }
+        Expr::CountWhere { object, predicate } => {
+            let Some(source) = ctx.object_sources.get(object.as_str()) else {
+                ctx.errors.push(SpecError::UndefinedObject {
+                    context: context.to_string(),
+                    object: object.clone(),
+                });
+                return None;
+            };
+            ctx.required.require_counter(source);
+            validate_collection_predicate(object, predicate, context, ctx);
+            Some(ExprType::Count)
+        }
+        Expr::SumAttr { object, attr } => validate_attr(object, attr, context, ctx)
+            .map(|_| ExprType::Numeric(Dimension::Dimensionless)),
+        Expr::All { object, predicate } | Expr::Any { object, predicate } => {
+            let Some(source) = ctx.object_sources.get(object.as_str()) else {
+                ctx.errors.push(SpecError::UndefinedObject {
+                    context: context.to_string(),
+                    object: object.clone(),
+                });
+                return None;
+            };
+            ctx.required.require_counter(source);
+            validate_collection_predicate(object, predicate, context, ctx);
+            Some(ExprType::Bool)
+        }
         Expr::LeadingAttr { object, attr } => validate_attr(object, attr, context, ctx),
+        Expr::PairDeltaR
+        | Expr::PairLeadingPt
+        | Expr::PairSubleadingPt
+        | Expr::CandidateMinDeltaR
+        | Expr::CandidateLeadingPt
+        | Expr::CandidateSubleadingPt => {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.to_string(),
+                detail: format!("filter-only expression `{expr}` is not valid here"),
+            });
+            None
+        }
+    }
+}
+
+fn validate_binary_dimension(
+    op: ArithOp,
+    lhs: Dimension,
+    rhs: Dimension,
+    context: &str,
+    expr: &Expr,
+    ctx: &mut ValidationContext<'_>,
+) -> Option<ExprType> {
+    match op {
+        ArithOp::Add | ArithOp::Sub if lhs == rhs => Some(ExprType::Numeric(lhs)),
+        ArithOp::Add | ArithOp::Sub => {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.to_string(),
+                detail: format!("`{expr}` cannot add or subtract incompatible dimensions"),
+            });
+            None
+        }
+        ArithOp::Mul if lhs == Dimension::Dimensionless => Some(ExprType::Numeric(rhs)),
+        ArithOp::Mul if rhs == Dimension::Dimensionless => Some(ExprType::Numeric(lhs)),
+        ArithOp::Mul => Some(ExprType::Numeric(Dimension::Dimensionless)),
+        ArithOp::Div if rhs == Dimension::Dimensionless => Some(ExprType::Numeric(lhs)),
+        ArithOp::Div => Some(ExprType::Numeric(Dimension::Dimensionless)),
+        ArithOp::Pow => {
+            if rhs != Dimension::Dimensionless {
+                ctx.errors.push(SpecError::InvalidExpression {
+                    context: context.to_string(),
+                    detail: format!("`{expr}` exponent must be dimensionless"),
+                });
+                None
+            } else {
+                Some(ExprType::Numeric(lhs))
+            }
+        }
+    }
+}
+
+fn validate_collection_predicate(
+    object: &str,
+    predicate: &Cut,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    let predicate_context = format!("{context} predicate");
+    match validate_expr(&predicate.lhs, &predicate_context, ctx) {
+        Some(ExprType::Numeric(dimension)) => validate_quantity_unit(
+            &predicate_context,
+            &predicate.lhs,
+            dimension,
+            &predicate.rhs,
+            ctx.errors,
+        ),
+        Some(_) => ctx.errors.push(SpecError::InvalidExpression {
+            context: predicate_context,
+            detail: format!("predicate for `{object}` must compare a numeric expression"),
+        }),
+        None => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterContext {
+    Pair,
+    Candidate,
+}
+
+fn validate_filter_expr(
+    expr: &Expr,
+    filter_context: FilterContext,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) -> Option<Dimension> {
+    match (filter_context, expr) {
+        (FilterContext::Pair, Expr::PairDeltaR)
+        | (FilterContext::Candidate, Expr::CandidateMinDeltaR) => Some(Dimension::Dimensionless),
+        (FilterContext::Pair, Expr::PairLeadingPt | Expr::PairSubleadingPt)
+        | (FilterContext::Candidate, Expr::CandidateLeadingPt | Expr::CandidateSubleadingPt) => {
+            Some(Dimension::Momentum)
+        }
+        _ => {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.to_string(),
+                detail: format!("unsupported filter expression `{expr}`"),
+            });
+            None
+        }
     }
 }
 
@@ -1119,6 +1431,7 @@ fn validate_model_provider(model: &ModelDef, context: &str, errors: &mut Vec<Spe
 enum ExprType {
     Numeric(Dimension),
     Count,
+    Bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1406,7 +1719,38 @@ fn parse_cut(input: &str, object_name: &str) -> Result<Cut, ParseError> {
     })
 }
 
+fn parse_pair_filter(input: &str) -> Result<Cut, ParseError> {
+    let (lhs, op, rhs) = split_comparison(input)?;
+    Ok(Cut {
+        lhs: parse_expr(lhs, None)?,
+        op,
+        rhs: parse_quantity(rhs)?,
+    })
+}
+
+fn parse_candidate_filter(input: &str) -> Result<Cut, ParseError> {
+    let mut filter = parse_pair_filter(input)?;
+    filter.lhs = match filter.lhs {
+        Expr::PairDeltaR => Expr::CandidateMinDeltaR,
+        Expr::PairLeadingPt => Expr::CandidateLeadingPt,
+        Expr::PairSubleadingPt => Expr::CandidateSubleadingPt,
+        other => other,
+    };
+    Ok(filter)
+}
+
 fn parse_requirement(input: &str) -> Result<Requirement, ParseError> {
+    let trimmed = input.trim();
+    if starts_with_call(trimmed, "all") || starts_with_call(trimmed, "any") {
+        return Ok(Requirement {
+            lhs: parse_expr(trimmed, None)?,
+            op: CmpOp::Eq,
+            rhs: Quantity {
+                value: 1.0,
+                unit: Unit::Dimensionless,
+            },
+        });
+    }
     let (lhs, op, rhs) = split_comparison(input)?;
     let rhs = parse_quantity(rhs)?;
     Ok(Requirement {
@@ -1417,22 +1761,34 @@ fn parse_requirement(input: &str) -> Result<Requirement, ParseError> {
 }
 
 fn split_comparison(input: &str) -> Result<(&str, CmpOp, &str), ParseError> {
-    for (token, op) in [
-        (">=", CmpOp::Ge),
-        ("<=", CmpOp::Le),
-        ("==", CmpOp::Eq),
-        ("!=", CmpOp::Ne),
-        (">", CmpOp::Gt),
-        ("<", CmpOp::Lt),
-    ] {
-        if let Some((lhs, rhs)) = input.split_once(token) {
-            let lhs = lhs.trim();
-            let rhs = rhs.trim();
-            if lhs.is_empty() || rhs.is_empty() {
-                break;
+    let bytes = input.as_bytes();
+    let mut depth = 0_i32;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 => {
+                for (token, op) in [
+                    (">=", CmpOp::Ge),
+                    ("<=", CmpOp::Le),
+                    ("==", CmpOp::Eq),
+                    ("!=", CmpOp::Ne),
+                    (">", CmpOp::Gt),
+                    ("<", CmpOp::Lt),
+                ] {
+                    if input[index..].starts_with(token) {
+                        let lhs = input[..index].trim();
+                        let rhs = input[index + token.len()..].trim();
+                        if !lhs.is_empty() && !rhs.is_empty() {
+                            return Ok((lhs, op, rhs));
+                        }
+                    }
+                }
             }
-            return Ok((lhs, op, rhs));
+            _ => {}
         }
+        index += 1;
     }
 
     Err(ParseError::InvalidSpec(format!(
@@ -1441,9 +1797,27 @@ fn split_comparison(input: &str) -> Result<(&str, CmpOp, &str), ParseError> {
 }
 
 fn parse_expr(input: &str, default_object: Option<&str>) -> Result<Expr, ParseError> {
-    let input = input.trim();
+    parse_expr_prec(input, default_object, 0)
+}
+
+fn parse_expr_prec(
+    input: &str,
+    default_object: Option<&str>,
+    min_prec: u8,
+) -> Result<Expr, ParseError> {
+    let input = strip_wrapping_parens(input.trim());
     if input.is_empty() {
         return Err(ParseError::InvalidSpec("empty expression".to_string()));
+    }
+
+    if let Some((index, op, precedence)) = find_binary_operator(input, min_prec) {
+        let lhs = parse_expr_prec(&input[..index], default_object, precedence + 1)?;
+        let rhs = parse_expr_prec(&input[index + 1..], default_object, precedence)?;
+        return Ok(Expr::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        });
     }
 
     if let Some(inner) = input
@@ -1454,12 +1828,78 @@ fn parse_expr(input: &str, default_object: Option<&str>) -> Result<Expr, ParseEr
     }
 
     if let Some(inner) = input
+        .strip_prefix("sqrt(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return Ok(Expr::Sqrt(Box::new(parse_expr(inner, default_object)?)));
+    }
+
+    if let Some(inner) = input
         .strip_prefix("count(")
         .and_then(|value| value.strip_suffix(')'))
     {
+        if let Some((object, predicate)) = split_top_level_comma(inner) {
+            let object = object.trim();
+            validate_identifier(object, input)?;
+            return Ok(Expr::CountWhere {
+                object: object.to_string(),
+                predicate: Box::new(parse_cut(predicate, object)?),
+            });
+        }
         let object = inner.trim();
         validate_identifier(object, input)?;
         return Ok(Expr::Count(object.to_string()));
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("sum(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let Some((object, attr)) = inner.trim().split_once('.') else {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse sum expression `{input}`; expected sum(object.attr)"
+            )));
+        };
+        validate_identifier(object.trim(), input)?;
+        validate_identifier(attr.trim(), input)?;
+        return Ok(Expr::SumAttr {
+            object: object.trim().to_string(),
+            attr: attr.trim().to_string(),
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("all(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let Some((object, predicate)) = split_top_level_comma(inner) else {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse all predicate `{input}`"
+            )));
+        };
+        let object = object.trim();
+        validate_identifier(object, input)?;
+        return Ok(Expr::All {
+            object: object.to_string(),
+            predicate: Box::new(parse_cut(predicate, object)?),
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("any(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let Some((object, predicate)) = split_top_level_comma(inner) else {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse any predicate `{input}`"
+            )));
+        };
+        let object = object.trim();
+        validate_identifier(object, input)?;
+        return Ok(Expr::Any {
+            object: object.to_string(),
+            predicate: Box::new(parse_cut(predicate, object)?),
+        });
     }
 
     if let Some(rest) = input.strip_prefix("leading(") {
@@ -1474,6 +1914,20 @@ fn parse_expr(input: &str, default_object: Option<&str>) -> Result<Expr, ParseEr
             object: object.trim().to_string(),
             attr: attr.trim().to_string(),
         });
+    }
+
+    match input {
+        "dR" | "dr" | "delta_r" | "deltaR" => return Ok(Expr::PairDeltaR),
+        "min_dR" | "min_dr" | "min_delta_r" | "min_deltaR" => return Ok(Expr::CandidateMinDeltaR),
+        "leading_pt" => return Ok(Expr::PairLeadingPt),
+        "subleading_pt" => return Ok(Expr::PairSubleadingPt),
+        "candidate_leading_pt" => return Ok(Expr::CandidateLeadingPt),
+        "candidate_subleading_pt" => return Ok(Expr::CandidateSubleadingPt),
+        _ => {}
+    }
+
+    if let Ok(value) = input.parse::<f64>() {
+        return Ok(Expr::Literal(value));
     }
 
     if let Some((object, attr)) = input.split_once('.') {
@@ -1496,6 +1950,99 @@ fn parse_expr(input: &str, default_object: Option<&str>) -> Result<Expr, ParseEr
     Err(ParseError::InvalidSpec(format!(
         "expression `{input}` needs an explicit object"
     )))
+}
+
+fn starts_with_call(input: &str, function: &str) -> bool {
+    input
+        .strip_prefix(function)
+        .is_some_and(|rest| rest.starts_with('(') && rest.ends_with(')'))
+}
+
+fn strip_wrapping_parens(mut input: &str) -> &str {
+    loop {
+        let trimmed = input.trim();
+        if !(trimmed.starts_with('(') && trimmed.ends_with(')')) {
+            return trimmed;
+        }
+        let mut depth = 0_i32;
+        let mut wraps = true;
+        for (index, ch) in trimmed.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 && index != trimmed.len() - 1 {
+                        wraps = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if wraps {
+            input = &trimmed[1..trimmed.len() - 1];
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+fn split_top_level_comma(input: &str) -> Option<(&str, &str)> {
+    let mut depth = 0_i32;
+    for (index, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => return Some((&input[..index], &input[index + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_binary_operator(input: &str, min_prec: u8) -> Option<(usize, ArithOp, u8)> {
+    for precedence in min_prec..=3 {
+        let mut depth = 0_i32;
+        for (index, ch) in input.char_indices().rev() {
+            match ch {
+                ')' => depth += 1,
+                '(' => depth -= 1,
+                '+' | '-' | '*' | '/' | '^' if depth == 0 => {
+                    let Some((op, op_precedence)) = arith_operator(ch) else {
+                        continue;
+                    };
+                    if op_precedence != precedence || is_unary_minus(input, index, ch) {
+                        continue;
+                    }
+                    return Some((index, op, op_precedence));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn arith_operator(ch: char) -> Option<(ArithOp, u8)> {
+    match ch {
+        '+' => Some((ArithOp::Add, 1)),
+        '-' => Some((ArithOp::Sub, 1)),
+        '*' => Some((ArithOp::Mul, 2)),
+        '/' => Some((ArithOp::Div, 2)),
+        '^' => Some((ArithOp::Pow, 3)),
+        _ => None,
+    }
+}
+
+fn is_unary_minus(input: &str, index: usize, ch: char) -> bool {
+    if ch != '-' {
+        return false;
+    }
+    input[..index]
+        .trim_end()
+        .chars()
+        .next_back()
+        .is_none_or(|previous| matches!(previous, '(' | '+' | '-' | '*' | '/' | '^'))
 }
 
 fn parse_quantity(input: &str) -> Result<Quantity, ParseError> {
@@ -1581,6 +2128,8 @@ struct RawDerivedObject {
     #[serde(default)]
     constraints: Vec<String>,
     #[serde(default)]
+    filters: Vec<String>,
+    #[serde(default)]
     selection: Option<String>,
     #[serde(default)]
     target: Option<String>,
@@ -1641,6 +2190,11 @@ fn derived_object_def_from_raw(
                 .iter()
                 .map(|constraint| pair_constraint_from_raw(&name, constraint))
                 .collect::<Result<Vec<_>, _>>()?;
+            let filters = raw
+                .filters
+                .iter()
+                .map(|filter| parse_pair_filter(filter))
+                .collect::<Result<Vec<_>, _>>()?;
             let selection = pair_selection_from_raw(
                 &name,
                 raw.selection.as_deref().unwrap_or("leading_pt"),
@@ -1652,6 +2206,7 @@ fn derived_object_def_from_raw(
             DerivedSource::Pair(ObjectPairDef {
                 object,
                 constraints,
+                filters,
                 selection,
                 exclude: raw.exclude,
             })
@@ -1670,7 +2225,15 @@ fn derived_object_def_from_raw(
             for item in &raw.items {
                 validate_identifier(item, &format!("derived candidate `{name}` item"))?;
             }
-            DerivedSource::Candidate(ObjectCandidateDef { items: raw.items })
+            let filters = raw
+                .filters
+                .iter()
+                .map(|filter| parse_candidate_filter(filter))
+                .collect::<Result<Vec<_>, _>>()?;
+            DerivedSource::Candidate(ObjectCandidateDef {
+                items: raw.items,
+                filters,
+            })
         }
         kind => {
             return Err(ParseError::InvalidSpec(format!(
@@ -1937,9 +2500,74 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Attr { object, attr } => write!(f, "{object}.{attr}"),
+            Self::Literal(value) => write!(f, "{value}"),
+            Self::Binary { op, lhs, rhs } => write!(f, "({lhs} {} {rhs})", op.as_str()),
             Self::Abs(inner) => write!(f, "abs({inner})"),
+            Self::Sqrt(inner) => write!(f, "sqrt({inner})"),
             Self::Count(object) => write!(f, "count({object})"),
+            Self::CountWhere { object, predicate } => write!(
+                f,
+                "count({object}, {} {} {})",
+                predicate.lhs,
+                predicate.op.as_str(),
+                predicate.rhs
+            ),
+            Self::SumAttr { object, attr } => write!(f, "sum({object}.{attr})"),
+            Self::All { object, predicate } => write!(
+                f,
+                "all({object}, {} {} {})",
+                predicate.lhs,
+                predicate.op.as_str(),
+                predicate.rhs
+            ),
+            Self::Any { object, predicate } => write!(
+                f,
+                "any({object}, {} {} {})",
+                predicate.lhs,
+                predicate.op.as_str(),
+                predicate.rhs
+            ),
             Self::LeadingAttr { object, attr } => write!(f, "leading({object}).{attr}"),
+            Self::PairDeltaR => f.write_str("dR"),
+            Self::PairLeadingPt => f.write_str("leading_pt"),
+            Self::PairSubleadingPt => f.write_str("subleading_pt"),
+            Self::CandidateMinDeltaR => f.write_str("min_dR"),
+            Self::CandidateLeadingPt => f.write_str("leading_pt"),
+            Self::CandidateSubleadingPt => f.write_str("subleading_pt"),
+        }
+    }
+}
+
+impl ArithOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "+",
+            Self::Sub => "-",
+            Self::Mul => "*",
+            Self::Div => "/",
+            Self::Pow => "^",
+        }
+    }
+}
+
+impl CmpOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Gt => ">",
+            Self::Ge => ">=",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Eq => "==",
+            Self::Ne => "!=",
+        }
+    }
+}
+
+impl fmt::Display for Quantity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.unit {
+            Unit::GeV => write!(f, "{} GeV", self.value),
+            Unit::Dimensionless => write!(f, "{}", self.value),
         }
     }
 }
@@ -2047,6 +2675,7 @@ mod tests {
             DerivedSource::Pair(ObjectPairDef {
                 object: "good_muon".to_string(),
                 constraints: vec![PairConstraint::OppositeCharge],
+                filters: vec![],
                 selection: PairSelection::LeadingPt,
                 exclude: vec![],
             })
@@ -2107,6 +2736,7 @@ mod tests {
             h.source,
             DerivedSource::Candidate(ObjectCandidateDef {
                 items: vec!["z1".to_string(), "z2".to_string()],
+                filters: vec![],
             })
         );
     }
