@@ -1,8 +1,8 @@
 use nano_analysis::{fill, Ev, Hist1D, Systematic};
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
 use nano_producers::{
-    select_muon_signal_region_with_weight, JetCorrectionInput, JmeJetCorrections, MuonSkimRow,
-    WeightedMuonSkimRow,
+    select_muon_signal_region_with_varied_jets, select_muon_signal_region_with_weight,
+    JetCorrectionInput, JmeJetCorrections, MuonSkimRow, VariedJetSelection, WeightedMuonSkimRow,
 };
 use std::path::Path;
 
@@ -14,12 +14,15 @@ fn real_jme_corrections() -> JmeJetCorrections {
 }
 
 fn event_with_jets(jet_pts: Vec<f32>, jet_etas: Vec<f32>) -> Event {
+    let jet_count = jet_pts.len();
     Event::from_columns(
         BranchSchema::new([
             BranchSpec::new("Muon_pt", BranchType::VecF32),
             BranchSpec::new("Muon_eta", BranchType::VecF32),
             BranchSpec::new("Jet_pt", BranchType::VecF32),
             BranchSpec::new("Jet_eta", BranchType::VecF32),
+            BranchSpec::new("Jet_phi", BranchType::VecF32),
+            BranchSpec::new("Jet_mass", BranchType::VecF32),
         ])
         .unwrap(),
         [
@@ -27,6 +30,11 @@ fn event_with_jets(jet_pts: Vec<f32>, jet_etas: Vec<f32>) -> Event {
             ("Muon_eta", BranchColumn::VecF32(vec![vec![0.2]])),
             ("Jet_pt", BranchColumn::VecF32(vec![jet_pts])),
             ("Jet_eta", BranchColumn::VecF32(vec![jet_etas])),
+            ("Jet_phi", BranchColumn::VecF32(vec![vec![0.1; jet_count]])),
+            (
+                "Jet_mass",
+                BranchColumn::VecF32(vec![vec![20.0; jet_count]]),
+            ),
         ],
         0,
     )
@@ -41,44 +49,40 @@ fn assert_close(actual: f64, expected: f64) {
 }
 
 #[test]
-fn real_jme_weight_differs_across_all_shape_systematics() {
+fn real_jme_variation_changes_jet_four_vector_across_systematics() {
     let corrections = real_jme_corrections();
     let event = event_with_jets(vec![100.0], vec![0.5]);
 
     let nominal = corrections
-        .event_weight(&event, Systematic::Nominal)
-        .unwrap()
-        .value();
-    let jes_up = corrections
-        .event_weight(&event, Systematic::JesUp)
-        .unwrap()
-        .value();
+        .varied_jets(&event, Systematic::Nominal)
+        .unwrap();
+    let jes_up = corrections.varied_jets(&event, Systematic::JesUp).unwrap();
     let jes_down = corrections
-        .event_weight(&event, Systematic::JesDown)
-        .unwrap()
-        .value();
-    let jer_up = corrections
-        .event_weight(&event, Systematic::JerUp)
-        .unwrap()
-        .value();
+        .varied_jets(&event, Systematic::JesDown)
+        .unwrap();
+    let jer_up = corrections.varied_jets(&event, Systematic::JerUp).unwrap();
     let jer_down = corrections
-        .event_weight(&event, Systematic::JerDown)
-        .unwrap()
-        .value();
+        .varied_jets(&event, Systematic::JerDown)
+        .unwrap();
 
-    assert_close(nominal, 1.0);
-    assert_close(jes_up, 1.0108);
-    assert_close(jes_down, 0.9892);
-    assert_close(jer_up, 1.0993);
-    assert_close(jer_down, 0.9096697898662786);
+    assert_close(nominal[0].pt, 100.0);
+    assert_close(nominal[0].mass, 20.0);
+    assert_close(jes_up[0].pt, 101.08);
+    assert_close(jes_up[0].mass, 20.216);
+    assert_close(jes_down[0].pt, 98.92);
+    assert_close(jes_down[0].mass, 19.784);
+    assert_close(jer_up[0].pt, 109.93);
+    assert_close(jer_up[0].mass, 21.986);
+    assert_close(jer_down[0].pt, 90.96697898662786);
+    assert_close(jer_down[0].mass, 18.193_395_797_325_57);
 
-    for varied in [jes_up, jes_down, jer_up, jer_down] {
-        assert_ne!(nominal, varied);
+    for varied in [jes_up[0].pt, jes_down[0].pt, jer_up[0].pt, jer_down[0].pt] {
+        assert_ne!(nominal[0].pt, varied);
     }
 }
 
 #[test]
-fn deterministic_expected_weight_for_fixed_real_payload_jet() {
+fn deterministic_expected_scales_for_fixed_real_payload_jet() {
     let corrections = real_jme_corrections();
     let jet = JetCorrectionInput {
         pt: 100.0,
@@ -88,17 +92,72 @@ fn deterministic_expected_weight_for_fixed_real_payload_jet() {
     assert_close(corrections.jes_total_uncertainty(jet).unwrap(), 0.0108);
     assert_close(corrections.jer_scale_factor(jet).unwrap(), 1.0993);
     assert_close(
-        corrections.jet_factor(Systematic::JesUp, jet).unwrap(),
+        corrections.jet_scale(Systematic::JesUp, jet).unwrap(),
         1.0108,
     );
     assert_close(
-        corrections.jet_factor(Systematic::JerDown, jet).unwrap(),
+        corrections.jet_scale(Systematic::JerDown, jet).unwrap(),
         0.9096697898662786,
     );
 }
 
 #[test]
-fn selected_event_weights_and_fills_histograms_for_nominal_and_variations() {
+fn jme_weight_api_is_only_normalization_not_shape_bookkeeping() {
+    let corrections = real_jme_corrections();
+    let event = event_with_jets(vec![100.0], vec![0.5]);
+
+    for systematic in Systematic::all() {
+        assert_close(
+            corrections
+                .event_weight(&event, systematic)
+                .unwrap()
+                .value(),
+            1.0,
+        );
+    }
+}
+
+#[test]
+fn varied_selection_recomputes_jet_threshold_under_shape_variation() {
+    let corrections = real_jme_corrections();
+    let event = event_with_jets(vec![29.75], vec![0.5]);
+    let jet_selection = VariedJetSelection::new(30.0, 2.4);
+
+    let nominal = select_muon_signal_region_with_varied_jets(
+        Ev::new(&event),
+        &corrections,
+        Systematic::Nominal,
+        jet_selection,
+    )
+    .unwrap()
+    .unwrap();
+    let jes_up = select_muon_signal_region_with_varied_jets(
+        Ev::new(&event),
+        &corrections,
+        Systematic::JesUp,
+        jet_selection,
+    )
+    .unwrap()
+    .unwrap();
+    let jes_down = select_muon_signal_region_with_varied_jets(
+        Ev::new(&event),
+        &corrections,
+        Systematic::JesDown,
+        jet_selection,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(nominal.n_selected_jets(), 0);
+    assert_eq!(jes_up.n_selected_jets(), 1);
+    assert_eq!(jes_down.n_selected_jets(), 0);
+    assert_close(jes_up.lead_selected_jet_pt().unwrap(), 30.359875);
+    assert_close(jes_down.jets()[0].pt, 29.140125);
+    assert_close(jes_up.normalization_weight().value(), 1.0);
+}
+
+#[test]
+fn selected_event_normalization_weight_fills_histograms_for_all_systematics() {
     let corrections = real_jme_corrections();
     let event = event_with_jets(vec![100.0], vec![0.5]);
 
