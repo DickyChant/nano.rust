@@ -576,6 +576,7 @@ fn validate_flat(
     let mut required = RequiredBranches::default();
     let model_outputs =
         validate_models(spec, catalogue, &object_sources, &mut required, &mut errors);
+    validate_unique_output_names(&spec.outputs, &mut errors);
 
     {
         let mut ctx = ValidationContext {
@@ -618,6 +619,18 @@ fn validate_flat(
     }
 
     Ok((required, model_outputs))
+}
+
+fn validate_unique_output_names(outputs: &[OutputDef], errors: &mut Vec<SpecError>) {
+    let mut seen = BTreeSet::new();
+    for output in outputs {
+        if !seen.insert(output.name.as_str()) {
+            errors.push(SpecError::InvalidExpression {
+                context: format!("output `{}`", output.name),
+                detail: format!("duplicate output name `{}`", output.name),
+            });
+        }
+    }
 }
 
 fn lower_union(spec: &AnalysisSpec, catalogue: &Catalogue) -> Result<core::CoreIr, Vec<SpecError>> {

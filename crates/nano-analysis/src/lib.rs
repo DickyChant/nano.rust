@@ -192,6 +192,41 @@ impl<'e, M: ModelTag> Ev<'e, Scored<M>> {
     /// on `Ev<Scored<M>>`, so a `Baseline` event has no such method. This is the
     /// score-before-use guarantee — the dual of weight-before-fill.
     ///
+    /// ```
+    /// use nano_analysis::{Ev, Features, ModelTag};
+    /// use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
+    /// use nano_inference::{MockPredictor, Tensor, TensorData};
+    ///
+    /// struct MuonTagger;
+    /// impl ModelTag for MuonTagger {
+    ///     const NAME: &'static str = "muon_tagger";
+    ///     const BATCH: &'static str = "Muon";
+    ///     const OUTPUT: &'static str = "topscore";
+    /// }
+    ///
+    /// let schema = BranchSchema::new([
+    ///     BranchSpec::new("Muon_pt", BranchType::VecF32),
+    /// ])
+    /// .unwrap();
+    /// let event = Event::from_columns(
+    ///     schema,
+    ///     [("Muon_pt", BranchColumn::VecF32(vec![vec![45.0]]))],
+    ///     0,
+    /// )
+    /// .unwrap();
+    /// let baseline = Ev::new(&event).preselect(|_| true).unwrap();
+    /// let features = Features::<MuonTagger>::from_tensors(vec![Tensor {
+    ///     name: "features".to_string(),
+    ///     shape: vec![1, 1],
+    ///     data: TensorData::F32(vec![45.0]),
+    /// }]);
+    /// let scored = baseline
+    ///     .infer::<MuonTagger>(&MockPredictor::new(MuonTagger::NAME), features)
+    ///     .unwrap();
+    /// let muons = scored.event().collection("Muon").unwrap();
+    /// let _ = scored.score(muons.get(0).unwrap()).unwrap();
+    /// ```
+    ///
     /// ```compile_fail
     /// use nano_analysis::{Ev, ModelTag};
     /// use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
@@ -391,6 +426,28 @@ impl Hist1D {
 ///
 /// The type signature is the precondition: callers cannot pass a raw,
 /// baseline, selected-but-unweighted, variation-unaware, or differently-regioned event.
+///
+/// ```
+/// use nano_analysis::{fill, Ev, EventWeight, Hist1D, SignalRegion};
+/// use nano_core::{BranchSchema, BranchSpec, Event};
+///
+/// let schema = BranchSchema::new(Vec::<BranchSpec>::new()).unwrap();
+/// let event = Event::from_columns(
+///     schema,
+///     Vec::<(String, nano_core::BranchColumn)>::new(),
+///     0,
+/// )
+/// .unwrap();
+/// let weighted = Ev::new(&event)
+///     .preselect(|_| true)
+///     .unwrap()
+///     .select::<SignalRegion>(|_| true)
+///     .unwrap()
+///     .weight(EventWeight::nominal());
+/// let mut hist = Hist1D::new(1, 0.0, 1.0);
+/// fill::<SignalRegion, nano_analysis::Nominal>(&mut hist, &weighted, 0.5);
+/// assert_eq!(hist.sumw(), 1.0);
+/// ```
 ///
 /// ```compile_fail
 /// use nano_analysis::{fill, Ev, Hist1D, SignalRegion};
@@ -605,6 +662,24 @@ impl_systematic_variation!(JerDown, JerDown, "jer_down");
 /// Each variation is a required trait method. Adding a variation to this closed
 /// set means adding a method here, which makes every incomplete consumer fail to
 /// compile until it handles the new arm.
+///
+/// ```
+/// use nano_analysis::{Systematic, SystematicVisitor};
+///
+/// struct Complete;
+///
+/// impl SystematicVisitor for Complete {
+///     type Output = &'static str;
+///
+///     fn nominal(self) -> Self::Output { "nominal" }
+///     fn jes_up(self) -> Self::Output { "jes_up" }
+///     fn jes_down(self) -> Self::Output { "jes_down" }
+///     fn jer_up(self) -> Self::Output { "jer_up" }
+///     fn jer_down(self) -> Self::Output { "jer_down" }
+/// }
+///
+/// assert_eq!(Systematic::JerDown.visit(Complete), "jer_down");
+/// ```
 ///
 /// ```compile_fail
 /// use nano_analysis::SystematicVisitor;
