@@ -44,24 +44,49 @@ verified IR with pluggable back-ends.
 
 ### 1. Per-event semantic IR — what the kernel does to one event
 
-`ResolvedPlan` (objects, cuts, regions, outputs, models). Back-ends:
+The per-event path is itself a small multi-stage compiler:
+
+```
+Surface spec (TOML/YAML)  →  Core IR  →  KIR (Kernel IR)  →  { interpret | codegen }
+   AnalysisSpec              typed       single executable
+   (validate)                Effect/      semantics
+                             Type/        (both back-ends
+                             primitive    derive from KIR)
+                             registry
+```
+
+`validate(spec, catalogue)` lowers the surface spec into a typed **Core IR**
+(`nano-spec::core`: an `ExprNode` arena with a `Type`/`Effect` lattice and a
+`PrimitiveSpec` registry — new physics functions are *registered*, not
+hand-branched) and derives `read_branches` from the Core IR's `ReadsBranch`
+effects. Core IR lowers to **KIR** (`nano-spec::kir`: a typed `KirProgram` of
+`Block`/`Stmt`/`Rvalue`, with a `verify()` pass). KIR is the **single
+executable semantics**: the interpreter *executes* KIR and codegen *emits* from
+KIR, so interpreter/codegen drift is eliminated by construction, not just by
+test. `ResolvedPlan` remains the validated handle the back-ends consume.
 
 | Back-end | What it is | Guarantee from | Status |
 |---|---|---|---|
-| **interpret** | walk the IR per event (`nano-spec::interpret`, `nano run --interpret`) | the spec *validator* | built |
-| **codegen + AOT** | IR → generated Rust (`nano-analysis` typestate) → compiled kernel | the **Rust compiler** | built |
-| **JIT (compile + dlopen)** | IR → Rust → `rustc` at runtime → dynamic loader | the **Rust compiler** | first muon slice, optional |
+| **interpret** | execute the verified KIR per event (`nano-spec::interpret`, `nano run --interpret`) | the spec *validator* | built |
+| **codegen + AOT** | KIR → generated Rust (`nano-analysis` typestate) → compiled kernel | the **Rust compiler** | built |
+| **JIT (compile + dlopen)** | KIR → Rust → `rustc` at runtime → dynamic loader | the **Rust compiler** | first muon slice, optional |
 | ~~Cranelift / LLVM JIT~~ | lower IR to a codegen backend ourselves | nothing reusable — rejected | — |
 
 The compiled kernel is expressed *in the `nano-analysis` typestate* — `Raw →
-Baseline → Scored<M> → Region → Weighted<R> → fill`. The typestate *makes
+Baseline → Scored<M> → Region → Weighted<R, S> → fill`. The typestate *makes
 invalid states unrepresentable* for code written in it (stage order, region
 typing, score-before-use, weight-before-fill, units, exhaustive systematics).
-Generated row-only kernels exercise region gating and, for `[[model]]` specs,
-`Ev::infer`/`score`; generated histogram kernels also emit
-`EventWeight -> Weighted<R> -> fill`, with an exhaustive `Systematic` match for
-the first nominal-only weight slice. `Unit` is currently `GeV`/dimensionless.
-The interpreter trades the compiler guarantee for not needing a toolchain.
+The weighted state carries **both** a region marker `R` and a systematic-axis
+marker `S` (`Weighted<R, S>`): the variation axis is a closed set with a
+`SystematicVisitor`, so adding a variation forces every consumer to handle it
+or fail to compile (a `compile_fail` doctest proves an incomplete visitor is
+rejected). Generated row-only kernels exercise region gating and, for
+`[[model]]` specs, `Ev::infer`/`score`; generated histogram kernels emit
+`EventWeight -> Weighted<R, Nominal> -> fill` and route the weight through an
+emitted `impl SystematicVisitor` (`systematic.visit(...)`). Multi-variation
+histogram fan-out (KIR `ForEach`/`Fill`) and a `Quantity<Dim>` unit lattice are
+in-progress sub-moves; `Unit` is currently `GeV`/dimensionless. The interpreter
+trades the compiler guarantee for not needing a toolchain.
 
 ### 2. Workflow DAG IR — how the kernel runs across files
 
@@ -126,8 +151,8 @@ the execution.
 | Layer | Crate(s) |
 |---|---|
 | Front-end (verifier) | `nano-spec` (parse/validate/derive), `nano-corrections` (typed corrections) |
-| Per-event IR + kernel vocabulary | `nano-spec` (IR), `nano-analysis` (typestate), `nano-inference` (model boundary) |
-| Per-event back-ends | `nano-spec::interpret`; codegen → `nano-producers`-shaped kernels; `nano-jit` (optional runtime compile + dlopen) |
+| Per-event IR + kernel vocabulary | `nano-spec::core` (typed Core IR + primitive registry), `nano-spec::kir` (KIR, single executable semantics), `nano-analysis` (`Weighted<R,S>` typestate), `nano-inference` (model boundary) |
+| Per-event back-ends | `nano-spec::interpret` (executes KIR); codegen (emits from KIR) → `nano-producers`-shaped kernels; `nano-jit` (optional runtime compile + dlopen) |
 | Data plane | `nano-rootio` (owned ROOT I/O), `nano-io` (streaming), `nano-core` (event model) |
 | Workflow IR + back-ends | `nano-workflow` (DAG, local executor, portable graph, task unit), `integrations/` (Dask/Ray) |
 | Action space | `nano-cli` (`validate`/`branches`/`inspect`/`codegen`/`run`), `nano-mcp` (same as agent tools) |
