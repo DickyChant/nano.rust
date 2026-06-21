@@ -43,6 +43,57 @@ Each step maps directly to a df103 stage; the code is written to be *read* — i
 the human-reviewed physics, with the framework providing the typed, remote-on-demand
 I/O underneath.
 
+## The config that steers it
+
+The physics *knobs* live in one TOML — `configs/higgs4l.toml` — not buried in the
+code. A physicist reviews and edits this; the combinatoric kernel just runs it
+(numbers stay bit-identical):
+
+```toml
+luminosity = 11580.0          # pb^-1 (11.6 fb^-1)
+
+[selection.muon]              # per-flavour lepton selection
+min_pt = 5.0
+max_abs_eta = 2.4
+max_pf_rel_iso04_all = 0.40
+max_sip3d = 4.0               # 3-D impact-parameter significance
+max_abs_dxy = 0.5
+max_abs_dz = 1.0
+
+[zcandidates]                 # Z reconstruction windows
+z_reference_mass = 91.2
+z1_mass_min = 40.0
+z1_mass_max = 120.0
+z2_mass_min = 12.0
+z2_mass_max = 120.0
+
+[histogram]
+bins = 36
+range = [70.0, 180.0]
+
+[[sample]]                    # luminosity-weighted samples for the stack
+name = "SMHiggsToZZTo4L"
+role = "signal"
+channels = ["4mu", "4e", "2e2mu"]
+xsec = 0.0065
+nevt = 299973.0
+scale = 1.0
+
+[[sample]]
+name = "ZZTo4mu"
+role = "background"
+channels = ["4mu"]
+xsec = 0.077
+nevt = 1499064.0
+scale = 1.386                 # ZZ k-factor
+# … ZZTo4e / ZZTo2e2mu, and the Run2012 DoubleMu/DoubleElectron data samples …
+```
+
+Run it against any config with `--config`; the default is the file above. The
+electron block, the data samples, and the per-channel mixed-flavour pt cuts are
+in the same file — that's the *entire* physics surface a reviewer needs, separate
+from the implementation.
+
 ## Identical to ROOT — bit for bit
 
 The point of porting *ROOT's* tutorial: we can check against ROOT itself. Running
