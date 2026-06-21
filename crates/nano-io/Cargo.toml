@@ -18,6 +18,10 @@ http = ["nano-rootio/http"]
 # a workspace-level [patch.crates-io] entry.
 plot = ["dep:kuva"]
 plot-png = ["plot", "kuva/png"]
+# Composite umbrellas: enable a combo with one flag instead of
+# `--features "http plot"`. e.g. `cargo run --example higgs4l_opendata --features full`.
+full = ["http", "plot"]
+full-png = ["http", "plot-png"]
 
 [dev-dependencies]
 nano-producers = { workspace = true }

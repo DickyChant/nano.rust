@@ -100,7 +100,7 @@ an analysis that reconstructs the Higgs boson.
 ## Reproduce it
 
 ```console
-$ cargo run -p nano-io --example higgs4l_opendata --features "http plot" -- \
+$ cargo run -p nano-io --example higgs4l_opendata --features full -- \
     "https://eospublic.cern.ch//eos/root-eos/cms_opendata_2012_nanoaod_skimmed/SMHiggsToZZTo4L.root" \
     --insecure --plot higgs.svg
 ```
