@@ -131,8 +131,10 @@ fn interpreted_union_matches_generated_union_on_synthetic_events() {
 #[test]
 fn generated_union_fills_histogram_through_weighted_terminal() {
     assert!(GENERATED_HIGGS4L_ALL.contains(".weight(weight)"));
-    assert!(GENERATED_HIGGS4L_ALL.contains("nano_analysis::fill::<SignalRegion>"));
-    assert!(GENERATED_HIGGS4L_ALL.contains("match systematic"));
+    assert!(GENERATED_HIGGS4L_ALL
+        .contains("nano_analysis::fill::<SignalRegion, nano_analysis::Nominal>"));
+    assert!(GENERATED_HIGGS4L_ALL.contains("impl nano_analysis::SystematicVisitor"));
+    assert!(GENERATED_HIGGS4L_ALL.contains("systematic.visit(GenWeightVisitor)"));
 
     let mut histograms = higgs4l_all::GenHistograms::new();
     let mut selected = 0_usize;

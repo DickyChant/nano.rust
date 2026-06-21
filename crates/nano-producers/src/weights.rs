@@ -7,7 +7,7 @@
 //! trigger weights can still be carried as separate normalization weights.
 
 use nano_analysis::{
-    passes_muon_signal_selection, Ev, EventWeight, Raw, SignalRegion, Systematic, Weighted,
+    passes_muon_signal_selection, Ev, EventWeight, Nominal, Raw, SignalRegion, Systematic, Weighted,
 };
 use nano_core::Event;
 use nano_corrections::{Correction, CorrectionError, CorrectionSet, Value};
@@ -147,7 +147,7 @@ impl<'e> VariedMuonSignalRegion<'e> {
         self.normalization_weight
     }
 
-    pub fn weighted(&self) -> Weighted<'e, SignalRegion> {
+    pub fn weighted(&self) -> Weighted<'e, SignalRegion, Nominal> {
         self.ev.weight(self.normalization_weight)
     }
 }
@@ -416,7 +416,7 @@ pub fn select_muon_signal_region_with_weight<'e>(
     event: Ev<'e, Raw>,
     corrections: &JmeJetCorrections,
     systematic: Systematic,
-) -> Result<Option<Weighted<'e, SignalRegion>>, WeightError> {
+) -> Result<Option<Weighted<'e, SignalRegion, Nominal>>, WeightError> {
     let Some(selected) = event.preselect(|_| true).and_then(|event| {
         event.select::<SignalRegion>(|event| passes_muon_signal_selection(event).unwrap_or(false))
     }) else {

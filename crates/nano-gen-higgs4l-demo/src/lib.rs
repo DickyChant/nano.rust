@@ -17,7 +17,9 @@
 //!     .select::<higgs4l_all::four_mu::SignalRegion>(|_| true)
 //!     .unwrap();
 //! let mut hist = Hist1D::new(1, 0.0, 1.0);
-//! fill::<higgs4l_all::four_mu::SignalRegion>(&mut hist, &selected, 0.5);
+//! fill::<higgs4l_all::four_mu::SignalRegion, nano_analysis::Nominal>(
+//!     &mut hist, &selected, 0.5,
+//! );
 //! ```
 //!
 //! ```compile_fail
@@ -34,7 +36,9 @@
 //!     .unwrap()
 //!     .weight(EventWeight::nominal());
 //! let mut hist = Hist1D::new(1, 0.0, 1.0);
-//! fill::<higgs4l_all::four_mu::SignalRegion>(&mut hist, &weighted_four_e, 0.5);
+//! fill::<higgs4l_all::four_mu::SignalRegion, nano_analysis::Nominal>(
+//!     &mut hist, &weighted_four_e, 0.5,
+//! );
 //! ```
 
 #![allow(

@@ -3,8 +3,8 @@
 //! `nano-core` remains the open, runtime-typed data-access layer. This crate
 //! adds a small typestate layer for analysis structure: raw events must pass
 //! preselection before region selection, region-selected events must be
-//! weighted before histogram filling, and region-specific fill APIs can demand
-//! the exact region token they need.
+//! weighted for a concrete systematic variation before histogram filling, and
+//! region-specific fill APIs can demand the exact region token they need.
 
 use std::marker::PhantomData;
 use std::ops::Mul;
@@ -227,9 +227,18 @@ impl<'e, M: ModelTag> Ev<'e, Scored<M>> {
 
 impl<'e, R: Region> Ev<'e, R> {
     /// Attach an accumulated event weight, producing the token required by
-    /// histogram filling.
-    pub fn weight(self, weight: EventWeight) -> Weighted<'e, R> {
-        Weighted { ev: self, weight }
+    /// nominal histogram filling.
+    pub fn weight(self, weight: EventWeight) -> Weighted<'e, R, Nominal> {
+        self.weight_for::<Nominal>(weight)
+    }
+
+    /// Attach an accumulated event weight for systematic variation `S`.
+    pub fn weight_for<S: SystematicVariation>(self, weight: EventWeight) -> Weighted<'e, R, S> {
+        Weighted {
+            ev: self,
+            weight,
+            _systematic: PhantomData,
+        }
     }
 }
 
@@ -257,21 +266,22 @@ impl EventWeight {
     }
 }
 
-/// Region-selected event after weights have been applied.
-pub struct Weighted<'e, R: Region> {
+/// Region-selected event after weights have been applied for variation `S`.
+pub struct Weighted<'e, R: Region, S: SystematicVariation> {
     ev: Ev<'e, R>,
     weight: EventWeight,
+    _systematic: PhantomData<S>,
 }
 
-impl<'e, R: Region> Clone for Weighted<'e, R> {
+impl<'e, R: Region, S: SystematicVariation> Clone for Weighted<'e, R, S> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'e, R: Region> Copy for Weighted<'e, R> {}
+impl<'e, R: Region, S: SystematicVariation> Copy for Weighted<'e, R, S> {}
 
-impl<'e, R: Region> Weighted<'e, R> {
+impl<'e, R: Region, S: SystematicVariation> Weighted<'e, R, S> {
     /// Region-selected event token carried by this weighted event.
     pub fn ev(&self) -> Ev<'e, R> {
         self.ev
@@ -290,6 +300,16 @@ impl<'e, R: Region> Weighted<'e, R> {
     /// Region name associated with this weighted token.
     pub fn region_name(&self) -> &'static str {
         R::NAME
+    }
+
+    /// Systematic variation associated with this weighted token.
+    pub fn systematic(&self) -> Systematic {
+        S::SYSTEMATIC
+    }
+
+    /// Stable systematic variation name associated with this weighted token.
+    pub fn systematic_name(&self) -> &'static str {
+        S::NAME
     }
 }
 
@@ -367,10 +387,10 @@ impl Hist1D {
     }
 }
 
-/// Fill a histogram with a weighted event from region `R`.
+/// Fill a histogram with a weighted event from region `R` and variation `S`.
 ///
 /// The type signature is the precondition: callers cannot pass a raw,
-/// baseline, selected-but-unweighted, or differently-regioned event.
+/// baseline, selected-but-unweighted, variation-unaware, or differently-regioned event.
 ///
 /// ```compile_fail
 /// use nano_analysis::{fill, Ev, Hist1D, SignalRegion};
@@ -385,7 +405,7 @@ impl Hist1D {
 /// .unwrap();
 /// let raw = Ev::new(&event);
 /// let mut hist = Hist1D::new(1, 0.0, 1.0);
-/// fill::<SignalRegion>(&mut hist, &raw, 0.5);
+/// fill::<SignalRegion, nano_analysis::Nominal>(&mut hist, &raw, 0.5);
 /// ```
 ///
 /// ```compile_fail
@@ -411,9 +431,13 @@ impl Hist1D {
 ///     .unwrap()
 ///     .weight(EventWeight::nominal());
 /// let mut hist = Hist1D::new(1, 0.0, 1.0);
-/// fill::<SignalRegion>(&mut hist, &control, 0.5);
+/// fill::<SignalRegion, nano_analysis::Nominal>(&mut hist, &control, 0.5);
 /// ```
-pub fn fill<R: Region>(hist: &mut Hist1D, event: &Weighted<R>, value: f64) {
+pub fn fill<R: Region, S: SystematicVariation>(
+    hist: &mut Hist1D,
+    event: &Weighted<'_, R, S>,
+    value: f64,
+) {
     hist.fill_weighted(value, event.weight.value());
 }
 
@@ -527,6 +551,99 @@ impl Systematic {
     }
 }
 
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Type-level marker for one member of the closed systematic-variation set.
+pub trait SystematicVariation: sealed::Sealed {
+    /// Dynamic enum value corresponding to this type-level marker.
+    const SYSTEMATIC: Systematic;
+    /// Stable variation name for labels, diagnostics, and generated code.
+    const NAME: &'static str;
+}
+
+/// Nominal systematic-variation marker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Nominal;
+
+/// JES-up systematic-variation marker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JesUp;
+
+/// JES-down systematic-variation marker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JesDown;
+
+/// JER-up systematic-variation marker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JerUp;
+
+/// JER-down systematic-variation marker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JerDown;
+
+macro_rules! impl_systematic_variation {
+    ($marker:ident, $variant:ident, $name:literal) => {
+        impl sealed::Sealed for $marker {}
+
+        impl SystematicVariation for $marker {
+            const SYSTEMATIC: Systematic = Systematic::$variant;
+            const NAME: &'static str = $name;
+        }
+    };
+}
+
+impl_systematic_variation!(Nominal, Nominal, "nominal");
+impl_systematic_variation!(JesUp, JesUp, "jes_up");
+impl_systematic_variation!(JesDown, JesDown, "jes_down");
+impl_systematic_variation!(JerUp, JerUp, "jer_up");
+impl_systematic_variation!(JerDown, JerDown, "jer_down");
+
+/// Exhaustive visitor over the closed [`Systematic`] variation set.
+///
+/// Each variation is a required trait method. Adding a variation to this closed
+/// set means adding a method here, which makes every incomplete consumer fail to
+/// compile until it handles the new arm.
+///
+/// ```compile_fail
+/// use nano_analysis::SystematicVisitor;
+///
+/// struct Incomplete;
+///
+/// impl SystematicVisitor for Incomplete {
+///     type Output = ();
+///
+///     fn nominal(self) -> Self::Output {}
+///     fn jes_up(self) -> Self::Output {}
+///     fn jes_down(self) -> Self::Output {}
+///     fn jer_up(self) -> Self::Output {}
+///     // Missing `jer_down`: incomplete systematic consumers do not compile.
+/// }
+/// ```
+pub trait SystematicVisitor {
+    type Output;
+
+    fn nominal(self) -> Self::Output;
+    fn jes_up(self) -> Self::Output;
+    fn jes_down(self) -> Self::Output;
+    fn jer_up(self) -> Self::Output;
+    fn jer_down(self) -> Self::Output;
+}
+
+impl Systematic {
+    /// Dispatch to a visitor method for this systematic variation.
+    pub fn visit<V: SystematicVisitor>(self, visitor: V) -> V::Output {
+        match self {
+            Self::Nominal => visitor.nominal(),
+            Self::JesUp => visitor.jes_up(),
+            Self::JesDown => visitor.jes_down(),
+            Self::JerUp => visitor.jer_up(),
+            Self::JerDown => visitor.jer_down(),
+        }
+    }
+}
+
 /// Whether the dynamic event passes the existing muon producer's signal cut.
 ///
 /// The cut matches `nano_producers::MuonProducer`: at least one muon with
@@ -549,7 +666,9 @@ pub fn passes_muon_signal_selection(event: &Event) -> nano_core::Result<bool> {
 /// demonstration uses an identity preselection before the signal-region cut.
 /// Dynamic branch-read failures are treated as vetoes because the requested
 /// demonstration returns `Option`.
-pub fn select_muon_signal_region(event: Ev<'_, Raw>) -> Option<Weighted<'_, SignalRegion>> {
+pub fn select_muon_signal_region(
+    event: Ev<'_, Raw>,
+) -> Option<Weighted<'_, SignalRegion, Nominal>> {
     Some(
         event
             .preselect(|_| true)?

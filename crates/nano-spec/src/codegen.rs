@@ -838,7 +838,7 @@ impl<'a> Generator<'a> {
             let value = self.emit_output_expr(&histogram.expr, &field)?;
             writeln!(
                 source,
-                "            nano_analysis::fill::<{region_type}>(&mut histograms.{field}, &weighted, {value});"
+                "            nano_analysis::fill::<{region_type}, nano_analysis::Nominal>(&mut histograms.{field}, &weighted, {value});"
             )
             .unwrap();
         }
@@ -848,7 +848,17 @@ impl<'a> Generator<'a> {
 
     fn emit_weight_match(&self, source: &mut String) -> Result<(), CodegenError> {
         let weight_expr = self.weight_expr();
-        writeln!(source, "            let weight = match systematic {{").unwrap();
+        writeln!(source, "            struct GenWeightVisitor;").unwrap();
+        writeln!(
+            source,
+            "            impl nano_analysis::SystematicVisitor for GenWeightVisitor {{"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "                type Output = nano_analysis::EventWeight;"
+        )
+        .unwrap();
         for systematic in [
             SystematicDef::Nominal,
             SystematicDef::JesUp,
@@ -858,13 +868,18 @@ impl<'a> Generator<'a> {
         ] {
             writeln!(
                 source,
-                "                nano_analysis::Systematic::{} => {},",
-                systematic_variant(systematic),
+                "                fn {}(self) -> Self::Output {{ {} }}",
+                systematic_method(systematic),
                 weight_expr
             )
             .unwrap();
         }
-        writeln!(source, "            }};").unwrap();
+        writeln!(source, "            }}").unwrap();
+        writeln!(
+            source,
+            "            let weight = systematic.visit(GenWeightVisitor);"
+        )
+        .unwrap();
         Ok(())
     }
 
@@ -3116,13 +3131,13 @@ fn rust_string(value: &str) -> String {
     format!("{value:?}")
 }
 
-fn systematic_variant(systematic: SystematicDef) -> &'static str {
+fn systematic_method(systematic: SystematicDef) -> &'static str {
     match systematic {
-        SystematicDef::Nominal => "Nominal",
-        SystematicDef::JesUp => "JesUp",
-        SystematicDef::JesDown => "JesDown",
-        SystematicDef::JerUp => "JerUp",
-        SystematicDef::JerDown => "JerDown",
+        SystematicDef::Nominal => "nominal",
+        SystematicDef::JesUp => "jes_up",
+        SystematicDef::JesDown => "jes_down",
+        SystematicDef::JerUp => "jer_up",
+        SystematicDef::JerDown => "jer_down",
     }
 }
 
