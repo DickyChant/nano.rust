@@ -1084,6 +1084,8 @@ dependencies = [
  "nano-producers",
  "nano-rootio",
  "rayon",
+ "serde",
+ "toml",
 ]
 
 [[package]]

@@ -1,0 +1,107 @@
+luminosity = 11580.0
+
+[selection]
+charge_balance_required = true
+
+[selection.muon]
+min_pt = 5.0
+max_abs_eta = 2.4
+max_pf_rel_iso04_all = 0.40
+max_sip3d = 4.0
+max_abs_dxy = 0.5
+max_abs_dz = 1.0
+
+[selection.electron]
+min_pt = 7.0
+max_abs_eta = 2.5
+max_pf_rel_iso03_all = 0.40
+max_sip3d = 4.0
+max_abs_dxy = 0.5
+max_abs_dz = 1.0
+
+[selection.mixed_channel]
+leading_pt = 20.0
+subleading_pt = 10.0
+
+[zcandidates]
+z_reference_mass = 91.2
+z1_mass_min = 40.0
+z1_mass_max = 120.0
+z2_mass_min = 12.0
+z2_mass_max = 120.0
+min_delta_r = 0.02
+
+[histogram]
+bins = 36
+range = [70.0, 180.0]
+
+[histogram.single_signal]
+bins = 11
+range = [70.0, 180.0]
+
+[source]
+skimmed_base_url = "https://eospublic.cern.ch//eos/root-eos/cms_opendata_2012_nanoaod_skimmed/"
+
+[[sample]]
+name = "SMHiggsToZZTo4L"
+file = "SMHiggsToZZTo4L.root"
+role = "signal"
+channels = ["4mu", "4e", "2e2mu"]
+xsec = 0.0065
+nevt = 299973.0
+scale = 1.0
+
+[[sample]]
+name = "ZZTo4mu"
+file = "ZZTo4mu.root"
+role = "background"
+channels = ["4mu"]
+xsec = 0.077
+nevt = 1499064.0
+scale = 1.386
+
+[[sample]]
+name = "ZZTo4e"
+file = "ZZTo4e.root"
+role = "background"
+channels = ["4e"]
+xsec = 0.077
+nevt = 1499093.0
+scale = 1.386
+
+[[sample]]
+name = "ZZTo2e2mu"
+file = "ZZTo2e2mu.root"
+role = "background"
+channels = ["2e2mu"]
+xsec = 0.18
+nevt = 1497445.0
+scale = 1.386
+
+[[sample]]
+name = "Run2012B_DoubleMuParked"
+file = "Run2012B_DoubleMuParked.root"
+role = "data"
+channels = ["4mu", "2e2mu"]
+scale = 1.0
+
+[[sample]]
+name = "Run2012C_DoubleMuParked"
+file = "Run2012C_DoubleMuParked.root"
+role = "data"
+channels = ["4mu", "2e2mu"]
+scale = 1.0
+
+[[sample]]
+name = "Run2012B_DoubleElectron"
+file = "Run2012B_DoubleElectron.root"
+role = "data"
+channels = ["4e"]
+scale = 1.0
+
+[[sample]]
+name = "Run2012C_DoubleElectron"
+file = "Run2012C_DoubleElectron.root"
+role = "data"
+channels = ["4e"]
+scale = 1.0

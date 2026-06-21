@@ -10,6 +10,8 @@ description = "NanoAOD ROOT input reading and skim output writing for nano.rust"
 kuva = { version = "0.1", optional = true, default-features = false }
 nano-core = { workspace = true }
 nano-rootio = { workspace = true }
+serde = { workspace = true }
+toml = "0.8"
 
 [features]
 default = []

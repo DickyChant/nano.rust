@@ -1,17 +1,3 @@
-#[cfg(feature = "http")]
-const DEFAULT_BASE_URL: &str =
-    "https://eospublic.cern.ch//eos/root-eos/cms_opendata_2012_nanoaod_skimmed/";
-#[cfg(feature = "http")]
-const NBINS: usize = 36;
-#[cfg(feature = "http")]
-const MASS_MIN: f64 = 70.0;
-#[cfg(feature = "http")]
-const MASS_MAX: f64 = 180.0;
-#[cfg(feature = "http")]
-const LUMINOSITY_PB: f64 = 11580.0;
-#[cfg(feature = "http")]
-const SCALE_ZZ_TO_4L: f64 = 1.386;
-
 use std::error::Error;
 
 #[cfg(feature = "http")]
@@ -22,17 +8,21 @@ mod higgs4l_opendata;
 #[cfg(feature = "http")]
 fn main() -> Result<(), Box<dyn Error>> {
     let options = Options::parse()?;
+    let config = higgs4l_opendata::load_higgs_config(options.config.as_deref())?;
     ensure_plot_feature(&options.plot)?;
     if options.insecure {
         std::env::set_var("NANO_HTTP_INSECURE", "1");
     }
 
-    let report = analyze_stack(&options.sources(), options.events)?;
+    let report = analyze_stack_with_config(&options.sources(&config), options.events, &config)?;
 
-    println!("luminosity_pb: {LUMINOSITY_PB}");
-    println!("histogram: nbins={NBINS} range=[{MASS_MIN},{MASS_MAX}]");
+    println!("luminosity_pb: {}", config.luminosity);
+    println!(
+        "histogram: nbins={} range=[{},{}]",
+        config.histogram.bins, config.histogram.range[0], config.histogram.range[1]
+    );
     println!("samples:");
-    for sample in samples() {
+    for sample in samples(&config)? {
         println!(
             "  {},kind={},weight={:.12},channels={}",
             sample.file,
@@ -60,7 +50,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_yields(&report.histograms);
 
     if let Some(path) = options.plot.as_deref() {
-        write_stack_plot(path, &report.histograms)?;
+        write_stack_plot(
+            path,
+            &report.histograms,
+            &config.histogram,
+            config.luminosity,
+        )?;
         println!("stack_plot: {path}");
     }
 
@@ -75,26 +70,28 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(feature = "http")]
 #[derive(Debug, Clone)]
 struct Options {
-    base_url: String,
+    base_url: Option<String>,
     local_dir: Option<String>,
     events: Option<usize>,
     insecure: bool,
     plot: Option<String>,
+    config: Option<String>,
 }
 
 #[cfg(feature = "http")]
 impl Options {
     fn parse() -> Result<Self, Box<dyn Error>> {
-        let mut base_url = DEFAULT_BASE_URL.to_string();
+        let mut base_url = None;
         let mut local_dir = None;
         let mut events = None;
         let mut insecure = true;
         let mut plot = None;
+        let mut config = None;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--base-url" => base_url = args.next().ok_or("missing value after --base-url")?,
+                "--base-url" => base_url = Some(args.next().ok_or("missing value after --base-url")?),
                 "--local-dir" => {
                     local_dir = Some(args.next().ok_or("missing value after --local-dir")?)
                 }
@@ -109,11 +106,12 @@ impl Options {
                 "--insecure" => insecure = true,
                 "--secure" => insecure = false,
                 "--plot" => plot = Some(args.next().ok_or("missing value after --plot")?),
+                "--config" => config = Some(args.next().ok_or("missing value after --config")?),
                 "-h" | "--help" => {
-                    return Err(format!(
-                        "usage: higgs4l_stack_opendata [--base-url url | --local-dir dir] [--events n] [--secure|--insecure] [--plot path]\ndefault base URL: {DEFAULT_BASE_URL}"
+                    return Err(
+                        "usage: higgs4l_stack_opendata [--base-url url | --local-dir dir] [--events n] [--secure|--insecure] [--plot path] [--config path]"
+                            .into(),
                     )
-                    .into());
                 }
                 other => return Err(format!("unknown argument: {other}").into()),
             }
@@ -125,12 +123,16 @@ impl Options {
             events,
             insecure,
             plot,
+            config,
         })
     }
 
-    fn sources(&self) -> SourceConfig {
+    fn sources(&self, config: &higgs4l_opendata::HiggsConfig) -> SourceConfig {
         SourceConfig {
-            base_url: self.base_url.clone(),
+            base_url: self
+                .base_url
+                .clone()
+                .unwrap_or_else(|| config.source.skimmed_base_url.clone()),
             local_dir: self.local_dir.clone(),
         }
     }
@@ -146,8 +148,9 @@ pub struct SourceConfig {
 #[cfg(feature = "http")]
 impl Default for SourceConfig {
     fn default() -> Self {
+        let config = higgs4l_opendata::default_higgs_config().expect("default Higgs config parses");
         Self {
-            base_url: DEFAULT_BASE_URL.to_string(),
+            base_url: config.source.skimmed_base_url,
             local_dir: None,
         }
     }
@@ -191,7 +194,7 @@ pub struct StackReport {
 #[cfg(feature = "http")]
 #[derive(Debug, Clone)]
 pub struct SampleReport {
-    pub file: &'static str,
+    pub file: String,
     pub events_read: usize,
     pub selected: usize,
     pub bytes_fetched: u64,
@@ -243,17 +246,27 @@ pub fn analyze_stack(
     sources: &SourceConfig,
     limit: Option<usize>,
 ) -> Result<StackReport, Box<dyn Error>> {
+    let config = higgs4l_opendata::default_higgs_config()?;
+    analyze_stack_with_config(sources, limit, &config)
+}
+
+#[cfg(feature = "http")]
+pub fn analyze_stack_with_config(
+    sources: &SourceConfig,
+    limit: Option<usize>,
+    config: &higgs4l_opendata::HiggsConfig,
+) -> Result<StackReport, Box<dyn Error>> {
     let mut histograms = StackHistograms {
-        edges: histogram_edges(),
-        signal: vec![0.0; NBINS],
-        background: vec![0.0; NBINS],
-        data: vec![0.0; NBINS],
+        edges: histogram_edges_from(&config.histogram),
+        signal: vec![0.0; config.histogram.bins],
+        background: vec![0.0; config.histogram.bins],
+        data: vec![0.0; config.histogram.bins],
     };
     let mut sample_reports = Vec::new();
 
-    for sample in samples() {
-        let source = sources.source_for(sample.file);
-        let report = higgs4l_opendata::analyze_source(&source, limit)?;
+    for sample in samples(config)? {
+        let source = sources.source_for(&sample.file);
+        let report = higgs4l_opendata::analyze_source_with_config(&source, limit, config)?;
         let mut selected = 0;
 
         for candidate in &report.selected {
@@ -266,11 +279,21 @@ pub fn analyze_stack(
             selected += 1;
             let mass = f64::from(candidate.h_mass);
             match sample.kind {
-                SampleKind::Signal => fill_weighted(&mut histograms.signal, mass, sample.weight),
-                SampleKind::Background => {
-                    fill_weighted(&mut histograms.background, mass, sample.weight)
+                SampleKind::Signal => fill_weighted(
+                    &mut histograms.signal,
+                    mass,
+                    sample.weight,
+                    &config.histogram,
+                ),
+                SampleKind::Background => fill_weighted(
+                    &mut histograms.background,
+                    mass,
+                    sample.weight,
+                    &config.histogram,
+                ),
+                SampleKind::Data => {
+                    fill_weighted(&mut histograms.data, mass, sample.weight, &config.histogram)
                 }
-                SampleKind::Data => fill_weighted(&mut histograms.data, mass, sample.weight),
             }
         }
 
@@ -290,11 +313,11 @@ pub fn analyze_stack(
 }
 
 #[cfg(feature = "http")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Sample {
-    file: &'static str,
+    file: String,
     kind: SampleKind,
-    channels: &'static [Channel],
+    channels: Vec<Channel>,
     weight: f64,
 }
 
@@ -313,6 +336,15 @@ impl SampleKind {
             Self::Signal => "signal",
             Self::Background => "background",
             Self::Data => "data",
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "signal" => Some(Self::Signal),
+            "background" => Some(Self::Background),
+            "data" => Some(Self::Data),
+            _ => None,
         }
     }
 }
@@ -346,85 +378,77 @@ impl Channel {
 }
 
 #[cfg(feature = "http")]
-const ALL_CHANNELS: &[Channel] = &[Channel::FourMu, Channel::FourEl, Channel::TwoElTwoMu];
-#[cfg(feature = "http")]
-const FOUR_MU: &[Channel] = &[Channel::FourMu];
-#[cfg(feature = "http")]
-const FOUR_EL: &[Channel] = &[Channel::FourEl];
-#[cfg(feature = "http")]
-const TWO_EL_TWO_MU: &[Channel] = &[Channel::TwoElTwoMu];
-#[cfg(feature = "http")]
-const DOUBLE_MU_DATA_CHANNELS: &[Channel] = &[Channel::FourMu, Channel::TwoElTwoMu];
-
-#[cfg(feature = "http")]
-fn samples() -> Vec<Sample> {
-    let weight_signal = LUMINOSITY_PB * 0.0065 / 299_973.0;
-    vec![
-        Sample {
-            file: "SMHiggsToZZTo4L.root",
-            kind: SampleKind::Signal,
-            channels: ALL_CHANNELS,
-            weight: weight_signal,
-        },
-        Sample {
-            file: "ZZTo4mu.root",
-            kind: SampleKind::Background,
-            channels: FOUR_MU,
-            weight: LUMINOSITY_PB * 0.077 * SCALE_ZZ_TO_4L / 1_499_064.0,
-        },
-        Sample {
-            file: "ZZTo4e.root",
-            kind: SampleKind::Background,
-            channels: FOUR_EL,
-            weight: LUMINOSITY_PB * 0.077 * SCALE_ZZ_TO_4L / 1_499_093.0,
-        },
-        Sample {
-            file: "ZZTo2e2mu.root",
-            kind: SampleKind::Background,
-            channels: TWO_EL_TWO_MU,
-            weight: LUMINOSITY_PB * 0.18 * SCALE_ZZ_TO_4L / 1_497_445.0,
-        },
-        Sample {
-            file: "Run2012B_DoubleMuParked.root",
-            kind: SampleKind::Data,
-            channels: DOUBLE_MU_DATA_CHANNELS,
-            weight: 1.0,
-        },
-        Sample {
-            file: "Run2012C_DoubleMuParked.root",
-            kind: SampleKind::Data,
-            channels: DOUBLE_MU_DATA_CHANNELS,
-            weight: 1.0,
-        },
-        Sample {
-            file: "Run2012B_DoubleElectron.root",
-            kind: SampleKind::Data,
-            channels: FOUR_EL,
-            weight: 1.0,
-        },
-        Sample {
-            file: "Run2012C_DoubleElectron.root",
-            kind: SampleKind::Data,
-            channels: FOUR_EL,
-            weight: 1.0,
-        },
-    ]
-}
-
-#[cfg(feature = "http")]
-fn histogram_edges() -> Vec<f64> {
-    let width = (MASS_MAX - MASS_MIN) / NBINS as f64;
-    (0..=NBINS)
-        .map(|index| MASS_MIN + index as f64 * width)
+fn samples(config: &higgs4l_opendata::HiggsConfig) -> Result<Vec<Sample>, Box<dyn Error>> {
+    config
+        .sample
+        .iter()
+        .map(|sample| {
+            let kind = SampleKind::from_label(&sample.role)
+                .ok_or_else(|| format!("unknown sample role: {}", sample.role))?;
+            let channels = sample
+                .channels
+                .iter()
+                .map(|channel| {
+                    Channel::from_label(channel)
+                        .ok_or_else(|| format!("unknown sample channel: {channel}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Sample {
+                file: sample.file.clone(),
+                kind,
+                channels,
+                weight: sample_weight(config.luminosity, sample)?,
+            })
+        })
         .collect()
 }
 
 #[cfg(feature = "http")]
-fn fill_weighted(histogram: &mut [f64], value: f64, weight: f64) {
-    if !(MASS_MIN..MASS_MAX).contains(&value) {
+fn sample_weight(
+    luminosity_pb: f64,
+    sample: &higgs4l_opendata::SampleConfig,
+) -> Result<f64, Box<dyn Error>> {
+    match (sample.xsec, sample.nevt) {
+        (Some(xsec), Some(nevt)) => {
+            let mut weight = luminosity_pb * xsec;
+            if sample.scale != 1.0 {
+                weight *= sample.scale;
+            }
+            Ok(weight / nevt)
+        }
+        (None, None) => Ok(sample.scale),
+        _ => Err(format!("sample {} must set both xsec and nevt", sample.name).into()),
+    }
+}
+
+#[cfg(feature = "http")]
+#[cfg(test)]
+fn histogram_edges() -> Vec<f64> {
+    let config = higgs4l_opendata::default_higgs_config().expect("default Higgs config parses");
+    histogram_edges_from(&config.histogram)
+}
+
+#[cfg(feature = "http")]
+fn histogram_edges_from(histogram: &higgs4l_opendata::HistogramConfig) -> Vec<f64> {
+    let width = (histogram.range[1] - histogram.range[0]) / histogram.bins as f64;
+    (0..=histogram.bins)
+        .map(|index| histogram.range[0] + index as f64 * width)
+        .collect()
+}
+
+#[cfg(feature = "http")]
+fn fill_weighted(
+    histogram: &mut [f64],
+    value: f64,
+    weight: f64,
+    config: &higgs4l_opendata::HistogramConfig,
+) {
+    let mass_min = config.range[0];
+    let mass_max = config.range[1];
+    if !(mass_min..mass_max).contains(&value) {
         return;
     }
-    let bin = ((value - MASS_MIN) / (MASS_MAX - MASS_MIN) * NBINS as f64) as usize;
+    let bin = ((value - mass_min) / (mass_max - mass_min) * config.bins as f64) as usize;
     if let Some(slot) = histogram.get_mut(bin) {
         *slot += weight;
     }
@@ -433,7 +457,7 @@ fn fill_weighted(histogram: &mut [f64], value: f64, weight: f64) {
 #[cfg(feature = "http")]
 fn print_yields(histograms: &StackHistograms) {
     println!("bin,low,high,signal,background,data");
-    for index in 0..NBINS {
+    for index in 0..histograms.signal.len() {
         println!(
             "{},{:.9},{:.9},{:.12},{:.12},{:.0}",
             index + 1,
@@ -454,7 +478,12 @@ fn print_yields(histograms: &StackHistograms) {
 }
 
 #[cfg(all(feature = "http", feature = "plot"))]
-fn write_stack_plot(path: &str, histograms: &StackHistograms) -> Result<(), Box<dyn Error>> {
+fn write_stack_plot(
+    path: &str,
+    histograms: &StackHistograms,
+    histogram: &higgs4l_opendata::HistogramConfig,
+    luminosity_pb: f64,
+) -> Result<(), Box<dyn Error>> {
     use kuva::backend::svg::SvgBackend;
     use kuva::plot::scatter::ScatterPlot;
     use kuva::plot::Histogram;
@@ -487,21 +516,25 @@ fn write_stack_plot(path: &str, histograms: &StackHistograms) -> Result<(), Box<
         Plot::Scatter(
             ScatterPlot::new()
                 .with_data(centers.into_iter().zip(histograms.data.iter().copied()))
-                .with_x_err(std::iter::repeat(half_width).take(NBINS))
+                .with_x_err(std::iter::repeat(half_width).take(histogram.bins))
                 .with_y_err(data_yerr)
                 .with_color("black")
                 .with_size(4.0)
                 .with_legend("Data"),
         ),
     ];
+    let title = format!(
+        "CMS Open Data, sqrt(s)=8 TeV, L={:.1} fb^-1",
+        luminosity_pb / 1000.0
+    );
     let layout = Layout::auto_from_plots(&plots)
-        .with_title("CMS Open Data, sqrt(s)=8 TeV, L=11.6 fb^-1")
+        .with_title(title)
         .with_x_label("m(4l) [GeV]")
         .with_y_label("N_Events")
         .with_width(900.0)
         .with_height(700.0)
-        .with_x_axis_min(MASS_MIN)
-        .with_x_axis_max(MASS_MAX)
+        .with_x_axis_min(histogram.range[0])
+        .with_x_axis_max(histogram.range[1])
         .with_y_axis_min(0.0);
     let scene = render_multiple(plots, layout);
 
@@ -528,7 +561,12 @@ fn write_stack_plot(path: &str, histograms: &StackHistograms) -> Result<(), Box<
 }
 
 #[cfg(all(feature = "http", not(feature = "plot")))]
-fn write_stack_plot(_path: &str, _histograms: &StackHistograms) -> Result<(), Box<dyn Error>> {
+fn write_stack_plot(
+    _path: &str,
+    _histograms: &StackHistograms,
+    _histogram: &higgs4l_opendata::HistogramConfig,
+    _luminosity_pb: f64,
+) -> Result<(), Box<dyn Error>> {
     Err("--plot requires plotting support; rebuild with --features plot".into())
 }
 
@@ -556,22 +594,33 @@ mod tests {
 
     #[test]
     fn histogram_edges_match_df103() {
+        let config = higgs4l_opendata::default_higgs_config().expect("default config parses");
         let edges = histogram_edges();
-        assert_eq!(edges.len(), NBINS + 1);
-        assert_eq!(edges[0], MASS_MIN);
-        assert_eq!(edges[NBINS], MASS_MAX);
+        assert_eq!(edges.len(), config.histogram.bins + 1);
+        assert_eq!(edges[0], config.histogram.range[0]);
+        assert_eq!(edges[config.histogram.bins], config.histogram.range[1]);
     }
 
     #[test]
     fn sample_wiring_matches_df103() {
-        let sample_table = samples();
+        let config = higgs4l_opendata::default_higgs_config().expect("default config parses");
+        let sample_table = samples(&config).expect("samples parse");
         assert_eq!(sample_table.len(), 8);
         assert_eq!(sample_table[0].file, "SMHiggsToZZTo4L.root");
-        assert_eq!(sample_table[0].channels, ALL_CHANNELS);
-        assert_eq!(sample_table[4].channels, DOUBLE_MU_DATA_CHANNELS);
-        assert_eq!(sample_table[5].channels, DOUBLE_MU_DATA_CHANNELS);
-        assert_eq!(sample_table[6].channels, FOUR_EL);
-        assert_eq!(sample_table[7].channels, FOUR_EL);
+        assert_eq!(
+            sample_table[0].channels,
+            vec![Channel::FourMu, Channel::FourEl, Channel::TwoElTwoMu]
+        );
+        assert_eq!(
+            sample_table[4].channels,
+            vec![Channel::FourMu, Channel::TwoElTwoMu]
+        );
+        assert_eq!(
+            sample_table[5].channels,
+            vec![Channel::FourMu, Channel::TwoElTwoMu]
+        );
+        assert_eq!(sample_table[6].channels, vec![Channel::FourEl]);
+        assert_eq!(sample_table[7].channels, vec![Channel::FourEl]);
     }
 
     #[cfg(feature = "plot")]
@@ -581,19 +630,27 @@ mod tests {
             "nano-higgs4l-stack-plot-test-{}.svg",
             std::process::id()
         ));
+        let config = higgs4l_opendata::default_higgs_config().expect("default config parses");
         let histograms = StackHistograms {
             edges: histogram_edges(),
-            signal: (0..NBINS)
+            signal: (0..config.histogram.bins)
                 .map(|index| if index == 18 { 3.0 } else { 0.2 })
                 .collect(),
-            background: (0..NBINS).map(|index| 0.5 + index as f64 * 0.02).collect(),
-            data: (0..NBINS)
+            background: (0..config.histogram.bins)
+                .map(|index| 0.5 + index as f64 * 0.02)
+                .collect(),
+            data: (0..config.histogram.bins)
                 .map(|index| if index == 18 { 5.0 } else { (index % 3) as f64 })
                 .collect(),
         };
 
-        write_stack_plot(path.to_str().expect("utf-8 temp path"), &histograms)
-            .expect("stack SVG renders");
+        write_stack_plot(
+            path.to_str().expect("utf-8 temp path"),
+            &histograms,
+            &config.histogram,
+            config.luminosity,
+        )
+        .expect("stack SVG renders");
         let svg = std::fs::read_to_string(&path).expect("stack SVG can be read");
         let _ = std::fs::remove_file(&path);
 
