@@ -64,6 +64,23 @@ identically on the handful of boundary events; the invariant-mass and Z-pairing
 arithmetic match ROOT's. A golden test now asserts these exact counts, so any
 future drift fails CI.
 
+## The full picture: signal + background + data
+
+The plot above is the simulated signal alone. The real df103 result stacks the
+luminosity-weighted signal and ZZ background and overlays the **2012 data** — the
+actual discovery plot. `examples/higgs4l_stack_opendata` reads all eight skimmed
+open-data samples over HTTPS, weights each by `lumi·σ/N` (lumi = 11.6 fb⁻¹), and
+fills 36 bins over m(4ℓ):
+
+![CMS Open Data H→ZZ→4ℓ: ZZ background, the m_H=125 signal stacked, and 2012 data — the Higgs discovery plot, reconstructed by nano.rust](../plots/higgs_stack.png)
+
+The ZZ continuum and Z peak sit at low mass, the **m_H = 125 GeV signal bump**
+rises above the background, and the **data points** track them — the four-lepton
+Higgs excess, from public data, in pure Rust. Totals: signal 6.70, background
+62.0, data 82. Against ROOT's df103 the agreement is to **f64 precision**
+(~12 significant figures; data exact, signal per-bin identical, the background
+sum differing only at ~1e-12 from summation order).
+
 ## Why this matters
 
 This is the whole thesis, end to end, on a real analysis:
