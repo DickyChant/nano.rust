@@ -41,8 +41,8 @@ layer. The analysis *meaning* lives in the typed IR, independent of any backend.
 | Phase | Scope | Status |
 |---|---|---|
 | 0 — Design study | IRs, spec syntax, design docs | **Done** — vision + migration + state-machine + semantic-layer + inference-protocol + versioning + agent-interface |
-| 1 — Minimal Rust kernel | reader, typed schema, selection, histograms | **Done (one debt)** — `nano-rootio` (read **+ write**, local **+ remote**), `nano-core`, `nano-io`, `nano-producers` (muon), `nano-analysis` (`Hist1D`, typestate). Debt: golden test vs the frozen `.root` references not wired yet |
-| 2 — Corrections & systematics | correctionlib, typed SF, weights, variations | **Mostly done** — native `nano-corrections` evaluator + typed SF + units + per-analysis exhaustive generated `Systematic`; **JME weights + all five shape variations wired into the channel from the real `jet_jerc` payloads**, carried by `Weighted<R>`. Remaining: full four-vector JES/JER propagation (current slice is bookkeeping-weight scaffolding) + PU/muon-SF payloads |
+| 1 — Minimal Rust kernel | reader, typed schema, selection, histograms | **Done** — `nano-rootio` reads real CMS NanoAOD **v9/v12/v15** (local + HTTP remote), writes TTrees **and ROOT `TH1F` histograms**; `nano-core`, `nano-io`, `nano-producers`, `nano-analysis` (`Hist1D`/`HistSet1D`, typestate). The frozen `.root` golden test **is now wired** (`nano-validate` round-trips/compares the v9/v12/v15 references) |
+| 2 — Corrections & systematics | correctionlib, typed SF, weights, variations | **Done (spec-declarable)** — native `nano-corrections` v2 evaluator wired INTO the spec: `[[correction]] kind="scale_factor"` (correctionlib SF → event weight) and `kind="jes"` (correctionlib JES shape → kinematics, recomputed per variation), both evaluated by the SAME evaluator in interpreter and codegen; per-analysis exhaustive generated `Systematic` axis with `Weighted<R,S>` fan-out (weight + shape). Remaining is **payload content** (real PU/lepton/b-tag JSONs), not framework capability |
 | 3 — Semantic compiler | spec → semantic IR → validate → Rust codegen | **Core done** — `nano-spec` validate + derive `read_branches` + codegen, proven equal to hand-written (`nano-gen-demo`), incl. **inference codegen** (`nano-gen-tagger-demo`) |
 | 4 — Workflow DAG (executor-agnostic) | typed workflow **DAG** as a portable IR: chunking, merging, provenance, staleness | **In progress** — `nano-workflow` typed DAG + local serial/parallel executor + portable JSON export + standalone task unit built; **thin Dask/Ray adapters built** (`integrations/`, not CI-gated). No built-in scheduler (LAW/HTCondor descoped) — the DAG is delegated to Dask/Ray/any system. *(Note: per the scope review, this is enabling infra, not the central thesis.)* |
 | 5 — Agentic integration | agent-operable harness, semantic-diff review, validation/repair | **Started** — `nano-cli` + `nano-mcp` expose the compiler-gated action space; review/repair loops are future |
@@ -52,8 +52,30 @@ Beyond the original plan, an **inference protocol** (`nano-inference`: mock / in
 ONNX / remote / self-launching server, declared as `[[model]]`) was added as a boundary
 layer.
 
-**Foundations (Phases 0–1) and the core of the semantic compiler (Phase 3) are in
-place; the next frontier is the Rust-native orchestrator (Phase 4).**
+### The real-analysis production path is complete and demonstrated
+
+A spec-driven analysis now runs **end to end, samples → datacard** (see
+[`worked-example.md`](worked-example.md), `crates/nano-io/examples/full_analysis_workflow.rs`):
+
+```
+sample table (xsec/lumi/sumw, signal/bkg/data)
+  → read NanoAOD v9/v12/v15 (local + HTTP)
+  → select objects/derived/candidate/regions
+  → correctionlib scale factors (→ weight) + JES shape (→ kinematics)
+  → golden-JSON lumi mask + HLT/MET-flag filters
+  → per-analysis systematic fan-out (weight + shape, + model re-inference)
+  → per-sample xsec·lumi/sumw normalization, accumulated per process
+  → ROOT TH1F shapes + a multi-process Combine datacard
+  → chunked at-scale execution (DAG == single-pass)
+```
+
+The whole chain is proven `interpret == codegen`, and the worked example emits a real
+`datacard.txt` + `shapes.root`. What remains to a *published* analysis is **content**
+(real CMS correction payloads, a real dataset), **infra** (xrootd, a live Dask/Ray
+cluster), and the external `combine` fit — not framework capability.
+
+**Foundations, the semantic compiler (Phase 3), corrections/systematics (Phase 2), and
+the full samples→datacard production path are in place.**
 
 ## Design decisions & refinements (stances taken for this project)
 

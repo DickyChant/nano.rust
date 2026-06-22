@@ -152,9 +152,11 @@ the execution.
 
 | Layer | Crate(s) |
 |---|---|
-| Front-end (verifier) | `nano-spec` (parse/validate/derive), `nano-corrections` (typed corrections) |
+| Front-end (verifier) | `nano-spec` (parse/validate/derive; `[[correction]]` scale_factor + jes, `[lumi_mask]`, triggers/flags), `nano-corrections` (native correctionlib-v2 evaluator, wired into the spec) |
 | Per-event IR + kernel vocabulary | `nano-spec::core` (typed Core IR + primitive registry), `nano-spec::kir` (KIR, single executable semantics), `nano-analysis` (`Weighted<R,S>` typestate), `nano-inference` (model boundary) |
 | Per-event back-ends | `nano-spec::interpret` (executes KIR); codegen (emits from KIR) → `nano-producers`-shaped kernels; `nano-jit` (optional runtime compile + dlopen) |
-| Data plane | `nano-rootio` (owned ROOT I/O), `nano-io` (streaming), `nano-core` (event model) |
-| Workflow IR + back-ends | `nano-workflow` (DAG, local executor, portable graph, task unit), `integrations/` (Dask/Ray) |
-| Action space | `nano-cli` (`validate`/`branches`/`inspect`/`codegen`/`run`), `nano-mcp` (same as agent tools) |
+| Data plane | `nano-rootio` (owned ROOT I/O — reads NanoAOD v9/v12/v15, writes TTrees + `TH1F`), `nano-io` (streaming, `samples` table + normalization, `datacard` emitter), `nano-core` (event model) |
+| Output / statistics handoff | `nano-io::datacard` (multi-process Combine datacard + `shapes.root`), `nano-io::samples` (sample table, per-sample xsec·lumi/sumw normalization), `nano-validate` (golden compare incl. the frozen v9/v12/v15 references) |
+| Workflow IR + back-ends | `nano-workflow` (DAG, local executor, portable graph, task unit; multi-chunk == single-pass), `integrations/` (Dask/Ray) |
+| Action space | `nano-cli` (`validate`/`branches`/`inspect`/`codegen`/`run`/`certify`/`compare`), `nano-mcp` (same as agent tools) |
+| Worked example | `crates/nano-io/examples/full_analysis_workflow.rs` + [`worked-example.md`](worked-example.md) — samples → corrections+systematics spec → multi-process datacard, end to end |

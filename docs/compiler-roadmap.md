@@ -78,8 +78,14 @@ not hand-branched in codegen; ADL/TOML/YAML desugar onto the registry.
    enums and exhaustive `SystematicVisitor` (compile_fail proof); weight +
    shape systematic histogram fan-out **executes** (interpret==codegen) with
    declaration-derived variant names. Remaining: table fan-out.
-5. **PARTIAL** — shape-variation corrections (`[[correction]]` kind="scale", pt-shift
-   that recomputes dependent selections). Full correctionlib-payload JES/JER deferred.
+5. **DONE (spec-declarable, payloads are content)** — corrections wired into the spec via
+   the native correctionlib-v2 evaluator: `[[correction]]` kind="scale_factor" (SF →
+   weight) and kind="jes" (binned correctionlib JES → kinematics, recomputes dependent
+   selections per variation), evaluated by the SAME evaluator in interpret + codegen. Plus
+   the **output→statistics handoff**: ROOT `TH1F` shapes, a **multi-process Combine
+   datacard**, a **sample table** with per-sample xsec·lumi/sumw normalization, and a full
+   worked example (samples → datacard). Remaining is real CMS payload/dataset CONTENT, not
+   framework capability.
 6. **DEFERRED** — inference over scopes / ONNX provider (a `nano-inference` boundary
    exists; real `ort` not wired — deferred from the thesis narrative per scope review).
 7. **DONE** — ADL front-end: `from_adl_str` desugars to the SAME AnalysisSpec/Core IR/
