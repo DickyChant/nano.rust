@@ -137,6 +137,10 @@ fn assert_adl_representable(spec: &AnalysisSpec) {
         "ADL emitter cannot render multi-channel unions"
     );
     assert!(
+        spec.lumi_mask.is_none(),
+        "ADL emitter cannot render lumi masks"
+    );
+    assert!(
         spec.models.iter().all(model_has_adl_provider_surface),
         "ADL emitter cannot render model providers other than plain kind bindings"
     );
@@ -366,6 +370,7 @@ fn cut_to_adl(cut: &Cut) -> String {
 
 fn expr_to_adl(expr: &Expr) -> String {
     match expr {
+        Expr::EventScalar(branch) => branch.clone(),
         Expr::Attr { object, attr } => format!("{object}.{attr}"),
         Expr::Literal(value) => format_f64(*value),
         Expr::Binary { op, lhs, rhs } => format!(
@@ -581,6 +586,7 @@ impl Parser {
             objects: self.objects,
             derived: self.derived,
             models: self.models,
+            lumi_mask: None,
             regions: self.regions,
             outputs: self.outputs,
             histograms: self.histograms,

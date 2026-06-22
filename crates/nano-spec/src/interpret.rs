@@ -754,6 +754,14 @@ impl<'a> KirEvaluator<'a> {
                 Ok(RuntimeValue::Candidate)
             }
             Rvalue::Requirement { requirement } => {
+                if let Expr::EventScalar(branch) = &requirement.lhs {
+                    let lhs = self.event.scalar::<bool>(branch)?;
+                    return Ok(RuntimeValue::Bool(compare_bool(
+                        lhs,
+                        requirement.op,
+                        requirement.rhs.value,
+                    )?));
+                }
                 if expr_has_missing_value(&requirement.lhs, &self.selected, &self.derived)? {
                     return Ok(RuntimeValue::Bool(false));
                 }
@@ -763,6 +771,14 @@ impl<'a> KirEvaluator<'a> {
                     requirement.op,
                     requirement.rhs.value,
                 )))
+            }
+            Rvalue::LumiMask { mask } => {
+                if self.event.is_mc() {
+                    return Ok(RuntimeValue::Bool(true));
+                }
+                let run = self.event.scalar::<u32>("run")?;
+                let luminosity_block = self.event.scalar::<u32>("luminosityBlock")?;
+                Ok(RuntimeValue::Bool(mask.contains(run, luminosity_block)))
             }
             Rvalue::Output { expr, .. } => Ok(RuntimeValue::Output(eval_output_expr(
                 expr,
@@ -1829,6 +1845,7 @@ fn expr_has_missing_value(
             Ok(derived_object(derived, object)?.is_none())
         }
         Expr::Attr { .. } | Expr::Literal(_) | Expr::Count(_) | Expr::SumAttr { .. } => Ok(false),
+        Expr::EventScalar(_) => Ok(false),
         Expr::Binary { lhs, rhs, .. } => Ok(expr_has_missing_value(lhs, selected, derived)?
             || expr_has_missing_value(rhs, selected, derived)?),
         Expr::Abs(inner) | Expr::Sqrt(inner) => expr_has_missing_value(inner, selected, derived),
@@ -1868,6 +1885,9 @@ fn eval_output_expr(
             })?;
             Ok(Some(Value::U32(count)))
         }
+        Expr::EventScalar(_) => Err(InterpretError::Unsupported(
+            "event scalar outputs are not supported by the interpreter".to_string(),
+        )),
         Expr::CountWhere { object, predicate } => {
             let count = count_where(selected, derived, object, predicate)?;
             Ok(Some(Value::U32(count)))
@@ -1953,6 +1973,9 @@ fn eval_numeric_expr(
     current: Option<(&str, &SelectedObject)>,
 ) -> Result<NumericValue> {
     match expr {
+        Expr::EventScalar(_) => Err(InterpretError::InvalidExpression(
+            "event scalar branches are only supported as boolean requirements".to_string(),
+        )),
         Expr::Attr { object, attr } => {
             if let Some((current_object, selected_object)) = current {
                 if object != current_object {
@@ -2265,6 +2288,25 @@ fn compare(lhs: f64, op: CmpOp, rhs: f64) -> bool {
         CmpOp::Le => lhs <= rhs,
         CmpOp::Eq => lhs == rhs,
         CmpOp::Ne => lhs != rhs,
+    }
+}
+
+fn compare_bool(lhs: bool, op: CmpOp, rhs: f64) -> Result<bool> {
+    let rhs = match rhs {
+        0.0 => false,
+        1.0 => true,
+        _ => {
+            return Err(InterpretError::InvalidExpression(format!(
+                "boolean comparison rhs must be 0 or 1, got {rhs}"
+            )));
+        }
+    };
+    match op {
+        CmpOp::Eq => Ok(lhs == rhs),
+        CmpOp::Ne => Ok(lhs != rhs),
+        _ => Err(InterpretError::InvalidExpression(
+            "boolean comparison supports only == or !=".to_string(),
+        )),
     }
 }
 

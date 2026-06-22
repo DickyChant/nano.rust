@@ -145,6 +145,19 @@ pub mod muon_sf {
     dead_code,
     non_snake_case,
     unused_parens,
+    clippy::collapsible_if,
+    clippy::double_parens,
+    clippy::neg_cmp_op_on_partial_ord,
+    clippy::unnecessary_cast
+)]
+pub mod lumi_mask_trigger {
+    include!(concat!(env!("OUT_DIR"), "/generated_lumi_mask_trigger.rs"));
+}
+
+#[allow(
+    dead_code,
+    non_snake_case,
+    unused_parens,
     clippy::approx_constant,
     clippy::collapsible_if,
     clippy::double_parens,

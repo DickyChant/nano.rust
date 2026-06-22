@@ -1,0 +1,20 @@
+[analysis]
+name = "lumi_mask_trigger_demo"
+year = "Run2018"
+
+[lumi_mask]
+file = "../nano-spec/tests/data/synthetic_golden.json"
+
+[objects.good_muon]
+source = "Muon"
+cuts = ["pt > 0 GeV"]
+
+[regions.signal]
+require = [
+  "HLT_IsoMu24",
+  "Flag_goodVertices",
+]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"

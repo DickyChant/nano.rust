@@ -712,6 +712,7 @@ fn channel_as_spec(channel: &ChannelDef, parent: &AnalysisSpec) -> AnalysisSpec 
     AnalysisSpec {
         name: format!("{}_{}", parent.name, channel.name),
         year: parent.year.clone(),
+        lumi_mask: parent.lumi_mask.clone(),
         objects: channel.objects.clone(),
         derived_objects: channel.derived_objects.clone(),
         models: Vec::new(),

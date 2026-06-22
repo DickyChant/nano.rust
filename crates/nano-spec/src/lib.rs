@@ -24,6 +24,7 @@ pub mod kir;
 pub struct AnalysisSpec {
     pub name: String,
     pub year: Year,
+    pub lumi_mask: Option<LumiMaskDef>,
     pub objects: Vec<ObjectDef>,
     pub derived_objects: Vec<DerivedObjectDef>,
     pub models: Vec<ModelDef>,
@@ -299,6 +300,96 @@ pub struct Quantity {
     pub unit: Unit,
 }
 
+/// Event-level CMS golden JSON luminosity mask.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LumiMaskDef {
+    pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranges: Option<LumiMask>,
+}
+
+/// Certified inclusive luminosity-section ranges keyed by run number.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LumiMask {
+    runs: BTreeMap<u32, Vec<LumiRange>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LumiRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl LumiMask {
+    /// Load a CMS golden JSON file: `{ "run": [[lsStart, lsEnd], ...], ... }`.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, SpecError> {
+        let path = path.as_ref();
+        let input = fs::read_to_string(path).map_err(|error| SpecError::InvalidExpression {
+            context: "lumi_mask".to_string(),
+            detail: format!("failed to load golden JSON `{}`: {error}", path.display()),
+        })?;
+        let raw =
+            serde_json::from_str::<BTreeMap<String, Vec<[u32; 2]>>>(&input).map_err(|error| {
+                SpecError::InvalidExpression {
+                    context: "lumi_mask".to_string(),
+                    detail: format!("failed to parse golden JSON `{}`: {error}", path.display()),
+                }
+            })?;
+        Self::from_raw(raw, path)
+    }
+
+    fn from_raw(raw: BTreeMap<String, Vec<[u32; 2]>>, path: &Path) -> Result<Self, SpecError> {
+        let mut runs = BTreeMap::new();
+        for (run, ranges) in raw {
+            let run = run
+                .parse::<u32>()
+                .map_err(|error| SpecError::InvalidExpression {
+                    context: "lumi_mask".to_string(),
+                    detail: format!(
+                        "golden JSON `{}` has non-u32 run key `{run}`: {error}",
+                        path.display()
+                    ),
+                })?;
+            let ranges = ranges
+                .into_iter()
+                .map(|[start, end]| {
+                    if start <= end {
+                        Ok(LumiRange { start, end })
+                    } else {
+                        Err(SpecError::InvalidExpression {
+                            context: "lumi_mask".to_string(),
+                            detail: format!(
+                                "golden JSON `{}` has inverted LS range [{start}, {end}] for run {run}",
+                                path.display()
+                            ),
+                        })
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            runs.insert(run, ranges);
+        }
+        Ok(Self { runs })
+    }
+
+    /// Return true when `(run, luminosityBlock)` lies in a certified range.
+    pub fn contains(&self, run: u32, luminosity_block: u32) -> bool {
+        self.runs
+            .get(&run)
+            .is_some_and(|ranges| lumi_mask_contains_ranges(ranges, luminosity_block))
+    }
+
+    pub fn ranges_by_run(&self) -> &BTreeMap<u32, Vec<LumiRange>> {
+        &self.runs
+    }
+}
+
+/// Shared inclusive luminosity-section membership test.
+pub fn lumi_mask_contains_ranges(ranges: &[LumiRange], luminosity_block: u32) -> bool {
+    ranges
+        .iter()
+        .any(|range| (range.start..=range.end).contains(&luminosity_block))
+}
+
 /// Units currently understood by the semantic validator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Unit {
@@ -319,6 +410,7 @@ pub enum ArithOp {
 /// Expression nodes for the semantic selection IR.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Expr {
+    EventScalar(String),
     Attr {
         object: String,
         attr: String,
@@ -519,6 +611,7 @@ impl ChannelDef {
         AnalysisSpec {
             name: format!("{}_{}", parent.name, self.name),
             year: parent.year.clone(),
+            lumi_mask: parent.lumi_mask.clone(),
             objects: self.objects.clone(),
             derived_objects: self.derived_objects.clone(),
             models: Vec::new(),
@@ -616,6 +709,11 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
     validate_raw_analysis_spec(&raw)?;
     let objects = object_defs_from_raw(raw.objects)?;
     let derived_objects = derived_defs_from_raw(raw.derived)?;
+    let lumi_mask = raw
+        .lumi_mask
+        .map(lumi_mask_def_from_raw)
+        .transpose()
+        .map_err(|error| ParseError::InvalidSpec(error.to_string()))?;
     let models = raw
         .models
         .into_iter()
@@ -662,6 +760,7 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
     Ok(AnalysisSpec {
         name: raw.analysis.name,
         year: Year::parse(&raw.analysis.year),
+        lumi_mask,
         objects,
         derived_objects,
         models,
@@ -691,11 +790,13 @@ pub fn validate(
     spec: &AnalysisSpec,
     catalogue: &Catalogue,
 ) -> Result<ResolvedPlan, Vec<SpecError>> {
+    let mut spec = spec.clone();
+    resolve_lumi_mask(&mut spec)?;
     if !spec.channels.is_empty() {
-        return validate_union(spec, catalogue);
+        return validate_union(&spec, catalogue);
     }
 
-    let core = lower(spec, catalogue)?;
+    let core = lower(&spec, catalogue)?;
     let branch_specs =
         branch_specs_from_core_effects(&core, catalogue).map_err(|error| vec![error])?;
     let read_branches = BranchSchema::new(branch_specs).map_err(|error| {
@@ -705,9 +806,18 @@ pub fn validate(
     })?;
 
     Ok(ResolvedPlan {
-        spec: spec.clone(),
+        spec,
         read_branches,
     })
+}
+
+fn resolve_lumi_mask(spec: &mut AnalysisSpec) -> Result<(), Vec<SpecError>> {
+    if let Some(mask) = &mut spec.lumi_mask {
+        if mask.ranges.is_none() {
+            mask.ranges = Some(LumiMask::from_path(&mask.file).map_err(|error| vec![error])?);
+        }
+    }
+    Ok(())
 }
 
 fn validate_flat(
@@ -726,6 +836,7 @@ fn validate_flat(
         .collect::<HashMap<_, _>>();
     let mut errors = Vec::new();
     let mut required = RequiredBranches::default();
+    validate_lumi_mask(spec, catalogue, &mut required, &mut errors);
     let model_outputs =
         validate_models(spec, catalogue, &object_sources, &mut required, &mut errors);
     validate_unique_output_names(&spec.outputs, &mut errors);
@@ -1030,6 +1141,7 @@ impl<'a> CoreLowerer<'a> {
 
     fn lower_expr(&mut self, expr: &Expr, context: &str) -> Option<core::ExprId> {
         match expr {
+            Expr::EventScalar(branch) => self.event_scalar_node(branch, context),
             Expr::Attr { object, attr } => self.attr_node(object, attr, context),
             Expr::Literal(value) => {
                 self.registry_call("literal", &[], context)?;
@@ -1232,6 +1344,16 @@ impl<'a> CoreLowerer<'a> {
             ty,
             BTreeSet::new(),
         )
+    }
+
+    fn event_scalar_node(&mut self, branch: &str, _context: &str) -> Option<core::ExprId> {
+        Some(self.builder.add_expr(
+            core::ExprKind::EventScalar {
+                branch: branch.to_string(),
+            },
+            core::Type::Bool,
+            BTreeSet::from([core::Effect::ReadsBranch(branch.to_string())]),
+        ))
     }
 
     fn filter_call(&mut self, primitive: &'static str, context: &str) -> Option<core::ExprId> {
@@ -1913,6 +2035,7 @@ fn validate_candidate_item(item: &str, context: &str, ctx: &mut ValidationContex
 fn validate_expr(expr: &Expr, context: &str, ctx: &mut ValidationContext<'_>) -> Option<ExprType> {
     match expr {
         Expr::Attr { object, attr } => validate_attr(object, attr, context, ctx),
+        Expr::EventScalar(branch) => validate_event_scalar(branch, context, ctx),
         Expr::Literal(_) => Some(ExprType::Numeric(Dimension::Dimensionless)),
         Expr::Binary { op, lhs, rhs } => {
             let lhs_type = validate_expr(lhs, context, ctx);
@@ -2243,6 +2366,108 @@ fn validate_attr(
     ctx.required.require_counter(source);
     ctx.required.require_attr(source, attr);
     Some(ExprType::Numeric(attribute_dimension(attr)))
+}
+
+fn validate_event_scalar(
+    branch: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) -> Option<ExprType> {
+    let Some(entry) = ctx.catalogue.branch(branch) else {
+        ctx.errors.push(SpecError::MissingBranch {
+            context: context.to_string(),
+            branch: branch.to_string(),
+        });
+        return None;
+    };
+    let Some(branch_type) = entry.branch_type else {
+        ctx.errors.push(SpecError::UnsupportedBranchType {
+            context: context.to_string(),
+            branch: branch.to_string(),
+            raw_type: entry.raw_type.clone(),
+        });
+        return None;
+    };
+    match branch_type {
+        BranchType::Bool => {
+            ctx.required.require_branch(branch);
+            Some(ExprType::Bool)
+        }
+        branch_type => {
+            ctx.errors.push(SpecError::WrongBranchType {
+                context: context.to_string(),
+                branch: branch.to_string(),
+                expected: "event scalar bool branch".to_string(),
+                actual: branch_type,
+            });
+            None
+        }
+    }
+}
+
+fn validate_lumi_mask(
+    spec: &AnalysisSpec,
+    catalogue: &Catalogue,
+    required: &mut RequiredBranches,
+    errors: &mut Vec<SpecError>,
+) {
+    if spec.lumi_mask.is_none() {
+        return;
+    }
+    require_event_scalar_type(
+        catalogue,
+        required,
+        errors,
+        "run",
+        BranchType::U32,
+        "u32 run branch",
+        "lumi_mask",
+    );
+    require_event_scalar_type(
+        catalogue,
+        required,
+        errors,
+        "luminosityBlock",
+        BranchType::U32,
+        "u32 luminosityBlock branch",
+        "lumi_mask",
+    );
+}
+
+fn require_event_scalar_type(
+    catalogue: &Catalogue,
+    required: &mut RequiredBranches,
+    errors: &mut Vec<SpecError>,
+    branch: &str,
+    expected_type: BranchType,
+    expected: &str,
+    context: &str,
+) {
+    let Some(entry) = catalogue.branch(branch) else {
+        errors.push(SpecError::MissingBranch {
+            context: context.to_string(),
+            branch: branch.to_string(),
+        });
+        return;
+    };
+    let Some(branch_type) = entry.branch_type else {
+        errors.push(SpecError::UnsupportedBranchType {
+            context: context.to_string(),
+            branch: branch.to_string(),
+            raw_type: entry.raw_type.clone(),
+        });
+        return;
+    };
+    if branch_type != expected_type {
+        errors.push(SpecError::WrongBranchType {
+            context: context.to_string(),
+            branch: branch.to_string(),
+            expected: expected.to_string(),
+            actual: branch_type,
+        });
+        return;
+    }
+    required.require_branch(branch);
 }
 
 fn validate_derived_attr(
@@ -3042,6 +3267,16 @@ fn parse_requirement(input: &str) -> Result<Requirement, ParseError> {
             },
         });
     }
+    if validate_identifier(trimmed, input).is_ok() {
+        return Ok(Requirement {
+            lhs: Expr::EventScalar(trimmed.to_string()),
+            op: CmpOp::Eq,
+            rhs: Quantity {
+                value: 1.0,
+                unit: Unit::Dimensionless,
+            },
+        });
+    }
     let (lhs, op, rhs) = split_comparison(input)?;
     let rhs = parse_quantity(rhs)?;
     Ok(Requirement {
@@ -3274,9 +3509,8 @@ fn parse_expr_prec(
         });
     }
 
-    Err(ParseError::InvalidSpec(format!(
-        "expression `{input}` needs an explicit object"
-    )))
+    validate_identifier(input, input)?;
+    Ok(Expr::EventScalar(input.to_string()))
 }
 
 fn starts_with_call(input: &str, function: &str) -> bool {
@@ -3473,6 +3707,8 @@ struct RawAnalysisSpec {
     #[serde(default, rename = "model")]
     models: Vec<RawModel>,
     #[serde(default)]
+    lumi_mask: Option<RawLumiMask>,
+    #[serde(default)]
     regions: BTreeMap<String, RawRegion>,
     #[serde(default)]
     outputs: Vec<RawOutput>,
@@ -3551,6 +3787,11 @@ struct RawModelProvider {
 struct RawRegion {
     #[serde(default)]
     require: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawLumiMask {
+    file: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3674,6 +3915,13 @@ fn region_defs_from_raw(
         regions.push(RegionDef { name, require });
     }
     Ok(regions)
+}
+
+fn lumi_mask_def_from_raw(raw: RawLumiMask) -> Result<LumiMaskDef, SpecError> {
+    Ok(LumiMaskDef {
+        file: raw.file,
+        ranges: None,
+    })
 }
 
 fn output_defs_from_raw(raw_outputs: &[RawOutput]) -> Result<Vec<OutputDef>, ParseError> {
@@ -4225,6 +4473,7 @@ impl fmt::Display for Unit {
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EventScalar(branch) => f.write_str(branch),
             Self::Attr { object, attr } => write!(f, "{object}.{attr}"),
             Self::Literal(value) => write!(f, "{value}"),
             Self::Binary { op, lhs, rhs } => write!(f, "({lhs} {} {rhs})", op.as_str()),
@@ -4566,6 +4815,7 @@ mod tests {
                 core::ExprKind::Call { primitive, .. } => Some(*primitive),
                 core::ExprKind::Literal(_)
                 | core::ExprKind::Quantity(_)
+                | core::ExprKind::EventScalar { .. }
                 | core::ExprKind::Attr { .. }
                 | core::ExprKind::DerivedAttr { .. }
                 | core::ExprKind::Compare { .. } => None,
@@ -5267,6 +5517,230 @@ expr = "z_mu_remaining.mass"
         let json_spec = AnalysisSpec::from_json_str(MUON_SPEC_JSON).expect("parse JSON spec");
 
         assert_eq!(json_spec, toml_spec);
+    }
+
+    #[test]
+    fn validates_event_scalar_boolean_region_requirements() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "event_flags"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[regions.signal]
+require = ["HLT_IsoMu24", "Flag_goodVertices"]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"
+"#,
+        )
+        .expect("parse event flag spec");
+        let plan = validate(&spec, &catalogue()).expect("validate event flag spec");
+        let read_branches = plan
+            .read_branches
+            .specs()
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            read_branches,
+            vec!["nMuon", "Flag_goodVertices", "HLT_IsoMu24"]
+        );
+    }
+
+    #[test]
+    fn lumi_mask_validation_loads_json_and_requires_event_branches() {
+        let mask =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/synthetic_golden.json");
+        let spec = AnalysisSpec::from_toml_str(&format!(
+            r#"
+[analysis]
+name = "lumi_mask_validation"
+year = "Run2018"
+
+[lumi_mask]
+file = "{}"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"
+"#,
+            mask.display()
+        ))
+        .expect("parse lumi mask spec");
+        let plan = validate(&spec, &catalogue()).expect("validate lumi mask spec");
+
+        assert!(plan
+            .spec
+            .lumi_mask
+            .as_ref()
+            .and_then(|mask| mask.ranges.as_ref())
+            .is_some_and(|mask| mask.contains(1001, 10) && !mask.contains(1001, 4)));
+        assert_eq!(
+            plan.read_branches
+                .specs()
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nMuon", "luminosityBlock", "run"]
+        );
+
+        let mut bad_catalogue_text = NANOV9_CATALOGUE.to_string();
+        bad_catalogue_text = bad_catalogue_text.replace("\"luminosityBlock\":", "\"missingLs\":");
+        let bad_catalogue =
+            Catalogue::from_nanoaod_yaml_str(&bad_catalogue_text, "v9").expect("parse catalogue");
+        let errors = validate(&spec, &bad_catalogue).expect_err("missing LS branch should fail");
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::MissingBranch { branch, .. } if branch == "luminosityBlock"
+        )));
+    }
+
+    #[test]
+    fn lumi_mask_validation_rejects_missing_file_as_spec_error() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "missing_lumi_mask"
+year = "Run2018"
+
+[lumi_mask]
+file = "/tmp/nano-rust-this-golden-json-does-not-exist.json"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+"#,
+        )
+        .expect("parse missing-mask spec");
+        let errors = validate(&spec, &catalogue()).expect_err("missing mask should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidExpression { context, detail }
+                if context == "lumi_mask" && detail.contains("failed to load golden JSON")
+        )));
+    }
+
+    #[test]
+    fn lumi_mask_validation_rejects_malformed_json_as_spec_error() {
+        let mask =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/malformed_golden.json");
+        let spec = AnalysisSpec::from_toml_str(&format!(
+            r#"
+[analysis]
+name = "malformed_lumi_mask"
+year = "Run2018"
+
+[lumi_mask]
+file = "{}"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+"#,
+            mask.display()
+        ))
+        .expect("parse malformed-mask spec");
+        let errors = validate(&spec, &catalogue()).expect_err("malformed mask should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidExpression { context, detail }
+                if context == "lumi_mask" && detail.contains("failed to parse golden JSON")
+        )));
+    }
+
+    #[test]
+    fn lumi_mask_lowers_to_initial_kir_guard_and_codegen_uses_shared_helper() {
+        let mask =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/synthetic_golden.json");
+        let spec = AnalysisSpec::from_toml_str(&format!(
+            r#"
+[analysis]
+name = "lumi_mask_kir"
+year = "Run2018"
+
+[lumi_mask]
+file = "{}"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"
+"#,
+            mask.display()
+        ))
+        .expect("parse lumi mask spec");
+        let plan = validate(&spec, &catalogue()).expect("validate lumi mask spec");
+        let kir = crate::kir::lower_plan_to_kir(&plan).expect("lower KIR");
+        crate::kir::verify(&kir).expect("verify KIR");
+
+        assert!(matches!(
+            &kir.block.stmts[0],
+            crate::kir::Stmt::Let {
+                expr: crate::kir::Rvalue::LumiMask { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &kir.block.stmts[1],
+            crate::kir::Stmt::Require { .. }
+        ));
+        let source = crate::codegen::generate_producer_source(&plan).expect("generate source");
+        assert!(source.contains("nano_spec::lumi_mask_contains_ranges"));
+    }
+
+    #[test]
+    fn no_lumi_mask_specs_remain_bit_identical_across_mask_validation() {
+        let catalogue = catalogue();
+        let spec = parse_muon_spec();
+        let before_plan = validate(&spec, &catalogue).expect("validate before");
+        let before_source =
+            crate::codegen::generate_producer_source(&before_plan).expect("generate before");
+
+        let mask =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/synthetic_golden.json");
+        let masked = AnalysisSpec::from_toml_str(&format!(
+            r#"
+[analysis]
+name = "masked_side_effect_check"
+year = "Run2018"
+
+[lumi_mask]
+file = "{}"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+"#,
+            mask.display()
+        ))
+        .expect("parse masked spec");
+        validate(&masked, &catalogue).expect("validate masked spec");
+
+        let after_plan = validate(&spec, &catalogue).expect("validate after");
+        let after_source =
+            crate::codegen::generate_producer_source(&after_plan).expect("generate after");
+        assert_eq!(
+            after_plan.read_branches.specs(),
+            before_plan.read_branches.specs()
+        );
+        assert_eq!(after_source, before_source);
+        assert!(!after_source.contains("lumi_mask_contains_ranges"));
     }
 
     #[test]

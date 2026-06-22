@@ -611,6 +611,7 @@ fn expr_kind_name(kind: &core::ExprKind) -> String {
         core::ExprKind::Quantity(quantity) => {
             format!("quantity:{:?}:{:?}", quantity.value, quantity.unit)
         }
+        core::ExprKind::EventScalar { branch } => format!("event_scalar:{branch}"),
         core::ExprKind::Attr {
             object,
             attr,
@@ -822,6 +823,9 @@ fn rvalue_name(expr: &kir::Rvalue) -> String {
                 "requirement:{}:{:?}:{:?}",
                 requirement.lhs, requirement.op, requirement.rhs
             )
+        }
+        kir::Rvalue::LumiMask { mask } => {
+            format!("lumi_mask:{} runs", mask.ranges_by_run().len())
         }
         kir::Rvalue::Output { expr, ty } => format!("output:{expr}:{ty:?}"),
         kir::Rvalue::Histogram { histogram } => format!("histogram:{}", histogram.name),

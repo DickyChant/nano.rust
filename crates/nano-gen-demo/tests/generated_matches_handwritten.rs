@@ -34,6 +34,8 @@ const MUON_HIST_SHAPE_NOMINAL_SPEC: &str =
 const MUON_HIST_SHAPE_CORRECTION_SPEC: &str =
     include_str!("../../nano-spec/examples/muon_hist_shape_correction.toml");
 const MUON_SF_SPEC: &str = include_str!("../../nano-spec/examples/muon_sf.toml");
+const LUMI_MASK_TRIGGER_SPEC: &str =
+    include_str!("../../nano-spec/examples/lumi_mask_trigger.toml");
 
 #[test]
 fn generated_muon_producer_matches_handwritten_producer_on_synthetic_events() {
@@ -117,6 +119,38 @@ fn interpreted_selection_all_matches_generated_code() {
                     Value::U32(value) => value,
                     value => panic!("unexpected interpreted value {value:?}"),
                 });
+        assert_eq!(generated, interpreted, "entry {entry}");
+    }
+}
+
+#[test]
+fn generated_lumi_mask_and_event_flags_match_interpreter() {
+    let spec = AnalysisSpec::from_toml_str(LUMI_MASK_TRIGGER_SPEC).unwrap();
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let plan = validate(&spec, &catalogue).unwrap();
+
+    let expected = [
+        Some(0_u32), // run 1001, LS 1: certified, trigger/filter pass
+        None,        // run 1001, LS 4: outside the mask
+        Some(0_u32), // run 1002, LS 5: single-LS certified range
+        None,        // trigger fails
+        None,        // MET filter fails
+        None,        // run is not in the mask
+    ];
+    for (entry, expected) in expected.into_iter().enumerate() {
+        let event = lumi_mask_event(entry);
+        let generated = nano_gen_demo::lumi_mask_trigger::GeneratedProducer::analyze(&event)
+            .unwrap()
+            .map(|row| row.n_good_muon);
+        let interpreted =
+            interpret(&plan, &event)
+                .unwrap()
+                .map(|row| match row.get("n_good_muon").unwrap() {
+                    Value::U32(value) => value,
+                    value => panic!("unexpected interpreted value {value:?}"),
+                });
+        assert_eq!(generated, expected, "generated entry {entry}");
+        assert_eq!(interpreted, expected, "interpreted entry {entry}");
         assert_eq!(generated, interpreted, "entry {entry}");
     }
 }
@@ -506,6 +540,51 @@ fn generated_muon_as_skim(event: &Event) -> nano_core::Result<Option<MuonSkimRow
 
 fn synthetic_event(entry: usize) -> Event {
     Event::from_columns(schema(), columns(), entry).unwrap()
+}
+
+fn lumi_mask_event(entry: usize) -> Event {
+    Event::from_columns(lumi_mask_schema(), lumi_mask_columns(), entry).unwrap()
+}
+
+fn lumi_mask_schema() -> BranchSchema {
+    BranchSchema::new([
+        BranchSpec::new("Flag_goodVertices", BranchType::Bool),
+        BranchSpec::new("HLT_IsoMu24", BranchType::Bool),
+        BranchSpec::new("luminosityBlock", BranchType::U32),
+        BranchSpec::new("Muon_pt", BranchType::VecF32),
+        BranchSpec::new("nMuon", BranchType::U32),
+        BranchSpec::new("run", BranchType::U32),
+    ])
+    .unwrap()
+}
+
+fn lumi_mask_columns() -> Vec<(String, BranchColumn)> {
+    vec![
+        (
+            "Flag_goodVertices".to_string(),
+            BranchColumn::Bool(vec![true, true, true, true, false, true]),
+        ),
+        (
+            "HLT_IsoMu24".to_string(),
+            BranchColumn::Bool(vec![true, true, true, false, true, true]),
+        ),
+        (
+            "luminosityBlock".to_string(),
+            BranchColumn::U32(vec![1, 4, 5, 2, 10, 1]),
+        ),
+        (
+            "Muon_pt".to_string(),
+            BranchColumn::VecF32(vec![vec![], vec![], vec![], vec![], vec![], vec![]]),
+        ),
+        (
+            "nMuon".to_string(),
+            BranchColumn::U32(vec![0, 0, 0, 0, 0, 0]),
+        ),
+        (
+            "run".to_string(),
+            BranchColumn::U32(vec![1001, 1001, 1002, 1001, 1001, 9999]),
+        ),
+    ]
 }
 
 fn reference_sf_weight(event: &Event, systematic: &str) -> f64 {

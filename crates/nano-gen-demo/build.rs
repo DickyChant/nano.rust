@@ -48,6 +48,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "generated_muon_hist_shape_correction.rs",
         ),
         ("muon_sf.toml", "generated_muon_sf.rs"),
+        ("lumi_mask_trigger.toml", "generated_lumi_mask_trigger.rs"),
     ] {
         let spec_path = repo_root.join("crates/nano-spec/examples").join(spec_file);
         println!("cargo:rerun-if-changed={}", spec_path.display());

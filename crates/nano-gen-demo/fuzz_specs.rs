@@ -511,6 +511,7 @@ fn generated_union_spec(index: usize) -> GeneratedSpec {
         spec: AnalysisSpec {
             name: format!("fuzz_union_diff_{index:03}"),
             year: Year::Run2018,
+            lumi_mask: None,
             objects: Vec::new(),
             derived_objects: Vec::new(),
             models: Vec::new(),
@@ -693,6 +694,7 @@ fn generated_standard_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec 
         spec: AnalysisSpec {
             name: format!("fuzz_diff_{index:03}"),
             year: Year::Run2018,
+            lumi_mask: None,
             objects,
             derived_objects,
             models: Vec::new(),
@@ -781,6 +783,7 @@ fn generated_model_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
         spec: AnalysisSpec {
             name: format!("fuzz_model_diff_{index:03}"),
             year: Year::Run2018,
+            lumi_mask: None,
             objects: vec![selected, tagged],
             derived_objects: Vec::new(),
             models: vec![ModelDef {

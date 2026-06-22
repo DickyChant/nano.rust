@@ -36,6 +36,7 @@ pub struct KirProgram {
     pub block: Block,
     pub read_branches: Vec<BranchSpec>,
     pub model_outputs: Vec<String>,
+    pub lumi_mask: Option<crate::LumiMaskDef>,
     pub objects: Vec<KirObject>,
     pub derived_objects: Vec<KirDerivedObject>,
     pub regions: Vec<KirRegion>,
@@ -113,6 +114,9 @@ pub enum Rvalue {
     },
     Requirement {
         requirement: KirRequirement,
+    },
+    LumiMask {
+        mask: crate::LumiMask,
     },
     Output {
         expr: crate::Expr,
@@ -255,6 +259,11 @@ pub fn lower_to_kir(core: &CoreIr) -> Result<KirProgram, KirError> {
         let rvalue = match &expr.kind {
             ExprKind::Literal(value) => Rvalue::Literal(*value),
             ExprKind::Quantity(quantity) => Rvalue::Quantity(quantity.clone()),
+            ExprKind::EventScalar { branch } => Rvalue::Attr {
+                object: core::ObjectId(usize::MAX),
+                attr: branch.clone(),
+                branch: Some(branch.clone()),
+            },
             ExprKind::Attr {
                 object,
                 attr,
@@ -316,6 +325,7 @@ pub fn lower_to_kir(core: &CoreIr) -> Result<KirProgram, KirError> {
         block,
         read_branches: Vec::new(),
         model_outputs: Vec::new(),
+        lumi_mask: None,
         objects: core
             .objects
             .iter()
@@ -427,6 +437,7 @@ pub fn lower_plan_to_kir(plan: &ResolvedPlan) -> Result<KirProgram, KirError> {
         })
         .collect();
     program.systematics = plan.spec.systematics.clone();
+    program.lumi_mask = plan.spec.lumi_mask.clone();
     program.shape_corrections = plan
         .spec
         .shape_corrections
@@ -468,6 +479,25 @@ pub fn lower_plan_to_kir(plan: &ResolvedPlan) -> Result<KirProgram, KirError> {
 fn executable_block(program: &KirProgram) -> Result<Block, KirError> {
     let mut block = Block::default();
     let mut next_value = 0_usize;
+
+    if let Some(mask) = &program.lumi_mask {
+        let ranges = mask.ranges.clone().ok_or_else(|| {
+            KirError::Lower(format!(
+                "lumi_mask `{}` was not resolved before KIR lowering",
+                mask.file
+            ))
+        })?;
+        let condition = ValueId(next_value);
+        next_value += 1;
+        block.stmts.push(Stmt::Let {
+            value: TypedValue {
+                id: condition,
+                ty: Type::Bool,
+            },
+            expr: Rvalue::LumiMask { mask: ranges },
+        });
+        block.stmts.push(Stmt::Require { condition });
+    }
 
     for object in &program.objects {
         let value = TypedValue {
@@ -647,7 +677,9 @@ fn derived_dependencies(object: &DerivedObjectDef) -> Vec<String> {
 fn output_expr_type(expr: &Expr) -> Type {
     match expr {
         Expr::Count(_) | Expr::CountWhere { .. } => Type::Int,
-        Expr::All { .. } | Expr::Any { .. } | Expr::EitherPairPt { .. } => Type::Bool,
+        Expr::EventScalar(_) | Expr::All { .. } | Expr::Any { .. } | Expr::EitherPairPt { .. } => {
+            Type::Bool
+        }
         Expr::Attr { .. }
         | Expr::Literal(_)
         | Expr::Binary { .. }
@@ -708,6 +740,10 @@ fn verify_requirement_expr(
     context: &str,
 ) -> Result<RequirementExprType, KirError> {
     match expr {
+        Expr::EventScalar(branch) => {
+            require_event_scalar_branch(program, branch, context)?;
+            Ok(RequirementExprType::Bool)
+        }
         Expr::Count(object) => {
             require_object(program, object, context)?;
             Ok(RequirementExprType::Count)
@@ -853,6 +889,30 @@ fn require_object<'a>(
         .iter()
         .find(|candidate| candidate.name == object)
         .ok_or_else(|| KirError::Lower(format!("{context}: unknown object `{object}`")))
+}
+
+fn require_event_scalar_branch(
+    program: &KirProgram,
+    branch: &str,
+    context: &str,
+) -> Result<(), KirError> {
+    let Some(spec) = program
+        .read_branches
+        .iter()
+        .find(|spec| spec.name == branch)
+    else {
+        return Err(KirError::Lower(format!(
+            "{context}: event scalar branch `{branch}` is missing from read schema"
+        )));
+    };
+    if spec.branch_type == BranchType::Bool {
+        Ok(())
+    } else {
+        Err(KirError::Lower(format!(
+            "{context}: event scalar branch `{branch}` has type {}, expected bool",
+            raw_branch_type(spec.branch_type)
+        )))
+    }
 }
 
 fn require_object_attr(
@@ -1143,6 +1203,7 @@ fn verify_rvalue(
         Rvalue::SelectObjects { .. } => Ok(Type::ObjectSet),
         Rvalue::DeriveObject { .. } => Ok(Type::Candidate),
         Rvalue::Requirement { .. } => Ok(Type::Bool),
+        Rvalue::LumiMask { .. } => Ok(Type::Bool),
         Rvalue::Output { ty, .. } => Ok(ty.clone()),
         Rvalue::Histogram { .. } => Ok(Type::Histogram),
         Rvalue::HistogramValue { ty, .. } => Ok(ty.clone()),

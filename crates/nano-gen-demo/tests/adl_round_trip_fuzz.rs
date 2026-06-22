@@ -182,6 +182,7 @@ fn expr_uses_candidate_filter_expr(expr: &Expr) -> bool {
         | Expr::All { predicate, .. }
         | Expr::Any { predicate, .. } => expr_uses_candidate_filter_expr(&predicate.lhs),
         Expr::Attr { .. }
+        | Expr::EventScalar(_)
         | Expr::Literal(_)
         | Expr::Count(_)
         | Expr::SumAttr { .. }

@@ -338,6 +338,7 @@ impl<'a> Generator<'a> {
         error_mapper: Option<&str>,
     ) -> Result<(), CodegenError> {
         let mut requirement_conditions = BTreeMap::new();
+        let mut event_guard_conditions = BTreeSet::new();
         let mut output_exprs = BTreeMap::new();
         let mut histogram_fields = BTreeMap::new();
         let mut histogram_values = BTreeMap::new();
@@ -369,12 +370,33 @@ impl<'a> Generator<'a> {
                         }
                     },
                     Rvalue::Requirement { requirement } => {
-                        let condition = self.emit_region_requirement(
-                            &requirement.lhs,
-                            requirement.op,
-                            requirement.rhs.value,
-                        )?;
+                        let condition = if let Expr::EventScalar(branch) = &requirement.lhs {
+                            let ident = format!("event_scalar_requirement_{}", value.id.0);
+                            writeln!(
+                                source,
+                                "        let {ident} = event.scalar::<bool>({})?;",
+                                rust_string(branch)
+                            )
+                            .unwrap();
+                            bool_comparison_expr(
+                                ident,
+                                requirement.op,
+                                requirement.rhs.value,
+                                "region requirement",
+                            )?
+                        } else {
+                            self.emit_region_requirement(
+                                &requirement.lhs,
+                                requirement.op,
+                                requirement.rhs.value,
+                            )?
+                        };
                         requirement_conditions.insert(value.id, condition);
+                    }
+                    Rvalue::LumiMask { mask } => {
+                        requirement_conditions
+                            .insert(value.id, self.emit_lumi_mask_condition(mask)?);
+                        event_guard_conditions.insert(value.id);
                     }
                     Rvalue::Output { expr, .. } => {
                         output_exprs.insert(value.id, expr.clone());
@@ -394,6 +416,18 @@ impl<'a> Generator<'a> {
                     }
                 },
                 Stmt::Require { condition } => {
+                    let is_event_guard = event_guard_conditions.remove(condition);
+                    let condition = requirement_conditions.remove(condition).ok_or_else(|| {
+                        CodegenError::UnsupportedFeature(format!(
+                            "KIR require references missing condition {condition:?}"
+                        ))
+                    })?;
+                    if is_event_guard {
+                        writeln!(source, "        if !({condition}) {{").unwrap();
+                        writeln!(source, "            return Ok(None);").unwrap();
+                        writeln!(source, "        }}").unwrap();
+                        continue;
+                    }
                     self.emit_empty_kir_regions(
                         source,
                         kir,
@@ -401,11 +435,6 @@ impl<'a> Generator<'a> {
                         &mut emitted_baseline,
                         &mut emitted_derived_region_unwraps,
                     )?;
-                    let condition = requirement_conditions.remove(condition).ok_or_else(|| {
-                        CodegenError::UnsupportedFeature(format!(
-                            "KIR require references missing condition {condition:?}"
-                        ))
-                    })?;
                     pending_region_conditions.push(condition);
                     let Some(region) = kir.regions.get(region_index) else {
                         return Err(CodegenError::UnsupportedFeature(
@@ -890,6 +919,12 @@ impl<'a> Generator<'a> {
         for region in &self.spec().regions {
             checked_ident(&region.name, "region name")?;
             for requirement in &region.require {
+                if self.spec().lumi_mask.is_some() && !self.spec().models.is_empty() {
+                    return Err(CodegenError::UnsupportedFeature(
+                        "lumi_mask codegen is only supported for KIR-generated producers"
+                            .to_string(),
+                    ));
+                }
                 if self.spec().models.is_empty() || !self.spec().derived_objects.is_empty() {
                     self.validate_region_expr(&requirement.lhs, "region requirement")?;
                     if matches!(requirement.lhs, Expr::Count(_)) {
@@ -2933,6 +2968,15 @@ impl<'a> Generator<'a> {
         rhs: f64,
     ) -> Result<String, CodegenError> {
         match lhs {
+            Expr::EventScalar(branch) => {
+                let branch = rust_string(branch);
+                Ok(bool_comparison_expr(
+                    format!("event.scalar::<bool>({branch})?"),
+                    op,
+                    rhs,
+                    "region requirement",
+                )?)
+            }
             Expr::Count(object) => {
                 let lhs = count_ident(object)?;
                 let rhs = checked_count_rhs(rhs, "region requirement")?;
@@ -3029,6 +3073,33 @@ impl<'a> Generator<'a> {
                 "region requirement `{other}` is not supported by this slice"
             ))),
         }
+    }
+
+    fn emit_lumi_mask_condition(&self, mask: &crate::LumiMask) -> Result<String, CodegenError> {
+        let mut arms = Vec::new();
+        for (run, ranges) in mask.ranges_by_run() {
+            let ranges = ranges
+                .iter()
+                .map(|range| {
+                    format!(
+                        "nano_spec::LumiRange {{ start: {}_u32, end: {}_u32 }}",
+                        range.start, range.end
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            arms.push(format!(
+                "{run}_u32 => nano_spec::lumi_mask_contains_ranges(&[{ranges}], luminosity_block)"
+            ));
+        }
+        let match_arms = if arms.is_empty() {
+            "_ => false".to_string()
+        } else {
+            format!("{}, _ => false", arms.join(", "))
+        };
+        Ok(format!(
+            "event.is_mc() || {{ let run = event.scalar::<u32>(\"run\")?; let luminosity_block = event.scalar::<u32>(\"luminosityBlock\")?; match run {{ {match_arms} }} }}"
+        ))
     }
 
     fn emit_collection_bool_expr(
@@ -3183,6 +3254,16 @@ impl<'a> Generator<'a> {
 
     fn validate_region_expr(&self, expr: &Expr, context: &str) -> Result<(), CodegenError> {
         match expr {
+            Expr::EventScalar(branch) => {
+                let branch_type = self.branch_type(branch)?;
+                if branch_type == BranchType::Bool {
+                    Ok(())
+                } else {
+                    Err(CodegenError::UnsupportedFeature(format!(
+                        "{context}: event scalar branch `{branch}` has type {branch_type:?}; this slice only emits bool event requirements"
+                    )))
+                }
+            }
             Expr::Count(object) => {
                 self.object(object)?;
                 Ok(())
@@ -4079,7 +4160,7 @@ fn collect_selected_attr_names(
             attrs.insert(attr.clone());
             Ok(())
         }
-        Expr::Attr { .. } | Expr::Literal(_) | Expr::Count(_) => Ok(()),
+        Expr::EventScalar(_) | Expr::Attr { .. } | Expr::Literal(_) | Expr::Count(_) => Ok(()),
         Expr::LeadingAttr { object, attr } if object == object_name => {
             attrs.insert(attr.clone());
             Ok(())

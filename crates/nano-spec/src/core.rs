@@ -87,6 +87,9 @@ pub struct ExprNode {
 pub enum ExprKind {
     Literal(f64),
     Quantity(Quantity),
+    EventScalar {
+        branch: String,
+    },
     Attr {
         object: ObjectId,
         attr: String,
