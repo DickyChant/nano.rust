@@ -19,6 +19,7 @@
 //! weight nominal [<factor>, ...];
 //! systematic <name> kind weight up <factor> down <factor>;
 //! correction <name> kind scale collection <object> attr <attr> up <factor> down <factor>;
+//! model <name> { inputs <branch>[, ...]; output <branch>; batch <object>; provider <kind>; }
 //! ```
 //!
 //! Pair objects also accept `comb(<object>, 2)`, `same_flavor`,
@@ -29,18 +30,19 @@
 //! as an alias for `combine(...)` and `filter <comparison>` statements.
 //!
 //! [`to_adl_string`] emits the same surface for specs that fit this grammar.
-//! The current ADL grammar has no surface for model bindings, multi-channel
-//! unions, or built-in JES/JER systematic enum declarations. Those constructs
-//! must be skipped by callers that need exact `AnalysisSpec` round trips.
+//! The current ADL grammar has no surface for multi-channel unions or built-in
+//! JES/JER systematic enum declarations. Those constructs must be skipped by
+//! callers that need exact `AnalysisSpec` round trips.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     analysis_spec_from_raw, validate_identifier, AnalysisSpec, ArithOp, CmpOp, Cut,
-    DerivedObjectDef, DerivedSource, Expr, HistogramDef, ObjectDef, PairConstraint, PairSelection,
-    ParseError, Quantity, RawAnalysis, RawAnalysisSpec, RawCorrection, RawDerivedObject,
-    RawHistogram, RawObject, RawOutput, RawRegion, RawSystematic, RawWeight, RegionDef,
-    ShapeCorrectionDef, SystematicDef, Unit, Year,
+    DerivedObjectDef, DerivedSource, Expr, HistogramDef, ModelDef, ModelOutputDType,
+    ModelProviderKind, ObjectDef, PairConstraint, PairSelection, ParseError, Quantity, RawAnalysis,
+    RawAnalysisSpec, RawCorrection, RawDerivedObject, RawHistogram, RawModel, RawModelProvider,
+    RawObject, RawOutput, RawRegion, RawSystematic, RawWeight, RegionDef, ShapeCorrectionDef,
+    SystematicDef, Unit, Year,
 };
 
 pub fn parse_adl(input: &str) -> Result<AnalysisSpec, ParseError> {
@@ -92,6 +94,10 @@ pub fn to_adl_string(spec: &AnalysisSpec) -> String {
         write_object(&mut out, object);
         out.push('\n');
     }
+    for model in &spec.models {
+        write_model(&mut out, model);
+        out.push('\n');
+    }
     for derived in &spec.derived_objects {
         write_derived_object(&mut out, derived);
         out.push('\n');
@@ -120,12 +126,12 @@ pub fn to_adl_string(spec: &AnalysisSpec) -> String {
 
 fn assert_adl_representable(spec: &AnalysisSpec) {
     assert!(
-        spec.models.is_empty(),
-        "ADL emitter cannot render model bindings"
-    );
-    assert!(
         spec.channels.is_empty(),
         "ADL emitter cannot render multi-channel unions"
+    );
+    assert!(
+        spec.models.iter().all(model_has_adl_provider_surface),
+        "ADL emitter cannot render model providers other than plain kind bindings"
     );
     assert!(
         spec.shape_corrections
@@ -169,6 +175,30 @@ fn write_object(out: &mut String, object: &ObjectDef) {
         out.push_str(&cut_to_adl(cut));
         out.push_str(";\n");
     }
+    out.push_str("}\n");
+}
+
+fn write_model(out: &mut String, model: &ModelDef) {
+    out.push_str("model ");
+    out.push_str(&model.name);
+    out.push_str(" {\n");
+    out.push_str("  inputs ");
+    out.push_str(&model.inputs.join(", "));
+    out.push_str(";\n");
+    out.push_str("  output ");
+    out.push_str(&model.output);
+    out.push_str(";\n");
+    if !matches!(model.output_dtype, ModelOutputDType::F32) {
+        out.push_str("  output_dtype ");
+        out.push_str(model_output_dtype_to_adl(model.output_dtype));
+        out.push_str(";\n");
+    }
+    out.push_str("  batch ");
+    out.push_str(&model.batch);
+    out.push_str(";\n");
+    out.push_str("  provider ");
+    out.push_str(model_provider_kind_to_adl(&model.provider.kind));
+    out.push_str(";\n");
     out.push_str("}\n");
 }
 
@@ -376,6 +406,29 @@ fn arith_op_to_adl(op: ArithOp) -> &'static str {
     }
 }
 
+fn model_output_dtype_to_adl(dtype: ModelOutputDType) -> &'static str {
+    match dtype {
+        ModelOutputDType::F32 => "F32",
+    }
+}
+
+fn model_provider_kind_to_adl(kind: &ModelProviderKind) -> &str {
+    match kind {
+        ModelProviderKind::Mock => "mock",
+        ModelProviderKind::InProcess => "inproc",
+        ModelProviderKind::Remote => "remote",
+        ModelProviderKind::Managed => "managed",
+        ModelProviderKind::Other(kind) => kind,
+    }
+}
+
+fn model_has_adl_provider_surface(model: &ModelDef) -> bool {
+    model.provider.endpoint.is_none()
+        && model.provider.launch.is_none()
+        && model.provider.onnx_path.is_none()
+        && !matches!(model.provider.kind, ModelProviderKind::Other(_))
+}
+
 fn year_to_string(year: &Year) -> String {
     match year {
         Year::Run2016 => "Run2016".to_string(),
@@ -406,6 +459,7 @@ struct Parser {
     object_order: Vec<String>,
     derived: BTreeMap<String, RawDerivedObject>,
     derived_order: Vec<String>,
+    models: Vec<RawModel>,
     regions: BTreeMap<String, RawRegion>,
     region_order: Vec<String>,
     outputs: Vec<RawOutput>,
@@ -427,6 +481,7 @@ impl Parser {
             object_order: Vec::new(),
             derived: BTreeMap::new(),
             derived_order: Vec::new(),
+            models: Vec::new(),
             regions: BTreeMap::new(),
             region_order: Vec::new(),
             outputs: Vec::new(),
@@ -445,6 +500,8 @@ impl Parser {
                 self.parse_analysis()?;
             } else if self.consume_keyword("object") {
                 self.parse_object()?;
+            } else if self.consume_keyword("model") {
+                self.parse_model()?;
             } else if self.consume_keyword("region") {
                 self.parse_region()?;
             } else if self.consume_keyword("define") || self.consume_keyword("alias") {
@@ -460,7 +517,7 @@ impl Parser {
             } else if self.consume_keyword("correction") {
                 self.parse_correction()?;
             } else {
-                return self.err("expected `analysis`, `object`, `region`, `define`, `alias`, `output`, `histogram`, `weight`, `systematic`, or `correction`");
+                return self.err("expected `analysis`, `object`, `model`, `region`, `define`, `alias`, `output`, `histogram`, `weight`, `systematic`, or `correction`");
             }
         }
 
@@ -472,7 +529,7 @@ impl Parser {
             analysis,
             objects: self.objects,
             derived: self.derived,
-            models: Vec::new(),
+            models: self.models,
             regions: self.regions,
             outputs: self.outputs,
             histograms: self.histograms,
@@ -632,6 +689,97 @@ impl Parser {
             target: None,
             exclude: Vec::new(),
         })
+    }
+
+    fn parse_model(&mut self) -> Result<(), ParseError> {
+        let name = self.parse_identifier("model name")?;
+        let body = self.parse_block()?;
+        let mut inputs = None;
+        let mut output = None;
+        let mut dtype = None;
+        let mut batch = None;
+        let mut provider = None;
+
+        for stmt in block_statements(&body) {
+            let stmt = stmt.trim();
+            if let Some(value) = stmt.strip_prefix("inputs ") {
+                if inputs.is_some() {
+                    return Err(ParseError::InvalidSpec(format!(
+                        "failed to parse ADL model `{name}`: duplicate `inputs`"
+                    )));
+                }
+                inputs = Some(parse_model_inputs(value.trim(), &name)?);
+            } else if let Some(value) = stmt.strip_prefix("output_dtype ") {
+                if dtype.is_some() {
+                    return Err(ParseError::InvalidSpec(format!(
+                        "failed to parse ADL model `{name}`: duplicate `output_dtype`"
+                    )));
+                }
+                dtype = Some(parse_model_single_value(
+                    value.trim(),
+                    &name,
+                    "output_dtype",
+                )?);
+            } else if let Some(value) = stmt.strip_prefix("dtype ") {
+                if dtype.is_some() {
+                    return Err(ParseError::InvalidSpec(format!(
+                        "failed to parse ADL model `{name}`: duplicate `dtype`"
+                    )));
+                }
+                dtype = Some(parse_model_single_value(value.trim(), &name, "dtype")?);
+            } else if let Some(value) = stmt.strip_prefix("output ") {
+                if output.is_some() {
+                    return Err(ParseError::InvalidSpec(format!(
+                        "failed to parse ADL model `{name}`: duplicate `output`"
+                    )));
+                }
+                output = Some(parse_model_single_value(value.trim(), &name, "output")?);
+            } else if let Some(value) = stmt.strip_prefix("batch ") {
+                if batch.is_some() {
+                    return Err(ParseError::InvalidSpec(format!(
+                        "failed to parse ADL model `{name}`: duplicate `batch`"
+                    )));
+                }
+                batch = Some(parse_model_single_value(value.trim(), &name, "batch")?);
+            } else if let Some(value) = stmt.strip_prefix("provider ") {
+                if provider.is_some() {
+                    return Err(ParseError::InvalidSpec(format!(
+                        "failed to parse ADL model `{name}`: duplicate `provider`"
+                    )));
+                }
+                provider = Some(parse_model_provider(value.trim(), &name)?);
+            } else {
+                return Err(ParseError::InvalidSpec(format!(
+                    "failed to parse ADL model `{name}`: unsupported statement `{stmt}`"
+                )));
+            }
+        }
+
+        self.models.push(RawModel {
+            name: name.clone(),
+            inputs: inputs.ok_or_else(|| {
+                ParseError::InvalidSpec(format!(
+                    "failed to parse ADL model `{name}`: missing `inputs`"
+                ))
+            })?,
+            output: output.ok_or_else(|| {
+                ParseError::InvalidSpec(format!(
+                    "failed to parse ADL model `{name}`: missing `output`"
+                ))
+            })?,
+            dtype,
+            batch: batch.ok_or_else(|| {
+                ParseError::InvalidSpec(format!(
+                    "failed to parse ADL model `{name}`: missing `batch`"
+                ))
+            })?,
+            provider: Some(provider.ok_or_else(|| {
+                ParseError::InvalidSpec(format!(
+                    "failed to parse ADL model `{name}`: missing `provider`"
+                ))
+            })?),
+        });
+        Ok(())
     }
 
     fn parse_region(&mut self) -> Result<(), ParseError> {
@@ -1138,6 +1286,45 @@ fn split_args(input: &str) -> Vec<&str> {
     }
     args.push(input[start..].trim());
     args
+}
+
+fn parse_model_inputs(input: &str, name: &str) -> Result<Vec<String>, ParseError> {
+    let inputs = split_args(input)
+        .into_iter()
+        .map(str::trim)
+        .filter(|input| !input.is_empty())
+        .map(|input| {
+            validate_identifier(input, &format!("ADL model `{name}` input"))?;
+            Ok(input.to_string())
+        })
+        .collect::<Result<Vec<_>, ParseError>>()?;
+    if inputs.is_empty() {
+        return Err(ParseError::InvalidSpec(format!(
+            "failed to parse ADL model `{name}`: `inputs` must list at least one branch"
+        )));
+    }
+    Ok(inputs)
+}
+
+fn parse_model_single_value(value: &str, name: &str, field: &str) -> Result<String, ParseError> {
+    let args = value.split_whitespace().collect::<Vec<_>>();
+    if args.len() != 1 {
+        return Err(ParseError::InvalidSpec(format!(
+            "failed to parse ADL model `{name}`: `{field}` expects one value"
+        )));
+    }
+    validate_identifier(args[0], &format!("ADL model `{name}` {field}"))?;
+    Ok(args[0].to_string())
+}
+
+fn parse_model_provider(value: &str, name: &str) -> Result<RawModelProvider, ParseError> {
+    let value = value.strip_prefix("kind ").unwrap_or(value).trim();
+    Ok(RawModelProvider {
+        kind: Some(parse_model_single_value(value, name, "provider")?),
+        endpoint: None,
+        launch: None,
+        onnx_path: None,
+    })
 }
 
 fn parse_range(input: &str, name: &str) -> Result<[f64; 2], ParseError> {

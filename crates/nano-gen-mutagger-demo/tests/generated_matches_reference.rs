@@ -6,31 +6,44 @@ use nano_gen_mutagger_demo::reference::{
 use nano_gen_mutagger_demo::{GenRow, GeneratedProducer};
 use nano_inference::MockPredictor;
 use nano_spec::interpret::{interpret_and_fill, InterpretError, InterpretedHistograms};
-use nano_spec::{validate, AnalysisSpec, Catalogue};
+use nano_spec::{lower, to_adl_string, validate, AnalysisSpec, Catalogue};
 
 const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 const MUTAGGER_TOML: &str = include_str!("../../nano-spec/examples/mutagger_cr.toml");
 const MUTAGGER_ADL: &str = include_str!("../../nano-spec/examples/mutagger_cr.adl");
 
 #[test]
-fn mutagger_cr_adl_documents_current_model_surface_gap() {
+fn mutagger_cr_adl_matches_toml_including_model_surface() {
     let toml_spec = AnalysisSpec::from_toml_str(MUTAGGER_TOML).expect("parse TOML spec");
-    let adl_spec = AnalysisSpec::from_adl_str(MUTAGGER_ADL).expect("parse scoped ADL spec");
+    let adl_spec = AnalysisSpec::from_adl_str(MUTAGGER_ADL).expect("parse ADL spec");
 
-    assert_eq!(toml_spec.models.len(), 1);
-    assert!(
-        adl_spec.models.is_empty(),
-        "current ADL grammar should not silently invent model bindings"
-    );
-    assert_ne!(
-        adl_spec, toml_spec,
-        "ADL and TOML cannot round-trip while ADL has no model surface"
+    assert_eq!(adl_spec, toml_spec, "ADL and TOML AnalysisSpec differ");
+    assert_eq!(adl_spec.models.len(), 1);
+    assert_eq!(adl_spec.models, toml_spec.models);
+    let emitted_adl = to_adl_string(&toml_spec);
+    let emitted_spec = AnalysisSpec::from_adl_str(&emitted_adl).expect("parse emitted ADL spec");
+    assert_eq!(
+        emitted_spec, toml_spec,
+        "model-bearing ADL emitter round-trip changed the spec"
     );
 
     let catalogue =
         Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
-    validate(&toml_spec, &catalogue).expect("validate TOML spec");
-    validate(&adl_spec, &catalogue).expect("validate scoped ADL spec");
+    let toml_core = lower(&toml_spec, &catalogue).expect("lower TOML spec");
+    let adl_core = lower(&adl_spec, &catalogue).expect("lower ADL spec");
+    assert_eq!(adl_core, toml_core, "ADL and TOML Core IR differ");
+
+    let toml_plan = validate(&toml_spec, &catalogue).expect("validate TOML spec");
+    let adl_plan = validate(&adl_spec, &catalogue).expect("validate ADL spec");
+    assert_eq!(
+        adl_plan.spec, toml_plan.spec,
+        "ADL and TOML plan specs differ"
+    );
+    assert_eq!(
+        adl_plan.read_branches.specs(),
+        toml_plan.read_branches.specs(),
+        "ADL and TOML plan read branches differ"
+    );
 }
 
 #[test]
