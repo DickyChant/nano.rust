@@ -14,7 +14,8 @@ use nano_core::BranchType;
 use crate::kir::{ForEachAxis, KirProgram, Rvalue, Stmt, ValueId};
 use crate::{
     AnalysisSpec, ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef,
-    ObjectCandidateDef, ObjectDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
+    ModelProviderKind, ObjectCandidateDef, ObjectDef, ObjectPairDef, PairConstraint, PairSelection,
+    ResolvedPlan,
 };
 
 /// Generate compilable Rust producer source from a validated plan.
@@ -702,9 +703,10 @@ impl<'a> Generator<'a> {
             .unwrap();
             writeln!(source, "    }}").unwrap();
         }
-        let systematic_param = if !self.spec().histograms.is_empty()
-            && kir.is_some()
-            && !self.spec().has_weight_systematic()
+        let systematic_param = if self.spec().has_shape_correction()
+            || (!self.spec().histograms.is_empty()
+                && kir.is_some()
+                && !self.spec().has_weight_systematic())
         {
             "systematic"
         } else {
@@ -715,12 +717,18 @@ impl<'a> Generator<'a> {
         } else {
             "histograms"
         };
+        let predictor_param = if self.spec().has_shape_correction() {
+            "_predictor"
+        } else {
+            "predictor"
+        };
         writeln!(
             source,
-            "    fn analyze_impl(event: &nano_core::Event, predictor: &impl nano_inference::Predictor, {histograms_param}: Option<&mut GenHistograms>, {systematic_param}: Systematic) -> GenResult<Option<GenRow>> {{"
+            "    fn analyze_impl(event: &nano_core::Event, {predictor_param}: &impl nano_inference::Predictor, {histograms_param}: Option<&mut GenHistograms>, {systematic_param}: Systematic) -> GenResult<Option<GenRow>> {{"
         )
         .unwrap();
 
+        self.emit_shape_factor_bindings(&mut source)?;
         for model in &self.spec().models {
             self.emit_model_inference(&mut source, model)?;
         }
@@ -852,11 +860,6 @@ impl<'a> Generator<'a> {
     }
 
     fn validate_supported_spec(&self) -> Result<(), CodegenError> {
-        if !self.spec().models.is_empty() && self.spec().has_shape_correction() {
-            return Err(CodegenError::UnsupportedFeature(
-                "shape corrections are not yet supported by model-aware codegen".to_string(),
-            ));
-        }
         for object in &self.spec().objects {
             checked_ident(&object.name, "object name")?;
             checked_ident(&object.source, "object source")?;
@@ -948,6 +951,15 @@ impl<'a> Generator<'a> {
 
         for model in &self.spec().models {
             checked_ident(&model.name, "model name")?;
+            if self.spec().has_shape_correction()
+                && !matches!(model.provider.kind, ModelProviderKind::Mock)
+            {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "model `{}` uses provider `{}`; model+shape codegen currently supports only mock providers",
+                    model.name,
+                    provider_kind_name(&model.provider.kind)
+                )));
+            }
             self.model_type_ident(model)?;
             self.model_batch_source(model)?;
             let (_, output_attr) = split_model_output(&model.output)?;
@@ -1345,7 +1357,51 @@ impl<'a> Generator<'a> {
         let region_event = checked_ident(&region.name, "region event")?;
         let region_type = region_type_ident(&region.name)?;
         writeln!(source, "        if let Some(histograms) = histograms {{").unwrap();
-        if self.spec().has_weight_systematic() {
+        if self.spec().has_shape_correction() {
+            self.emit_weight_visitor(source)?;
+            writeln!(
+                source,
+                "            let weight = systematic.visit(GenWeightVisitor);"
+            )
+            .unwrap();
+            writeln!(source, "            match systematic {{").unwrap();
+            for systematic in self.generated_systematics()? {
+                writeln!(
+                    source,
+                    "                Systematic::{} => {{",
+                    systematic.variant
+                )
+                .unwrap();
+                if matches!(systematic.source, GeneratedSystematicSource::Nominal) {
+                    writeln!(
+                        source,
+                        "                    let weighted = {region_event}_event.weight(weight);"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        source,
+                        "                    let weighted = {region_event}_event.weight_for::<{}>(weight);",
+                        systematic.marker
+                    )
+                    .unwrap();
+                }
+                for histogram in &self.spec().histograms {
+                    let field = checked_ident(&histogram.name, "histogram field")?;
+                    let value = self.histogram_fill_value_expr(
+                        &histogram.expr,
+                        &self.emit_model_output_expr(&histogram.expr)?,
+                    )?;
+                    writeln!(
+                        source,
+                        "                    nano_analysis::fill_set::<{region_type}, _, _>(&mut histograms.{field}, systematic, &weighted, {value});"
+                    )
+                    .unwrap();
+                }
+                writeln!(source, "                }}").unwrap();
+            }
+            writeln!(source, "            }}").unwrap();
+        } else if self.spec().has_weight_systematic() {
             self.emit_weight_visitor(source)?;
             writeln!(
                 source,
@@ -2984,6 +3040,30 @@ impl<'a> Generator<'a> {
             .find(|correction| correction.collection == object_name && correction.attr == attr)
     }
 
+    fn shape_factor_for_source_attr(
+        &self,
+        source: &str,
+        attr: &str,
+    ) -> Result<Option<String>, CodegenError> {
+        let factors = self
+            .spec()
+            .shape_corrections()
+            .iter()
+            .filter(|correction| {
+                correction.attr == attr
+                    && self.spec().objects.iter().any(|object| {
+                        object.name == correction.collection && object.source == source
+                    })
+            })
+            .map(|correction| shape_factor_ident(&correction.collection, &correction.attr))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(match factors.len() {
+            0 => None,
+            1 => factors.into_iter().next(),
+            _ => Some(format!("({})", factors.join(" * "))),
+        })
+    }
+
     fn validate_derived_object(&self, derived: &DerivedObjectDef) -> Result<(), CodegenError> {
         match &derived.source {
             DerivedSource::Pair(pair) => {
@@ -3166,6 +3246,7 @@ impl<'a> Generator<'a> {
         let model_ident = checked_ident(&model.name, "model name")?;
         let type_ident = self.model_type_ident(model)?;
         let batch = self.model_batch_source(model)?;
+        let (_, output_attr) = split_model_output(&model.output)?;
         let n_inputs = model.inputs.len();
 
         writeln!(
@@ -3188,39 +3269,107 @@ impl<'a> Generator<'a> {
             self.emit_model_input_push(source, model, input)?;
         }
         writeln!(source, "        }}").unwrap();
-        writeln!(
-            source,
-            "        let {model_ident}_features = nano_analysis::Features::<{type_ident}>::from_tensors(vec![nano_inference::Tensor {{"
-        )
-        .unwrap();
-        writeln!(source, "            name: \"features\".to_string(),").unwrap();
-        writeln!(
-            source,
-            "            shape: vec![{model_ident}_collection.len(), {n_inputs}],"
-        )
-        .unwrap();
-        writeln!(
-            source,
-            "            data: nano_inference::TensorData::F32({model_ident}_values),"
-        )
-        .unwrap();
-        writeln!(source, "        }}]);").unwrap();
-        writeln!(
-            source,
-            "        let {model_ident}_baseline = nano_analysis::Ev::new(event)"
-        )
-        .unwrap();
-        writeln!(source, "            .preselect(|_| true)").unwrap();
-        writeln!(
-            source,
-            "            .expect(\"true generated preselection should always pass\");"
-        )
-        .unwrap();
-        writeln!(
-            source,
-            "        let _{model_ident}_scored = {model_ident}_baseline.infer::<{type_ident}>(predictor, {model_ident}_features)?;"
-        )
-        .unwrap();
+        if self.spec().has_shape_correction() {
+            writeln!(
+                source,
+                "        let {model_ident}_scores = nano_inference::mock_scores(&nano_inference::InferRequest {{"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "            model: {}.to_string(),",
+                rust_string(&model.name)
+            )
+            .unwrap();
+            writeln!(source, "            inputs: vec![nano_inference::Tensor {{").unwrap();
+            writeln!(source, "                name: \"features\".to_string(),").unwrap();
+            writeln!(
+                source,
+                "                shape: vec![{model_ident}_collection.len(), {n_inputs}],"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "                data: nano_inference::TensorData::F32({model_ident}_values),"
+            )
+            .unwrap();
+            writeln!(source, "            }}],").unwrap();
+            writeln!(source, "        }})?;").unwrap();
+            writeln!(
+                source,
+                "        if {model_ident}_scores.len() != {model_ident}_collection.len() {{"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "            return Err(nano_inference::InferError::ShapeMismatch {{ tensor: {}.to_string(), expected: vec![{model_ident}_collection.len()], actual: vec![{model_ident}_scores.len()] }});",
+                rust_string(output_attr)
+            )
+            .unwrap();
+            writeln!(source, "        }}").unwrap();
+            writeln!(
+                source,
+                "        let {model_ident}_baseline = nano_analysis::Ev::new(event)"
+            )
+            .unwrap();
+            writeln!(source, "            .preselect(|_| true)").unwrap();
+            writeln!(
+                source,
+                "            .expect(\"true generated preselection should always pass\");"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "        for ({model_ident}_item, {model_ident}_score) in {model_ident}_collection.iter().zip({model_ident}_scores.iter().copied()) {{"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "            {model_ident}_item.set({}, {model_ident}_score);",
+                rust_string(output_attr)
+            )
+            .unwrap();
+            writeln!(source, "        }}").unwrap();
+            writeln!(
+                source,
+                "        let _{model_ident}_scored = {model_ident}_baseline;"
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                source,
+                "        let {model_ident}_features = nano_analysis::Features::<{type_ident}>::from_tensors(vec![nano_inference::Tensor {{"
+            )
+            .unwrap();
+            writeln!(source, "            name: \"features\".to_string(),").unwrap();
+            writeln!(
+                source,
+                "            shape: vec![{model_ident}_collection.len(), {n_inputs}],"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "            data: nano_inference::TensorData::F32({model_ident}_values),"
+            )
+            .unwrap();
+            writeln!(source, "        }}]);").unwrap();
+            writeln!(
+                source,
+                "        let {model_ident}_baseline = nano_analysis::Ev::new(event)"
+            )
+            .unwrap();
+            writeln!(source, "            .preselect(|_| true)").unwrap();
+            writeln!(
+                source,
+                "            .expect(\"true generated preselection should always pass\");"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "        let _{model_ident}_scored = {model_ident}_baseline.infer::<{type_ident}>(predictor, {model_ident}_features)?;"
+            )
+            .unwrap();
+        }
         writeln!(source).unwrap();
         Ok(())
     }
@@ -3291,11 +3440,19 @@ impl<'a> Generator<'a> {
                     )));
                 }
             };
-            writeln!(
-                source,
-                "            let {local_ident} = {value_expr}.map_err(gen_core_error)?;"
-            )
-            .unwrap();
+            if let Some(factor) = self.shape_factor_for_source_attr(&batch, attr)? {
+                writeln!(
+                    source,
+                    "            let {local_ident} = (f64::from({value_expr}.map_err(gen_core_error)?) * {factor}) as f32;"
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    source,
+                    "            let {local_ident} = {value_expr}.map_err(gen_core_error)?;"
+                )
+                .unwrap();
+            }
         } else {
             let value_expr = match branch_type {
                 BranchType::I8 => format!(
@@ -3387,12 +3544,22 @@ impl<'a> Generator<'a> {
         for attr in attrs {
             self.require_f32_attr(&object.name, &attr, "object attribute")?;
             let attr_ident = attr_ident(&object.name, &attr)?;
-            writeln!(
-                source,
-                "            let {attr_ident} = {item_ident}.get::<f32>({}).map_err(gen_core_error)?;",
-                rust_string(&attr)
-            )
-            .unwrap();
+            if self.shape_correction_for(&object.name, &attr).is_some() {
+                let factor = shape_factor_ident(&object.name, &attr)?;
+                writeln!(
+                    source,
+                    "            let {attr_ident} = (f64::from({item_ident}.get::<f32>({}).map_err(gen_core_error)?) * {factor}) as f32;",
+                    rust_string(&attr)
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    source,
+                    "            let {attr_ident} = {item_ident}.get::<f32>({}).map_err(gen_core_error)?;",
+                    rust_string(&attr)
+                )
+                .unwrap();
+            }
         }
 
         let condition = if object.cuts.is_empty() {
@@ -3808,6 +3975,16 @@ fn split_model_output(output: &str) -> Result<(&str, &str), CodegenError> {
     Ok((source, attr))
 }
 
+fn provider_kind_name(kind: &ModelProviderKind) -> &str {
+    match kind {
+        ModelProviderKind::Mock => "mock",
+        ModelProviderKind::InProcess => "inproc",
+        ModelProviderKind::Remote => "remote",
+        ModelProviderKind::Managed => "managed",
+        ModelProviderKind::Other(kind) => kind.as_str(),
+    }
+}
+
 fn checked_ident(value: &str, context: &str) -> Result<String, CodegenError> {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -4026,7 +4203,7 @@ mod tests {
     }
 
     #[test]
-    fn model_aware_codegen_still_rejects_shape_corrections() {
+    fn model_aware_codegen_supports_shape_corrections() {
         let mut spec = AnalysisSpec::from_toml_str(MUON_TAGGER_SPEC).unwrap();
         spec.shape_corrections.push(crate::ShapeCorrectionDef {
             name: "jes".to_string(),
@@ -4037,14 +4214,13 @@ mod tests {
         });
         let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
         let plan = validate(&spec, &catalogue).unwrap();
-        let error = generate_producer_source(&plan).expect_err("shape correction must reject");
+        let source = generate_producer_source(&plan).expect("model+shape codegen should emit");
 
-        assert_eq!(
-            error,
-            CodegenError::UnsupportedFeature(
-                "shape corrections are not yet supported by model-aware codegen".to_string()
-            )
-        );
+        assert!(source.contains("let good_muon_pt_shape_factor = match systematic"));
+        assert!(source.contains("nano_inference::mock_scores(&nano_inference::InferRequest"));
+        assert!(source.contains(
+            "let muon_tagger_muon_pt = (f64::from(muon_tagger_item.get::<f32>(\"pt\").map_err(gen_core_error)?) * good_muon_pt_shape_factor) as f32;"
+        ));
     }
 
     #[test]

@@ -5,7 +5,9 @@ use std::io;
 use std::path::PathBuf;
 
 use nano_spec::codegen::generate_producer_source;
-use nano_spec::{validate, AnalysisSpec, Catalogue, SystematicDef, WeightSystematicDef};
+use nano_spec::{
+    validate, AnalysisSpec, Catalogue, ShapeCorrectionDef, SystematicDef, WeightSystematicDef,
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
@@ -63,5 +65,100 @@ fn main() -> Result<(), Box<dyn Error>> {
         systematic_source,
     )?;
 
+    let shape_base_spec = AnalysisSpec::from_toml_str(MUTAGGER_SHAPE_CROSSING_TOML)?;
+    let shape_base_plan = validate(&shape_base_spec, &catalogue).map_err(|errors| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    })?;
+    fs::write(
+        out_dir.join("generated_mutagger_shape_crossing_base.rs"),
+        generate_producer_source(&shape_base_plan)?,
+    )?;
+
+    let mut shape_spec = shape_base_spec;
+    shape_spec.name = "mutagger_shape_crossing".to_string();
+    shape_spec.shape_corrections = vec![ShapeCorrectionDef {
+        name: "muon_pt_shape".to_string(),
+        collection: "tagged_muon".to_string(),
+        attr: "pt".to_string(),
+        up: 1.5,
+        down: 0.5,
+    }];
+    let shape_plan = validate(&shape_spec, &catalogue).map_err(|errors| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    })?;
+    fs::write(
+        out_dir.join("generated_mutagger_shape_crossing.rs"),
+        generate_producer_source(&shape_plan)?,
+    )?;
+
     Ok(())
 }
+
+const MUTAGGER_SHAPE_CROSSING_TOML: &str = r#"
+[analysis]
+name = "mutagger_shape_crossing_base"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = [
+  "pt > 5 GeV",
+  "abs(eta) < 2.4",
+]
+
+[objects.tagged_muon]
+source = "Muon"
+cuts = [
+  "pt > 5 GeV",
+  "abs(eta) < 2.4",
+  "topscore > 0.5",
+]
+
+[[model]]
+name = "muon_tagger"
+inputs = ["Muon_pt", "Muon_eta", "Muon_phi"]
+output = "Muon_topscore"
+batch = "Muon"
+
+[model.provider]
+kind = "mock"
+
+[regions.control]
+require = ["count(tagged_muon) >= 1"]
+
+[[outputs]]
+name = "n_selected_muons"
+expr = "count(good_muon)"
+
+[[outputs]]
+name = "n_tagged_muons"
+expr = "count(tagged_muon)"
+
+[[outputs]]
+name = "leading_muon_pt"
+expr = "leading(tagged_muon).pt"
+
+[[outputs]]
+name = "leading_muon_score"
+expr = "leading(tagged_muon).topscore"
+
+[[histogram]]
+name = "leading_muon_score"
+expr = "leading(tagged_muon).topscore"
+bins = 10
+range = [0.0, 1.0]
+"#;

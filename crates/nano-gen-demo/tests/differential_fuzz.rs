@@ -9,8 +9,7 @@
 //! histograms over object or derived attributes with optional weight, pt-shape,
 //! or combined weight-plus-shape systematics. Covered model combinations include
 //! model-only, model+histogram, model+derived, and model+weight-systematic
-//! histograms. Model+shape-correction remains explicitly excluded because it
-//! needs a per-variation inference semantics decision. A deterministic subset of
+//! histograms, and model+shape-correction histograms. A deterministic subset of
 //! otherwise no-derived specs is replaced with mock-model taggers over real Muon
 //! or Jet batches; those model specs use the generated score in object cuts,
 //! region requirements, leading-score outputs, and targeted score histograms.
@@ -30,8 +29,8 @@
 //! Random mock-model specs are included in the same build-time compiled corpus
 //! and are compared interpreter == compiled producer using the shared mock score
 //! routine through the interpreter and `MockPredictor` through generated code.
-//! Model+weight-systematic histogram specs are covered by a targeted 24-case
-//! corpus.
+//! Model+weight-systematic and model+shape-correction histogram specs are covered
+//! by targeted 24-case corpora.
 //! Derived objects under model-aware codegen are compared in their own targeted
 //! corpus, covering pair and candidate construction after mock inference.
 //! Multi-channel union specs are compared as rows per event plus their shared
@@ -386,6 +385,74 @@ fn generated_model_weight_systematic_specs_interpret_like_compiled_codegen() {
     assert_eq!(weight_systematic_cases, cases.len());
     eprintln!(
         "model+weight differential fuzz seed=0x{seed:016x} generated={generated} compiled_compared={compiled_compared} histogram_cases={histogram_cases} weight_systematic_cases={weight_systematic_cases}",
+        seed = fuzz_specs::FUZZ_SEED,
+        generated = cases.len(),
+    );
+}
+
+#[test]
+fn generated_model_shape_specs_interpret_like_compiled_codegen() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let cases = fuzz_specs::generated_model_shape_specs();
+    let events = synthetic_events();
+
+    let mut compiled_compared = 0_usize;
+    let mut histogram_cases = 0_usize;
+    let mut shape_systematic_cases = 0_usize;
+    for case in &cases {
+        let plan = validate(&case.spec, &catalogue).unwrap_or_else(|errors| {
+            panic!(
+                "generated model+shape fuzz spec {} did not validate: {errors:?}\n{:#?}",
+                case.index, case.spec
+            )
+        });
+        let kir = nano_spec::kir::lower_plan_to_kir(&plan).unwrap_or_else(|error| {
+            panic!(
+                "generated model+shape fuzz spec {} did not lower to KIR: {error}",
+                case.index
+            )
+        });
+        nano_spec::kir::verify(&kir).unwrap_or_else(|error| {
+            panic!(
+                "generated model+shape fuzz spec {} produced invalid KIR: {error}",
+                case.index
+            )
+        });
+        generate_producer_source(&plan).unwrap_or_else(|error| {
+            panic!(
+                "generated model+shape fuzz spec {} was not supported by codegen: {error}",
+                case.index
+            )
+        });
+
+        let interpreted = interpret_case(&plan, &events, case);
+        let compiled = nano_gen_demo::fuzz::run_model_shape_case(case.index, &events)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "compiled model+shape fuzz case {} failed: {error}",
+                    case.index
+                )
+            });
+        assert_eq!(
+            compiled, interpreted,
+            "model+shape fuzz case {}",
+            case.index
+        );
+        compiled_compared += 1;
+        histogram_cases += usize::from(case.has_histogram);
+        shape_systematic_cases += usize::from(case.has_shape_correction);
+    }
+
+    assert_eq!(cases.len(), fuzz_specs::FUZZ_MODEL_SHAPE_SPEC_COUNT);
+    assert_eq!(compiled_compared, cases.len());
+    assert_eq!(
+        compiled_compared,
+        nano_gen_demo::fuzz::FUZZ_MODEL_SHAPE_CASES
+    );
+    assert_eq!(histogram_cases, cases.len());
+    assert_eq!(shape_systematic_cases, cases.len());
+    eprintln!(
+        "model+shape differential fuzz seed=0x{seed:016x} generated={generated} compiled_compared={compiled_compared} histogram_cases={histogram_cases} shape_systematic_cases={shape_systematic_cases}",
         seed = fuzz_specs::FUZZ_SEED,
         generated = cases.len(),
     );

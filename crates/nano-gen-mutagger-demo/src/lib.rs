@@ -19,4 +19,18 @@ pub mod mutagger_weight_systematic {
     ));
 }
 
+pub mod mutagger_shape_crossing_base {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/generated_mutagger_shape_crossing_base.rs"
+    ));
+}
+
+pub mod mutagger_shape_crossing {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/generated_mutagger_shape_crossing.rs"
+    ));
+}
+
 include!(concat!(env!("OUT_DIR"), "/generated_mutagger_cr.rs"));

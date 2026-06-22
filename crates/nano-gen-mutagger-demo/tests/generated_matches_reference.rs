@@ -1,19 +1,78 @@
 use nano_analysis::Hist1D;
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
-use nano_gen_mutagger_demo::mutagger_weight_systematic;
 use nano_gen_mutagger_demo::reference::{
     ReferenceHistograms, ReferenceProducer, ReferenceRow, MODEL_NAME,
 };
+use nano_gen_mutagger_demo::{
+    mutagger_shape_crossing, mutagger_shape_crossing_base, mutagger_weight_systematic,
+};
 use nano_gen_mutagger_demo::{GenRow, GeneratedProducer};
 use nano_inference::MockPredictor;
-use nano_spec::interpret::{interpret_and_fill, InterpretedHistograms, OutputRow, Value};
+use nano_spec::interpret::{
+    interpret_and_fill, interpret_and_fill_systematic, InterpretedHistograms, OutputRow, Value,
+};
 use nano_spec::{
-    lower, to_adl_string, validate, AnalysisSpec, Catalogue, SystematicDef, WeightSystematicDef,
+    lower, to_adl_string, validate, AnalysisSpec, Catalogue, ShapeCorrectionDef, SystematicDef,
+    WeightSystematicDef,
 };
 
 const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 const MUTAGGER_TOML: &str = include_str!("../../nano-spec/examples/mutagger_cr.toml");
 const MUTAGGER_ADL: &str = include_str!("../../nano-spec/examples/mutagger_cr.adl");
+const MUTAGGER_SHAPE_CROSSING_TOML: &str = r#"
+[analysis]
+name = "mutagger_shape_crossing"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = [
+  "pt > 5 GeV",
+  "abs(eta) < 2.4",
+]
+
+[objects.tagged_muon]
+source = "Muon"
+cuts = [
+  "pt > 5 GeV",
+  "abs(eta) < 2.4",
+  "topscore > 0.5",
+]
+
+[[model]]
+name = "muon_tagger"
+inputs = ["Muon_pt", "Muon_eta", "Muon_phi"]
+output = "Muon_topscore"
+batch = "Muon"
+
+[model.provider]
+kind = "mock"
+
+[regions.control]
+require = ["count(tagged_muon) >= 1"]
+
+[[outputs]]
+name = "n_selected_muons"
+expr = "count(good_muon)"
+
+[[outputs]]
+name = "n_tagged_muons"
+expr = "count(tagged_muon)"
+
+[[outputs]]
+name = "leading_muon_pt"
+expr = "leading(tagged_muon).pt"
+
+[[outputs]]
+name = "leading_muon_score"
+expr = "leading(tagged_muon).topscore"
+
+[[histogram]]
+name = "leading_muon_score"
+expr = "leading(tagged_muon).topscore"
+bins = 10
+range = [0.0, 1.0]
+"#;
 
 #[test]
 fn mutagger_cr_adl_matches_toml_including_model_surface() {
@@ -195,8 +254,141 @@ fn model_weight_systematic_histogram_fanout_matches_interpreter_and_preserves_no
     );
 }
 
+#[test]
+fn model_shape_correction_reruns_inference_per_variation_and_preserves_nominal() {
+    let mut shape_spec =
+        AnalysisSpec::from_toml_str(MUTAGGER_SHAPE_CROSSING_TOML).expect("parse shape spec");
+    shape_spec.shape_corrections = vec![ShapeCorrectionDef {
+        name: "muon_pt_shape".to_string(),
+        collection: "tagged_muon".to_string(),
+        attr: "pt".to_string(),
+        up: 1.5,
+        down: 0.5,
+    }];
+    let catalogue =
+        Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+    let shape_plan = validate(&shape_spec, &catalogue).expect("validate shape spec");
+    let predictor = MockPredictor::new(MODEL_NAME);
+
+    let no_correction_row = mutagger_shape_crossing_base::GeneratedProducer::analyze(
+        &shape_crossing_event(),
+        &predictor,
+    )
+    .expect("base generated analyze")
+    .map(shape_base_row_bits);
+
+    let mut generated_histograms = mutagger_shape_crossing::GenHistograms::new();
+    let mut interpreted_histograms = InterpretedHistograms::new(&shape_plan);
+
+    let nominal_generated = mutagger_shape_crossing::GeneratedProducer::analyze_and_fill(
+        &shape_crossing_event(),
+        &mut generated_histograms,
+        mutagger_shape_crossing::Systematic::Nominal,
+        &predictor,
+    )
+    .expect("generated nominal")
+    .map(shape_row_bits);
+    let up_generated = mutagger_shape_crossing::GeneratedProducer::analyze_and_fill(
+        &shape_crossing_event(),
+        &mut generated_histograms,
+        mutagger_shape_crossing::Systematic::MuonPtShapeUp,
+        &predictor,
+    )
+    .expect("generated up")
+    .map(shape_row_bits);
+    let down_generated = mutagger_shape_crossing::GeneratedProducer::analyze_and_fill(
+        &shape_crossing_event(),
+        &mut generated_histograms,
+        mutagger_shape_crossing::Systematic::MuonPtShapeDown,
+        &predictor,
+    )
+    .expect("generated down")
+    .map(shape_row_bits);
+
+    let nominal_interpreted = interpret_and_fill_systematic(
+        &shape_plan,
+        &shape_crossing_event(),
+        &mut interpreted_histograms,
+        "Nominal",
+    )
+    .expect("interpreted nominal")
+    .map(interpreted_shape_row_bits);
+    let up_interpreted = interpret_and_fill_systematic(
+        &shape_plan,
+        &shape_crossing_event(),
+        &mut interpreted_histograms,
+        "MuonPtShapeUp",
+    )
+    .expect("interpreted up")
+    .map(interpreted_shape_row_bits);
+    let down_interpreted = interpret_and_fill_systematic(
+        &shape_plan,
+        &shape_crossing_event(),
+        &mut interpreted_histograms,
+        "MuonPtShapeDown",
+    )
+    .expect("interpreted down")
+    .map(interpreted_shape_row_bits);
+
+    assert_eq!(nominal_generated, no_correction_row);
+    assert_eq!(nominal_generated, nominal_interpreted);
+    assert_eq!(up_generated, up_interpreted);
+    assert_eq!(down_generated, down_interpreted);
+    assert_eq!(nominal_generated, None);
+    assert_eq!(down_generated, None);
+    let up = up_generated.expect("pt-up variation should pass the score cut");
+    assert_eq!(up.0, 1);
+    assert_eq!(up.1, 1);
+    assert!(f32::from_bits(up.3) > 0.5);
+
+    let generated = &generated_histograms.leading_muon_score;
+    let interpreted = interpreted_histograms
+        .get("leading_muon_score")
+        .expect("interpreted leading_muon_score histogram");
+    for systematic in [
+        mutagger_shape_crossing::Systematic::Nominal,
+        mutagger_shape_crossing::Systematic::MuonPtShapeUp,
+        mutagger_shape_crossing::Systematic::MuonPtShapeDown,
+    ] {
+        let key = format!("{systematic:?}");
+        assert_eq!(generated.get(systematic), interpreted.get(key));
+    }
+    assert_eq!(
+        generated
+            .get(mutagger_shape_crossing::Systematic::Nominal)
+            .sumw(),
+        0.0
+    );
+    assert_eq!(
+        generated
+            .get(mutagger_shape_crossing::Systematic::MuonPtShapeUp)
+            .sumw(),
+        1.0
+    );
+    assert_eq!(
+        generated
+            .get(mutagger_shape_crossing::Systematic::MuonPtShapeDown)
+            .sumw(),
+        0.0
+    );
+}
+
 fn synthetic_event(entry: usize) -> Event {
     Event::from_columns(schema(), columns(), entry).unwrap()
+}
+
+fn shape_crossing_event() -> Event {
+    Event::from_columns(
+        schema(),
+        [
+            ("nMuon", BranchColumn::U32(vec![1])),
+            ("Muon_pt", BranchColumn::VecF32(vec![vec![10.75]])),
+            ("Muon_eta", BranchColumn::VecF32(vec![vec![0.1]])),
+            ("Muon_phi", BranchColumn::VecF32(vec![vec![0.2]])),
+        ],
+        0,
+    )
+    .unwrap()
 }
 
 fn schema() -> BranchSchema {
@@ -286,6 +478,33 @@ fn interpreted_row_bits(row: OutputRow) -> (u32, u32, u64) {
         output_u32(&row, "n_selected_muons"),
         output_u32(&row, "n_tagged_muons"),
         output_f64(&row, "leading_muon_pt").to_bits(),
+    )
+}
+
+fn shape_base_row_bits(row: mutagger_shape_crossing_base::GenRow) -> (u32, u32, u32, u32) {
+    (
+        row.n_selected_muons,
+        row.n_tagged_muons,
+        row.leading_muon_pt.to_bits(),
+        row.leading_muon_score.to_bits(),
+    )
+}
+
+fn shape_row_bits(row: mutagger_shape_crossing::GenRow) -> (u32, u32, u32, u32) {
+    (
+        row.n_selected_muons,
+        row.n_tagged_muons,
+        row.leading_muon_pt.to_bits(),
+        row.leading_muon_score.to_bits(),
+    )
+}
+
+fn interpreted_shape_row_bits(row: OutputRow) -> (u32, u32, u32, u32) {
+    (
+        output_u32(&row, "n_selected_muons"),
+        output_u32(&row, "n_tagged_muons"),
+        (output_f64(&row, "leading_muon_pt") as f32).to_bits(),
+        (output_f64(&row, "leading_muon_score") as f32).to_bits(),
     )
 }
 

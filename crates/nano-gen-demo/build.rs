@@ -75,6 +75,7 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     let union_specs = fuzz_specs::generated_union_specs();
     let model_histogram_specs = fuzz_specs::generated_model_histogram_specs();
     let model_weight_systematic_specs = fuzz_specs::generated_model_weight_systematic_specs();
+    let model_shape_specs = fuzz_specs::generated_model_shape_specs();
     let derived_model_specs = fuzz_specs::generated_derived_under_model_specs();
     let weight_shape_specs = fuzz_specs::generated_weight_shape_specs();
     let mut modules = String::new();
@@ -86,6 +87,7 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     let model_cases = specs.iter().filter(|case| case.has_model).count();
     let model_histogram_cases = model_histogram_specs.len();
     let model_weight_systematic_cases = model_weight_systematic_specs.len();
+    let model_shape_cases = model_shape_specs.len();
     let derived_model_cases = derived_model_specs.len();
     let weight_shape_cases = weight_shape_specs.len();
     writeln!(
@@ -112,6 +114,10 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     writeln!(
         modules,
         "pub const FUZZ_MODEL_WEIGHT_SYSTEMATIC_CASES: usize = {model_weight_systematic_cases};"
+    )?;
+    writeln!(
+        modules,
+        "pub const FUZZ_MODEL_SHAPE_CASES: usize = {model_shape_cases};"
     )?;
     writeln!(
         modules,
@@ -277,6 +283,26 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
         emit_run_case(&mut modules, &module_name, generated)?;
     }
 
+    let mut model_shape_arms = String::new();
+    for generated in &model_shape_specs {
+        let module_name = format!("model_shape_case_{:03}", generated.index);
+        let file_name = format!("generated_fuzz_model_shape_{:03}.rs", generated.index);
+        emit_generated_module(
+            catalogue,
+            out_dir,
+            generated,
+            &module_name,
+            &file_name,
+            &mut modules,
+        )?;
+        writeln!(
+            model_shape_arms,
+            "        {} => run_{}(events),",
+            generated.index, module_name
+        )?;
+        emit_run_case(&mut modules, &module_name, generated)?;
+    }
+
     let mut derived_model_arms = String::new();
     for generated in &derived_model_specs {
         let module_name = format!("derived_model_case_{:03}", generated.index);
@@ -378,6 +404,19 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     writeln!(
         modules,
         "        _ => Err(nano_core::NanoError::MissingBranch {{ branch: format!(\"unknown weight-shape fuzz case {{case}}\") }}),"
+    )?;
+    writeln!(modules, "    }}")?;
+    writeln!(modules, "}}")?;
+
+    writeln!(
+        modules,
+        "pub fn run_model_shape_case(case: usize, events: &[nano_core::Event]) -> nano_core::Result<FuzzCaseResult> {{"
+    )?;
+    writeln!(modules, "    match case {{")?;
+    modules.push_str(&model_shape_arms);
+    writeln!(
+        modules,
+        "        _ => Err(nano_core::NanoError::MissingBranch {{ branch: format!(\"unknown model-shape fuzz case {{case}}\") }}),"
     )?;
     writeln!(modules, "    }}")?;
     writeln!(modules, "}}")?;

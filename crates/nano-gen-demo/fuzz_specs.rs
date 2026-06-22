@@ -10,6 +10,7 @@ pub const FUZZ_SPEC_COUNT: usize = 400;
 pub const FUZZ_UNION_SPEC_COUNT: usize = 24;
 pub const FUZZ_MODEL_HISTOGRAM_SPEC_COUNT: usize = 24;
 pub const FUZZ_MODEL_WEIGHT_SYSTEMATIC_SPEC_COUNT: usize = 24;
+pub const FUZZ_MODEL_SHAPE_SPEC_COUNT: usize = 24;
 pub const FUZZ_DERIVED_MODEL_SPEC_COUNT: usize = 24;
 pub const FUZZ_WEIGHT_SHAPE_SPEC_COUNT: usize = 24;
 
@@ -337,6 +338,32 @@ pub fn generated_model_weight_systematic_specs() -> Vec<GeneratedSpec> {
                 }),
             ];
             generated.has_weight_systematic = true;
+            generated
+        })
+        .collect()
+}
+
+pub fn generated_model_shape_specs() -> Vec<GeneratedSpec> {
+    generated_model_histogram_specs()
+        .into_iter()
+        .take(FUZZ_MODEL_SHAPE_SPEC_COUNT)
+        .map(|mut generated| {
+            let index = generated.index;
+            let mut rng = SplitMix64::new(
+                FUZZ_SEED
+                    ^ 0xa15c_0de1_5afe_47aa
+                    ^ (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            );
+            generated.spec.name = format!("fuzz_model_shape_diff_{index:03}");
+            let tagged = generated.spec.objects[1].name.clone();
+            generated.spec.shape_corrections = vec![ShapeCorrectionDef {
+                name: format!("fuzz_model_shape_{index:03}"),
+                collection: tagged,
+                attr: "pt".to_string(),
+                up: round(rng.f64(1.05, 1.35)),
+                down: round(rng.f64(0.65, 0.95)),
+            }];
+            generated.has_shape_correction = true;
             generated
         })
         .collect()

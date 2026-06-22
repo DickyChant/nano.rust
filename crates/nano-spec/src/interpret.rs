@@ -239,7 +239,7 @@ pub fn interpret_systematic(
 
     let kir = crate::kir::lower_plan_to_kir(plan)?;
     crate::kir::verify(&kir)?;
-    let model_outputs = evaluate_mock_models(&plan.spec.models, &kir, event)?;
+    let model_outputs = evaluate_mock_models(&plan.spec.models, &kir, event, systematic)?;
     execute_verified_kir(&kir, event, systematic.to_string(), model_outputs)
 }
 
@@ -268,7 +268,7 @@ pub fn interpret_and_fill_systematic(
 
     let kir = crate::kir::lower_plan_to_kir(plan)?;
     crate::kir::verify(&kir)?;
-    let model_outputs = evaluate_mock_models(&plan.spec.models, &kir, event)?;
+    let model_outputs = evaluate_mock_models(&plan.spec.models, &kir, event, systematic)?;
     let mut evaluator = KirEvaluator::new(&kir, event, systematic.to_string(), model_outputs);
     evaluator.histograms = Some(&mut histograms.histograms);
     match evaluator.execute_block(&kir.block)? {
@@ -319,6 +319,7 @@ fn evaluate_mock_models(
     models: &[ModelDef],
     program: &KirProgram,
     event: &Event,
+    systematic: &str,
 ) -> Result<ModelOutputs> {
     let mut outputs = ModelOutputs::with_capacity(models.len());
     for model in models {
@@ -328,7 +329,7 @@ fn evaluate_mock_models(
         for item in collection.iter() {
             for input in &model.inputs {
                 values.push(model_input_value(
-                    model, program, event, item, input, &batch,
+                    model, program, event, item, input, &batch, systematic,
                 )?);
             }
         }
@@ -366,6 +367,7 @@ fn model_input_value(
     item: &ObjectView<'_>,
     input: &str,
     batch: &str,
+    systematic: &str,
 ) -> Result<f32> {
     let branch_type = branch_type(program, input)?;
     if branch_type.is_vector() {
@@ -381,7 +383,9 @@ fn model_input_value(
                 model.name
             )));
         }
-        object_input_value(item, attr, branch_type)
+        let value = object_input_value(item, attr, branch_type)?;
+        let factor = shape_factor_for_source(program, batch, attr, systematic);
+        Ok((f64::from(value) * factor) as f32)
     } else {
         scalar_input_value(event, input, branch_type)
     }
@@ -1531,6 +1535,30 @@ fn shape_factor(program: &KirProgram, collection: &str, attr: &str, systematic: 
             _ => 1.0,
         })
         .unwrap_or(1.0)
+}
+
+fn shape_factor_for_source(
+    program: &KirProgram,
+    source: &str,
+    attr: &str,
+    systematic: &str,
+) -> f64 {
+    program
+        .shape_corrections
+        .iter()
+        .filter(|correction| {
+            correction.attr == attr
+                && program
+                    .objects
+                    .iter()
+                    .any(|object| object.name == correction.collection && object.source == source)
+        })
+        .map(|correction| match systematic {
+            value if value == interpreted_variant_name(&correction.name, "Up") => correction.up,
+            value if value == interpreted_variant_name(&correction.name, "Down") => correction.down,
+            _ => 1.0,
+        })
+        .product()
 }
 
 fn expr_has_missing_value(
