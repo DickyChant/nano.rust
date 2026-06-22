@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 use nano_analysis::{Fb, FbInv, Hist1D, HistSet1D, Pb, PbInv};
 use nano_core::Event;
-use nano_spec::interpret::{interpret_and_fill, InterpretedHistograms};
+use nano_spec::interpret::{
+    interpret_and_fill, interpret_and_fill_systematic, InterpretedHistograms,
+};
 use nano_spec::ResolvedPlan;
 
 use crate::datacard::{DatacardOutput, MultiProcessChannel, MultiProcessDatacard, Process};
@@ -211,6 +213,7 @@ where
     for (sample_index, sample) in table.samples.iter().enumerate() {
         let factor = sample.normalization_factor(table.lumi)?;
         let mut histograms = InterpretedHistograms::new(plan);
+        let systematic_variations = systematic_variations(&histograms);
         let mut events_read = 0_usize;
         let mut selected = 0_usize;
 
@@ -218,7 +221,20 @@ where
             for event in events_for_file(file)? {
                 let event = event?;
                 events_read += 1;
-                if interpret_and_fill(plan, &event, &mut histograms)
+                if plan.spec.has_shape_correction() {
+                    for systematic in &systematic_variations {
+                        let row = interpret_and_fill_systematic(
+                            plan,
+                            &event,
+                            &mut histograms,
+                            systematic,
+                        )
+                        .map_err(|error| RootError::other(error.to_string()))?;
+                        if systematic == NOMINAL_VARIATION && row.is_some() {
+                            selected += 1;
+                        }
+                    }
+                } else if interpret_and_fill(plan, &event, &mut histograms)
                     .map_err(|error| RootError::other(error.to_string()))?
                     .is_some()
                 {
@@ -548,4 +564,16 @@ fn paired_shape_systematics(set: &HistSet1D<String>) -> Vec<String> {
         .filter(|base| variations.contains(format!("{base}Down").as_str()))
         .map(ToString::to_string)
         .collect()
+}
+
+fn systematic_variations(histograms: &InterpretedHistograms) -> Vec<String> {
+    histograms
+        .iter()
+        .next()
+        .map(|(_, set)| {
+            set.iter()
+                .map(|(systematic, _)| systematic.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![NOMINAL_VARIATION.to_string()])
 }
