@@ -5,7 +5,7 @@ use std::io;
 use std::path::PathBuf;
 
 use nano_spec::codegen::generate_producer_source;
-use nano_spec::{validate, AnalysisSpec, Catalogue};
+use nano_spec::{validate, AnalysisSpec, Catalogue, SystematicDef, WeightSystematicDef};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
@@ -36,6 +36,32 @@ fn main() -> Result<(), Box<dyn Error>> {
     let source = generate_producer_source(&plan)?;
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     fs::write(out_dir.join("generated_mutagger_cr.rs"), source)?;
+
+    let mut systematic_spec = spec;
+    systematic_spec.name = "mutagger_cr_weight_systematic".to_string();
+    systematic_spec.systematics = vec![
+        SystematicDef::Nominal,
+        SystematicDef::Weight(WeightSystematicDef {
+            name: "muon_weight".to_string(),
+            up: 2.0,
+            down: 0.5,
+        }),
+    ];
+    let systematic_plan = validate(&systematic_spec, &catalogue).map_err(|errors| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    })?;
+    let systematic_source = generate_producer_source(&systematic_plan)?;
+    fs::write(
+        out_dir.join("generated_mutagger_cr_weight_systematic.rs"),
+        systematic_source,
+    )?;
 
     Ok(())
 }

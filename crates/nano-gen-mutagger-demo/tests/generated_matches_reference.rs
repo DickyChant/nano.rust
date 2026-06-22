@@ -1,12 +1,15 @@
 use nano_analysis::Hist1D;
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
+use nano_gen_mutagger_demo::mutagger_weight_systematic;
 use nano_gen_mutagger_demo::reference::{
     ReferenceHistograms, ReferenceProducer, ReferenceRow, MODEL_NAME,
 };
 use nano_gen_mutagger_demo::{GenRow, GeneratedProducer};
 use nano_inference::MockPredictor;
 use nano_spec::interpret::{interpret_and_fill, InterpretedHistograms, OutputRow, Value};
-use nano_spec::{lower, to_adl_string, validate, AnalysisSpec, Catalogue};
+use nano_spec::{
+    lower, to_adl_string, validate, AnalysisSpec, Catalogue, SystematicDef, WeightSystematicDef,
+};
 
 const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 const MUTAGGER_TOML: &str = include_str!("../../nano-spec/examples/mutagger_cr.toml");
@@ -109,6 +112,89 @@ fn generated_mutagger_cr_matches_reference_on_synthetic_events() {
     );
 }
 
+#[test]
+fn model_weight_systematic_histogram_fanout_matches_interpreter_and_preserves_nominal() {
+    let mut systematic_spec = AnalysisSpec::from_toml_str(MUTAGGER_TOML).expect("parse spec");
+    systematic_spec.name = "mutagger_cr_weight_systematic".to_string();
+    systematic_spec.systematics = vec![
+        SystematicDef::Nominal,
+        SystematicDef::Weight(WeightSystematicDef {
+            name: "muon_weight".to_string(),
+            up: 2.0,
+            down: 0.5,
+        }),
+    ];
+    let catalogue =
+        Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+    let systematic_plan = validate(&systematic_spec, &catalogue).expect("validate spec");
+    let predictor = MockPredictor::new(MODEL_NAME);
+    let mut generated_nominal = Hist1D::new(30, 30.0, 330.0);
+    let mut generated_systematic = mutagger_weight_systematic::GenHistograms::new();
+    let mut interpreted_systematic = InterpretedHistograms::new(&systematic_plan);
+
+    for entry in 0..8 {
+        let event = synthetic_event(entry);
+        let nominal_row = GeneratedProducer::analyze(&event, &predictor)
+            .unwrap_or_else(|error| panic!("entry {entry}: nominal generated failed: {error}"))
+            .inspect(|row| generated_nominal.fill_weighted(f64::from(row.leading_muon_pt), 1.0))
+            .map(row_bits);
+        let systematic_row = mutagger_weight_systematic::GeneratedProducer::analyze_and_fill(
+            &event,
+            &mut generated_systematic,
+            mutagger_weight_systematic::Systematic::Nominal,
+            &predictor,
+        )
+        .unwrap_or_else(|error| panic!("entry {entry}: systematic generated failed: {error}"))
+        .map(systematic_row_bits);
+        let interpreted = interpret_and_fill(&systematic_plan, &event, &mut interpreted_systematic)
+            .unwrap_or_else(|error| panic!("entry {entry}: interpret failed: {error}"))
+            .map(interpreted_row_bits);
+
+        assert_eq!(nominal_row, systematic_row, "entry {entry}");
+        assert_eq!(systematic_row, interpreted, "entry {entry}");
+    }
+
+    let interpreted = interpreted_systematic
+        .get("leading_muon_pt")
+        .expect("interpreted leading_muon_pt histogram");
+    let generated = &generated_systematic.leading_muon_pt;
+    for systematic in [
+        mutagger_weight_systematic::Systematic::Nominal,
+        mutagger_weight_systematic::Systematic::MuonWeightUp,
+        mutagger_weight_systematic::Systematic::MuonWeightDown,
+    ] {
+        let interpreted_key = format!("{systematic:?}");
+        assert_eq!(
+            generated.get(systematic),
+            interpreted.get(interpreted_key),
+            "{systematic:?}"
+        );
+    }
+
+    assert_eq!(
+        generated.get(mutagger_weight_systematic::Systematic::Nominal),
+        &generated_nominal
+    );
+    assert_eq!(
+        generated
+            .get(mutagger_weight_systematic::Systematic::Nominal)
+            .sumw(),
+        3.0
+    );
+    assert_eq!(
+        generated
+            .get(mutagger_weight_systematic::Systematic::MuonWeightUp)
+            .sumw(),
+        6.0
+    );
+    assert_eq!(
+        generated
+            .get(mutagger_weight_systematic::Systematic::MuonWeightDown)
+            .sumw(),
+        1.5
+    );
+}
+
 fn synthetic_event(entry: usize) -> Event {
     Event::from_columns(schema(), columns(), entry).unwrap()
 }
@@ -184,6 +270,14 @@ fn reference_row_bits(row: ReferenceRow) -> (u32, u32, u64) {
         row.n_selected_muons,
         row.n_tagged_muons,
         row.leading_muon_pt.to_bits(),
+    )
+}
+
+fn systematic_row_bits(row: mutagger_weight_systematic::GenRow) -> (u32, u32, u64) {
+    (
+        row.n_selected_muons,
+        row.n_tagged_muons,
+        f64::from(row.leading_muon_pt).to_bits(),
     )
 }
 

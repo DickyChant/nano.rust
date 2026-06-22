@@ -12,4 +12,11 @@
 
 pub mod reference;
 
+pub mod mutagger_weight_systematic {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/generated_mutagger_cr_weight_systematic.rs"
+    ));
+}
+
 include!(concat!(env!("OUT_DIR"), "/generated_mutagger_cr.rs"));

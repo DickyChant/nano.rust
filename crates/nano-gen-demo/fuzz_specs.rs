@@ -9,6 +9,7 @@ pub const FUZZ_SEED: u64 = 0x4e41_4e4f_5f44_4946;
 pub const FUZZ_SPEC_COUNT: usize = 400;
 pub const FUZZ_UNION_SPEC_COUNT: usize = 24;
 pub const FUZZ_MODEL_HISTOGRAM_SPEC_COUNT: usize = 24;
+pub const FUZZ_MODEL_WEIGHT_SYSTEMATIC_SPEC_COUNT: usize = 24;
 pub const FUZZ_DERIVED_MODEL_SPEC_COUNT: usize = 24;
 pub const FUZZ_WEIGHT_SHAPE_SPEC_COUNT: usize = 24;
 
@@ -310,6 +311,32 @@ pub fn generated_model_histogram_specs() -> Vec<GeneratedSpec> {
                 range: [0.0, if index.is_multiple_of(2) { 1.0 } else { 220.0 }],
             }];
             generated.has_histogram = true;
+            generated
+        })
+        .collect()
+}
+
+pub fn generated_model_weight_systematic_specs() -> Vec<GeneratedSpec> {
+    generated_model_histogram_specs()
+        .into_iter()
+        .take(FUZZ_MODEL_WEIGHT_SYSTEMATIC_SPEC_COUNT)
+        .map(|mut generated| {
+            let index = generated.index;
+            let mut rng = SplitMix64::new(
+                FUZZ_SEED
+                    ^ 0x51a7_5e7c_7a6b_21d3
+                    ^ (index as u64).wrapping_mul(0xd6e8_feb8_6659_fd93),
+            );
+            generated.spec.name = format!("fuzz_model_weight_diff_{index:03}");
+            generated.spec.systematics = vec![
+                SystematicDef::Nominal,
+                SystematicDef::Weight(WeightSystematicDef {
+                    name: format!("fuzz_model_weight_{index:03}"),
+                    up: round(rng.f64(1.1, 2.5)),
+                    down: round(rng.f64(0.25, 0.9)),
+                }),
+            ];
+            generated.has_weight_systematic = true;
             generated
         })
         .collect()

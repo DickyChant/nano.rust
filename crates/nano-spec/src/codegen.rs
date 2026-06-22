@@ -702,7 +702,10 @@ impl<'a> Generator<'a> {
             .unwrap();
             writeln!(source, "    }}").unwrap();
         }
-        let systematic_param = if kir.is_some() && !self.spec().histograms.is_empty() {
+        let systematic_param = if !self.spec().histograms.is_empty()
+            && kir.is_some()
+            && !self.spec().has_weight_systematic()
+        {
             "systematic"
         } else {
             "_systematic"
@@ -854,15 +857,6 @@ impl<'a> Generator<'a> {
                 "shape corrections are not yet supported by model-aware codegen".to_string(),
             ));
         }
-        if !self.spec().models.is_empty()
-            && !self.spec().histograms.is_empty()
-            && self.spec().has_histogram_systematic()
-        {
-            return Err(CodegenError::UnsupportedFeature(
-                "histogram systematics are not yet supported by model-aware codegen".to_string(),
-            ));
-        }
-
         for object in &self.spec().objects {
             checked_ident(&object.name, "object name")?;
             checked_ident(&object.source, "object source")?;
@@ -1351,22 +1345,75 @@ impl<'a> Generator<'a> {
         let region_event = checked_ident(&region.name, "region event")?;
         let region_type = region_type_ident(&region.name)?;
         writeln!(source, "        if let Some(histograms) = histograms {{").unwrap();
-        writeln!(
-            source,
-            "            let weighted = {region_event}_event.weight(nano_analysis::EventWeight::nominal());"
-        )
-        .unwrap();
-        for histogram in &self.spec().histograms {
-            let field = checked_ident(&histogram.name, "histogram field")?;
-            let value = self.histogram_fill_value_expr(
-                &histogram.expr,
-                &self.emit_model_output_expr(&histogram.expr)?,
-            )?;
+        if self.spec().has_weight_systematic() {
+            self.emit_weight_visitor(source)?;
             writeln!(
                 source,
-                "            nano_analysis::fill::<{region_type}, nano_analysis::Nominal>(&mut histograms.{field}, &weighted, {value});"
+                "            for systematic in [{}] {{",
+                self.active_systematic_exprs()?.join(", ")
             )
             .unwrap();
+            writeln!(
+                source,
+                "                let weight = systematic.visit(GenWeightVisitor);"
+            )
+            .unwrap();
+            writeln!(source, "                match systematic {{").unwrap();
+            for systematic in self.generated_systematics()? {
+                writeln!(
+                    source,
+                    "                    Systematic::{} => {{",
+                    systematic.variant
+                )
+                .unwrap();
+                if matches!(systematic.source, GeneratedSystematicSource::Nominal) {
+                    writeln!(
+                        source,
+                        "                        let weighted = {region_event}_event.weight(weight);"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        source,
+                        "                        let weighted = {region_event}_event.weight_for::<{}>(weight);",
+                        systematic.marker
+                    )
+                    .unwrap();
+                }
+                for histogram in &self.spec().histograms {
+                    let field = checked_ident(&histogram.name, "histogram field")?;
+                    let value = self.histogram_fill_value_expr(
+                        &histogram.expr,
+                        &self.emit_model_output_expr(&histogram.expr)?,
+                    )?;
+                    writeln!(
+                        source,
+                        "                        nano_analysis::fill_set::<{region_type}, _, _>(&mut histograms.{field}, systematic, &weighted, {value});"
+                    )
+                    .unwrap();
+                }
+                writeln!(source, "                    }}").unwrap();
+            }
+            writeln!(source, "                }}").unwrap();
+            writeln!(source, "            }}").unwrap();
+        } else {
+            writeln!(
+                source,
+                "            let weighted = {region_event}_event.weight(nano_analysis::EventWeight::nominal());"
+            )
+            .unwrap();
+            for histogram in &self.spec().histograms {
+                let field = checked_ident(&histogram.name, "histogram field")?;
+                let value = self.histogram_fill_value_expr(
+                    &histogram.expr,
+                    &self.emit_model_output_expr(&histogram.expr)?,
+                )?;
+                writeln!(
+                    source,
+                    "            nano_analysis::fill::<{region_type}, nano_analysis::Nominal>(&mut histograms.{field}, &weighted, {value});"
+                )
+                .unwrap();
+            }
         }
         writeln!(source, "        }}").unwrap();
         Ok(())
@@ -3976,6 +4023,28 @@ mod tests {
         assert!(source.contains(
             "muon_tagger_baseline.select::<SignalRegion>(|_| n_good_muon >= 1_u32 && leading_good_muon_topscore > 0.5_f32)"
         ));
+    }
+
+    #[test]
+    fn model_aware_codegen_still_rejects_shape_corrections() {
+        let mut spec = AnalysisSpec::from_toml_str(MUON_TAGGER_SPEC).unwrap();
+        spec.shape_corrections.push(crate::ShapeCorrectionDef {
+            name: "jes".to_string(),
+            collection: "good_muon".to_string(),
+            attr: "pt".to_string(),
+            up: 1.1,
+            down: 0.9,
+        });
+        let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+        let plan = validate(&spec, &catalogue).unwrap();
+        let error = generate_producer_source(&plan).expect_err("shape correction must reject");
+
+        assert_eq!(
+            error,
+            CodegenError::UnsupportedFeature(
+                "shape corrections are not yet supported by model-aware codegen".to_string()
+            )
+        );
     }
 
     #[test]
