@@ -1,0 +1,68 @@
+[analysis]
+name = "end_to_end_analysis"
+year = "Run2018"
+
+[lumi_mask]
+file = "../nano-spec/tests/data/synthetic_golden.json"
+
+[objects.good_muon]
+source = "Muon"
+cuts = ["pt > 30 GeV", "abs(eta) < 2.4"]
+
+[objects.good_jet]
+source = "Jet"
+cuts = ["pt > 30 GeV", "abs(eta) < 5.0"]
+
+[regions.signal]
+require = [
+  "HLT_IsoMu24",
+  "Flag_goodVertices",
+  "count(good_muon) >= 1",
+  "count(good_jet) >= 1",
+]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"
+
+[[outputs]]
+name = "n_good_jet"
+expr = "count(good_jet)"
+
+[[outputs]]
+name = "leading_jet_pt"
+expr = "leading(good_jet).pt"
+
+[[outputs]]
+name = "ht"
+expr = "sum(good_jet.pt)"
+
+[[histogram]]
+name = "n_good_jet_hist"
+expr = "count(good_jet)"
+bins = 5
+range = [0.0, 5.0]
+
+[[correction]]
+name = "muon_sf"
+kind = "scale_factor"
+file = "../nano-spec/tests/data/muon_sf.json"
+correction = "synthetic_muon_sf"
+collection = "good_muon"
+inputs = [
+  { name = "eta", from = "eta" },
+  { name = "pt", from = "pt" },
+]
+systematic = { name = "scale_factors", nominal = "nominal", up = "systup", down = "systdown" }
+
+[[correction]]
+name = "jes_total"
+kind = "jes"
+file = "../nano-spec/tests/data/jes_uncertainty.json"
+correction = "synthetic_jes_uncertainty"
+collection = "good_jet"
+attr = "pt"
+inputs = [
+  { name = "eta", from = "eta" },
+  { name = "pt", from = "pt" },
+]

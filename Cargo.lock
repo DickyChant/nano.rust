@@ -1043,6 +1043,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-gen-analysis-demo"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "nano-analysis",
+ "nano-core",
+ "nano-corrections",
+ "nano-io",
+ "nano-spec",
+ "root-io",
+]
+
+[[package]]
 name = "nano-gen-demo"
 version = "0.0.0"
 dependencies = [

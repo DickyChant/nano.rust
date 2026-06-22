@@ -1,0 +1,22 @@
+[package]
+name = "nano-gen-analysis-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "End-to-end generated analysis composition demo for nano.rust"
+build = "build.rs"
+
+[dependencies]
+nano-analysis = { workspace = true }
+nano-core = { workspace = true }
+nano-corrections = { workspace = true }
+nano-spec = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"
+nano-io = { workspace = true }
+root-io = { path = "../root-io" }
+
+[build-dependencies]
+nano-spec = { workspace = true }
