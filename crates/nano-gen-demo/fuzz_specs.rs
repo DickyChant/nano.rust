@@ -1,12 +1,15 @@
 use nano_spec::{
-    AnalysisSpec, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, HistogramDef, ModelDef,
-    ModelOutputDType, ModelProviderKind, ModelProviderSpec, ObjectCandidateDef, ObjectDef,
-    ObjectPairDef, OutputDef, PairConstraint, PairSelection, Quantity, RegionDef, Requirement,
-    ShapeCorrectionDef, SystematicDef, Unit, WeightDef, WeightSystematicDef, Year,
+    AnalysisSpec, ChannelDef, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, HistogramDef,
+    ModelDef, ModelOutputDType, ModelProviderKind, ModelProviderSpec, ObjectCandidateDef,
+    ObjectDef, ObjectPairDef, OutputDef, PairConstraint, PairSelection, Quantity, RegionDef,
+    Requirement, ShapeCorrectionDef, SystematicDef, Unit, WeightDef, WeightSystematicDef, Year,
 };
 
 pub const FUZZ_SEED: u64 = 0x4e41_4e4f_5f44_4946;
 pub const FUZZ_SPEC_COUNT: usize = 400;
+pub const FUZZ_UNION_SPEC_COUNT: usize = 24;
+pub const FUZZ_MODEL_HISTOGRAM_SPEC_COUNT: usize = 24;
+pub const FUZZ_WEIGHT_SHAPE_SPEC_COUNT: usize = 24;
 
 #[derive(Debug, Clone)]
 pub struct GeneratedSpec {
@@ -267,6 +270,93 @@ pub fn generated_specs() -> Vec<GeneratedSpec> {
         .collect()
 }
 
+pub fn generated_union_specs() -> Vec<GeneratedSpec> {
+    (0..FUZZ_UNION_SPEC_COUNT)
+        .map(generated_union_spec)
+        .collect()
+}
+
+pub fn generated_model_histogram_specs() -> Vec<GeneratedSpec> {
+    (0..FUZZ_MODEL_HISTOGRAM_SPEC_COUNT)
+        .map(|index| {
+            let mut rng = SplitMix64::new(
+                FUZZ_SEED
+                    ^ 0x9d13_781f_e2b4_6c91
+                    ^ (index as u64).wrapping_mul(0xa24b_aed4_963e_e407),
+            );
+            let mut generated = generated_model_spec(index, &mut rng);
+            let tagged = generated.spec.objects[1].name.clone();
+            let score = generated.spec.models[0]
+                .output
+                .split_once('_')
+                .expect("mock model output is source_attr")
+                .1
+                .to_string();
+            generated.spec.histograms = vec![HistogramDef {
+                name: "fuzz_model_score_hist".to_string(),
+                expr: if index.is_multiple_of(2) {
+                    Expr::LeadingAttr {
+                        object: tagged,
+                        attr: score,
+                    }
+                } else {
+                    Expr::LeadingAttr {
+                        object: generated.spec.objects[1].name.clone(),
+                        attr: "pt".to_string(),
+                    }
+                },
+                bins: 10,
+                range: [0.0, if index.is_multiple_of(2) { 1.0 } else { 220.0 }],
+            }];
+            generated.has_histogram = true;
+            generated
+        })
+        .collect()
+}
+
+pub fn generated_weight_shape_specs() -> Vec<GeneratedSpec> {
+    (0..FUZZ_WEIGHT_SHAPE_SPEC_COUNT)
+        .map(|index| {
+            let mut rng = SplitMix64::new(
+                FUZZ_SEED
+                    ^ 0xf00d_574a_5a11_c0de
+                    ^ (index as u64).wrapping_mul(0x632b_e59b_d9b4_e019),
+            );
+            let mut generated = generated_standard_spec(index, &mut rng);
+            if generated.spec.histograms.is_empty() {
+                generated.spec.histograms = vec![HistogramDef {
+                    name: "fuzz_hist".to_string(),
+                    expr: leading_pt(OBJECTS[index % OBJECTS.len()].name),
+                    bins: 8,
+                    range: [0.0, 220.0],
+                }];
+            }
+            generated.spec.systematics = vec![
+                SystematicDef::Nominal,
+                SystematicDef::Weight(WeightSystematicDef {
+                    name: format!("fuzz_weight_shape_{index:03}"),
+                    up: round(rng.f64(1.1, 2.5)),
+                    down: round(rng.f64(0.25, 0.9)),
+                }),
+            ];
+            let shape_object = generated.spec.objects[index % generated.spec.objects.len()]
+                .name
+                .clone();
+            generated.spec.shape_corrections = vec![ShapeCorrectionDef {
+                name: format!("fuzz_shape_weight_{index:03}"),
+                collection: shape_object,
+                attr: "pt".to_string(),
+                up: round(rng.f64(1.02, 1.18)),
+                down: round(rng.f64(0.82, 0.98)),
+            }];
+            generated.has_histogram = true;
+            generated.has_weight_systematic = true;
+            generated.has_shape_correction = true;
+            generated
+        })
+        .collect()
+}
+
 fn generated_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
     let generated = generated_standard_spec(index, rng);
     if !generated.has_derived_object && index.is_multiple_of(3) {
@@ -275,6 +365,75 @@ fn generated_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
         return generated_model_spec(index, &mut model_rng);
     }
     generated
+}
+
+fn generated_union_spec(index: usize) -> GeneratedSpec {
+    let muon_threshold = 5.0 + (index % 12) as f64;
+    let electron_threshold = 7.0 + (index % 10) as f64;
+    let jet_threshold = 20.0 + (index % 18) as f64;
+    let mut channels = vec![
+        union_channel("mu", "Muon", muon_threshold),
+        union_channel("el", "Electron", electron_threshold),
+    ];
+    if index.is_multiple_of(3) {
+        channels.push(union_channel("jet", "Jet", jet_threshold));
+    }
+
+    GeneratedSpec {
+        index,
+        spec: AnalysisSpec {
+            name: format!("fuzz_union_diff_{index:03}"),
+            year: Year::Run2018,
+            objects: Vec::new(),
+            derived_objects: Vec::new(),
+            models: Vec::new(),
+            regions: Vec::new(),
+            outputs: Vec::new(),
+            histograms: vec![HistogramDef {
+                name: "fuzz_union_hist".to_string(),
+                expr: leading_pt("probe"),
+                bins: 12,
+                range: [0.0, 220.0],
+            }],
+            weight: WeightDef::default(),
+            systematics: vec![SystematicDef::Nominal],
+            shape_corrections: Vec::new(),
+            channels,
+        },
+        has_histogram: true,
+        has_weight_systematic: false,
+        has_shape_correction: false,
+        has_derived_object: false,
+        has_candidate_object: false,
+        has_model: false,
+    }
+}
+
+fn union_channel(name: &str, source: &str, pt_threshold: f64) -> ChannelDef {
+    ChannelDef {
+        name: name.to_string(),
+        objects: vec![ObjectDef {
+            name: "probe".to_string(),
+            source: source.to_string(),
+            cuts: vec![Cut {
+                lhs: Expr::Attr {
+                    object: "probe".to_string(),
+                    attr: "pt".to_string(),
+                },
+                op: CmpOp::Gt,
+                rhs: q(round(pt_threshold), Unit::GeV),
+            }],
+        }],
+        derived_objects: Vec::new(),
+        regions: vec![RegionDef {
+            name: "selected".to_string(),
+            require: vec![count_requirement("probe", CmpOp::Ge, 1.0)],
+        }],
+        outputs: vec![
+            output("n_probe", Expr::Count("probe".to_string())),
+            output("lead_probe_pt", leading_pt("probe")),
+        ],
+    }
 }
 
 fn generated_standard_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {

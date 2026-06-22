@@ -72,6 +72,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     let specs = fuzz_specs::generated_specs();
+    let union_specs = fuzz_specs::generated_union_specs();
+    let model_histogram_specs = fuzz_specs::generated_model_histogram_specs();
+    let weight_shape_specs = fuzz_specs::generated_weight_shape_specs();
     let mut modules = String::new();
     let derived_cases = specs.iter().filter(|case| case.has_derived_object).count();
     let candidate_cases = specs
@@ -79,6 +82,8 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
         .filter(|case| case.has_candidate_object)
         .count();
     let model_cases = specs.iter().filter(|case| case.has_model).count();
+    let model_histogram_cases = model_histogram_specs.len();
+    let weight_shape_cases = weight_shape_specs.len();
     writeln!(
         modules,
         "pub const FUZZ_DERIVED_CASES: usize = {derived_cases};"
@@ -90,6 +95,19 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     writeln!(
         modules,
         "pub const FUZZ_MODEL_CASES: usize = {model_cases};"
+    )?;
+    writeln!(
+        modules,
+        "pub const FUZZ_UNION_CASES: usize = {};",
+        union_specs.len()
+    )?;
+    writeln!(
+        modules,
+        "pub const FUZZ_MODEL_HISTOGRAM_CASES: usize = {model_histogram_cases};"
+    )?;
+    writeln!(
+        modules,
+        "pub const FUZZ_WEIGHT_SHAPE_CASES: usize = {weight_shape_cases};"
     )?;
     writeln!(modules)?;
     writeln!(modules, "#[derive(Debug, Clone, Copy, PartialEq)]")?;
@@ -121,6 +139,21 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     writeln!(modules, "#[derive(Debug, Clone, PartialEq)]")?;
     writeln!(modules, "pub struct FuzzCaseResult {{")?;
     writeln!(modules, "    pub rows: Vec<Option<FuzzRow>>,")?;
+    writeln!(
+        modules,
+        "    pub histogram: Option<Vec<FuzzHistVariation>>,"
+    )?;
+    writeln!(modules, "}}")?;
+    writeln!(modules)?;
+    writeln!(modules, "#[derive(Debug, Clone, PartialEq)]")?;
+    writeln!(modules, "pub struct FuzzUnionRow {{")?;
+    writeln!(modules, "    pub channel: String,")?;
+    writeln!(modules, "    pub values: Vec<(String, FuzzValue)>,")?;
+    writeln!(modules, "}}")?;
+    writeln!(modules)?;
+    writeln!(modules, "#[derive(Debug, Clone, PartialEq)]")?;
+    writeln!(modules, "pub struct FuzzUnionCaseResult {{")?;
+    writeln!(modules, "    pub rows: Vec<Vec<FuzzUnionRow>>,")?;
     writeln!(
         modules,
         "    pub histogram: Option<Vec<FuzzHistVariation>>,"
@@ -172,6 +205,66 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
         emit_run_case(&mut modules, &module_name, generated)?;
     }
 
+    let mut union_arms = String::new();
+    for generated in &union_specs {
+        let module_name = format!("union_case_{:03}", generated.index);
+        let file_name = format!("generated_fuzz_union_{:03}.rs", generated.index);
+        emit_generated_module(
+            catalogue,
+            out_dir,
+            generated,
+            &module_name,
+            &file_name,
+            &mut modules,
+        )?;
+        writeln!(
+            union_arms,
+            "        {} => run_{}(events),",
+            generated.index, module_name
+        )?;
+        emit_run_union_case(&mut modules, &module_name, generated)?;
+    }
+
+    let mut model_histogram_arms = String::new();
+    for generated in &model_histogram_specs {
+        let module_name = format!("model_hist_case_{:03}", generated.index);
+        let file_name = format!("generated_fuzz_model_hist_{:03}.rs", generated.index);
+        emit_generated_module(
+            catalogue,
+            out_dir,
+            generated,
+            &module_name,
+            &file_name,
+            &mut modules,
+        )?;
+        writeln!(
+            model_histogram_arms,
+            "        {} => run_{}(events),",
+            generated.index, module_name
+        )?;
+        emit_run_case(&mut modules, &module_name, generated)?;
+    }
+
+    let mut weight_shape_arms = String::new();
+    for generated in &weight_shape_specs {
+        let module_name = format!("weight_shape_case_{:03}", generated.index);
+        let file_name = format!("generated_fuzz_weight_shape_{:03}.rs", generated.index);
+        emit_generated_module(
+            catalogue,
+            out_dir,
+            generated,
+            &module_name,
+            &file_name,
+            &mut modules,
+        )?;
+        writeln!(
+            weight_shape_arms,
+            "        {} => run_{}(events),",
+            generated.index, module_name
+        )?;
+        emit_run_case(&mut modules, &module_name, generated)?;
+    }
+
     writeln!(
         modules,
         "pub fn run_case(case: usize, events: &[nano_core::Event]) -> nano_core::Result<FuzzCaseResult> {{"
@@ -185,7 +278,78 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     writeln!(modules, "    }}")?;
     writeln!(modules, "}}")?;
 
+    writeln!(
+        modules,
+        "pub fn run_union_case(case: usize, events: &[nano_core::Event]) -> nano_core::Result<FuzzUnionCaseResult> {{"
+    )?;
+    writeln!(modules, "    match case {{")?;
+    modules.push_str(&union_arms);
+    writeln!(
+        modules,
+        "        _ => Err(nano_core::NanoError::MissingBranch {{ branch: format!(\"unknown union fuzz case {{case}}\") }}),"
+    )?;
+    writeln!(modules, "    }}")?;
+    writeln!(modules, "}}")?;
+
+    writeln!(
+        modules,
+        "pub fn run_model_histogram_case(case: usize, events: &[nano_core::Event]) -> nano_core::Result<FuzzCaseResult> {{"
+    )?;
+    writeln!(modules, "    match case {{")?;
+    modules.push_str(&model_histogram_arms);
+    writeln!(
+        modules,
+        "        _ => Err(nano_core::NanoError::MissingBranch {{ branch: format!(\"unknown model histogram fuzz case {{case}}\") }}),"
+    )?;
+    writeln!(modules, "    }}")?;
+    writeln!(modules, "}}")?;
+
+    writeln!(
+        modules,
+        "pub fn run_weight_shape_case(case: usize, events: &[nano_core::Event]) -> nano_core::Result<FuzzCaseResult> {{"
+    )?;
+    writeln!(modules, "    match case {{")?;
+    modules.push_str(&weight_shape_arms);
+    writeln!(
+        modules,
+        "        _ => Err(nano_core::NanoError::MissingBranch {{ branch: format!(\"unknown weight-shape fuzz case {{case}}\") }}),"
+    )?;
+    writeln!(modules, "    }}")?;
+    writeln!(modules, "}}")?;
+
     fs::write(out_dir.join("generated_fuzz_modules.rs"), modules)?;
+    Ok(())
+}
+
+fn emit_generated_module(
+    catalogue: &Catalogue,
+    out_dir: &Path,
+    generated: &fuzz_specs::GeneratedSpec,
+    module_name: &str,
+    file_name: &str,
+    modules: &mut String,
+) -> Result<(), Box<dyn Error>> {
+    let plan = validate(&generated.spec, catalogue).map_err(|errors| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    })?;
+    let source = generate_producer_source(&plan)?;
+    fs::write(out_dir.join(file_name), source)?;
+    writeln!(modules)?;
+    writeln!(modules, "#[allow(dead_code, non_snake_case, unused_parens, clippy::approx_constant, clippy::collapsible_if, clippy::double_parens, clippy::manual_range_contains, clippy::neg_cmp_op_on_partial_ord, clippy::unnecessary_cast)]")?;
+    writeln!(modules, "pub mod {module_name} {{")?;
+    writeln!(
+        modules,
+        "    include!(concat!(env!(\"OUT_DIR\"), \"/{file_name}\"));"
+    )?;
+    writeln!(modules, "}}")?;
+    writeln!(modules)?;
     Ok(())
 }
 
@@ -215,16 +379,38 @@ fn emit_run_case(
             modules,
             "    let mut histograms = {module_name}::GenHistograms::new();"
         )?;
-        if generated.has_shape_correction && !generated.has_weight_systematic {
+        if generated.has_model {
+            let model_name = generated
+                .spec
+                .models
+                .first()
+                .map(|model| model.name.as_str())
+                .expect("model flag implies model spec");
+            writeln!(
+                modules,
+                "    let predictor = nano_inference::MockPredictor::new({model_name:?});"
+            )?;
+        }
+        if generated.has_shape_correction {
             writeln!(modules, "    for event in events {{")?;
             writeln!(
                 modules,
-                "        rows.push({module_name}::GeneratedProducer::analyze(event)?.map(normalize_{module_name}));"
+                "        rows.push({analyze_call});",
+                analyze_call = if generated.has_model {
+                    format!("{module_name}::GeneratedProducer::analyze(event, &predictor).map_err(|error| nano_core::NanoError::MissingAttachment {{ name: error.to_string() }})?.map(normalize_{module_name})")
+                } else {
+                    format!("{module_name}::GeneratedProducer::analyze(event)?.map(normalize_{module_name})")
+                }
             )?;
             for (_, variant) in systematic_variants(&generated.spec) {
                 writeln!(
                     modules,
-                    "        let _ = {module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, {module_name}::Systematic::{variant})?;"
+                    "        let _ = {fill_call};",
+                    fill_call = if generated.has_model {
+                        format!("{module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, {module_name}::Systematic::{variant}, &predictor).map_err(|error| nano_core::NanoError::MissingAttachment {{ name: error.to_string() }})?")
+                    } else {
+                        format!("{module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, {module_name}::Systematic::{variant})?")
+                    }
                 )?;
             }
             writeln!(modules, "    }}")?;
@@ -232,7 +418,12 @@ fn emit_run_case(
             writeln!(modules, "    for event in events {{")?;
             writeln!(
                 modules,
-                "        rows.push({module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, {module_name}::Systematic::Nominal)?.map(normalize_{module_name}));"
+                "        rows.push({fill_call}.map(normalize_{module_name}));",
+                fill_call = if generated.has_model {
+                    format!("{module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, {module_name}::Systematic::Nominal, &predictor).map_err(|error| nano_core::NanoError::MissingAttachment {{ name: error.to_string() }})?")
+                } else {
+                    format!("{module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, {module_name}::Systematic::Nominal)?")
+                }
             )?;
             writeln!(modules, "    }}")?;
         }
@@ -290,6 +481,81 @@ fn emit_run_case(
     writeln!(modules, "    FuzzRow {{")?;
     writeln!(modules, "        values: vec![")?;
     for output in &generated.spec.outputs {
+        writeln!(
+            modules,
+            "            ({}.to_string(), {}),",
+            format_args!("{:?}", output.name),
+            fuzz_value_expr(&output.expr, &output.name)
+        )?;
+    }
+    writeln!(modules, "        ],")?;
+    writeln!(modules, "    }}")?;
+    writeln!(modules, "}}")?;
+    writeln!(modules)?;
+    Ok(())
+}
+
+fn emit_run_union_case(
+    modules: &mut String,
+    module_name: &str,
+    generated: &fuzz_specs::GeneratedSpec,
+) -> Result<(), Box<dyn Error>> {
+    let histogram_name = generated
+        .spec
+        .histograms
+        .first()
+        .map(|histogram| histogram.name.as_str());
+    writeln!(
+        modules,
+        "fn run_{module_name}(events: &[nano_core::Event]) -> nano_core::Result<FuzzUnionCaseResult> {{"
+    )?;
+    writeln!(
+        modules,
+        "    let mut rows = Vec::with_capacity(events.len());"
+    )?;
+    if generated.has_histogram {
+        writeln!(
+            modules,
+            "    let mut histograms = {module_name}::GenHistograms::new();"
+        )?;
+        writeln!(modules, "    for event in events {{")?;
+        writeln!(
+            modules,
+            "        rows.push({module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, {module_name}::Systematic::Nominal)?.into_iter().map(normalize_{module_name}).collect());"
+        )?;
+        writeln!(modules, "    }}")?;
+        let histogram_name = histogram_name.expect("histogram exists when flag is set");
+        writeln!(modules, "    let histogram = Some(vec![")?;
+        writeln!(
+            modules,
+            "        FuzzHistVariation {{ systematic: \"Nominal\".to_string(), hist: snapshot_hist(&histograms.{histogram_name}) }},"
+        )?;
+        writeln!(modules, "    ]);")?;
+    } else {
+        writeln!(modules, "    for event in events {{")?;
+        writeln!(
+            modules,
+            "        rows.push({module_name}::GeneratedProducer::analyze(event)?.into_iter().map(normalize_{module_name}).collect());"
+        )?;
+        writeln!(modules, "    }}")?;
+        writeln!(modules, "    let histogram = None;")?;
+    }
+    writeln!(modules, "    Ok(FuzzUnionCaseResult {{ rows, histogram }})")?;
+    writeln!(modules, "}}")?;
+    writeln!(modules)?;
+    writeln!(
+        modules,
+        "fn normalize_{module_name}(row: {module_name}::GenRow) -> FuzzUnionRow {{"
+    )?;
+    writeln!(modules, "    FuzzUnionRow {{")?;
+    writeln!(modules, "        channel: row.channel.to_string(),")?;
+    writeln!(modules, "        values: vec![")?;
+    let first_channel = generated
+        .spec
+        .channels
+        .first()
+        .expect("union spec has channels");
+    for output in &first_channel.outputs {
         writeln!(
             modules,
             "            ({}.to_string(), {}),",

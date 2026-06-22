@@ -505,7 +505,10 @@ fn executable_block(program: &KirProgram) -> Result<Block, KirError> {
         });
     }
 
-    if has_weight_systematic(program) && !program.histograms.is_empty() {
+    if has_weight_systematic(program)
+        && program.shape_corrections.is_empty()
+        && !program.histograms.is_empty()
+    {
         let systematic = ValueId(next_value);
         next_value += 1;
         let mut body = Block::default();

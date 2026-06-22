@@ -1,16 +1,18 @@
 //! Differential/property evidence for valid specs on the compiled demo path.
 //!
-//! Seed: `0x4e414e4f5f444946`. Generated cases: 400.
+//! Seed: `0x4e414e4f5f444946`. Baseline generated cases: 400.
 //! The shared generator emits deterministic single-channel specs over real
 //! NanoAOD v9 Muon/Electron/Jet branches, with randomized f32 object cuts,
 //! two or three count/predicate/derived-object regions, count/count-where/
 //! leading-pt/sum-pt/bool/derived outputs, pair-derived objects, nested
 //! pair-plus-candidate objects, cross-collection candidate objects, and optional
-//! histograms over object or derived attributes with optional weight or pt-shape
-//! systematics. A deterministic subset of otherwise no-derived specs is replaced
-//! with mock-model taggers over real Muon or Jet batches; those model specs use
-//! the generated score in object cuts, region requirements, and leading-score
-//! outputs.
+//! histograms over object or derived attributes with optional weight, pt-shape,
+//! or combined weight-plus-shape systematics. A deterministic subset of
+//! otherwise no-derived specs is replaced with mock-model taggers over real Muon
+//! or Jet batches; those model specs use the generated score in object cuts,
+//! region requirements, leading-score outputs, and targeted score histograms.
+//! A targeted union corpus adds multi-channel Muon/Electron/Jet specs with
+//! matching output schemas and shared histograms.
 //!
 //! This test validates every generated spec, lowers it to KIR, verifies KIR,
 //! requires string codegen to succeed, then compares the KIR interpreter against
@@ -22,20 +24,25 @@
 //! Random mock-model specs are included in the same build-time compiled corpus
 //! and are compared interpreter == compiled producer using the shared mock score
 //! routine through the interpreter and `MockPredictor` through generated code.
-//! Multi-channel union specs, non-mock model providers, model-aware histograms,
-//! derived objects under model-aware codegen, and combined weight-plus-shape
-//! histogram systematics remain outside this dependency-free fuzz slice because
-//! both dynamic and compiled backends do not yet share one fully supported path
-//! for those combinations.
+//! Multi-channel union specs are compared as rows per event plus their shared
+//! histogram contents. Non-mock model providers remain excluded because the
+//! dependency-free interpreter intentionally supports only the mock provider.
+//! Derived objects under model-aware codegen remain excluded: model-aware
+//! string codegen currently rejects them with `derived objects are not yet
+//! supported by model-aware codegen`; an ignored minimal repro below pins that
+//! capability gap.
 
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
-use nano_gen_demo::fuzz::{FuzzCaseResult, FuzzHist1D, FuzzHistVariation, FuzzRow, FuzzValue};
+use nano_gen_demo::fuzz::{
+    FuzzCaseResult, FuzzHist1D, FuzzHistVariation, FuzzRow, FuzzUnionCaseResult, FuzzUnionRow,
+    FuzzValue,
+};
 use nano_spec::codegen::generate_producer_source;
 use nano_spec::interpret::{
-    interpret_and_fill, interpret_and_fill_systematic, interpret_systematic, InterpretedHistograms,
-    OutputRow, Value,
+    interpret_and_fill, interpret_and_fill_systematic, interpret_systematic, interpret_union,
+    ChannelOutputRow, InterpretedHistograms, OutputRow, Value,
 };
-use nano_spec::{validate, Catalogue};
+use nano_spec::{validate, AnalysisSpec, Catalogue, ChannelDef, ResolvedPlan};
 use nano_spec::{ShapeCorrectionDef, SystematicDef};
 
 #[path = "../fuzz_specs.rs"]
@@ -190,6 +197,219 @@ fn generated_candidate_min_delta_r_regression() {
     assert_eq!(compiled, interpreted, "fuzz case {}", case.index);
 }
 
+#[test]
+fn generated_union_specs_interpret_like_compiled_codegen() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let cases = fuzz_specs::generated_union_specs();
+    let events = synthetic_events();
+
+    let mut compiled_compared = 0_usize;
+    let mut histogram_cases = 0_usize;
+    for case in &cases {
+        let plan = validate(&case.spec, &catalogue).unwrap_or_else(|errors| {
+            panic!(
+                "generated union fuzz spec {} did not validate: {errors:?}\n{:#?}",
+                case.index, case.spec
+            )
+        });
+        let kir = nano_spec::kir::lower_plan_to_kir(&plan).unwrap_or_else(|error| {
+            panic!(
+                "generated union fuzz spec {} did not lower to KIR: {error}",
+                case.index
+            )
+        });
+        nano_spec::kir::verify(&kir).unwrap_or_else(|error| {
+            panic!(
+                "generated union fuzz spec {} produced invalid KIR: {error}",
+                case.index
+            )
+        });
+        generate_producer_source(&plan).unwrap_or_else(|error| {
+            panic!(
+                "generated union fuzz spec {} was not supported by codegen: {error}",
+                case.index
+            )
+        });
+
+        let interpreted = interpret_union_case(&plan, &events, case);
+        let compiled =
+            nano_gen_demo::fuzz::run_union_case(case.index, &events).unwrap_or_else(|error| {
+                panic!("compiled union fuzz case {} failed: {error}", case.index)
+            });
+        assert_eq!(compiled, interpreted, "union fuzz case {}", case.index);
+        compiled_compared += 1;
+        histogram_cases += usize::from(case.has_histogram);
+    }
+
+    assert_eq!(cases.len(), fuzz_specs::FUZZ_UNION_SPEC_COUNT);
+    assert_eq!(compiled_compared, cases.len());
+    assert_eq!(histogram_cases, cases.len());
+    assert_eq!(compiled_compared, nano_gen_demo::fuzz::FUZZ_UNION_CASES);
+    eprintln!(
+        "union differential fuzz seed=0x{seed:016x} generated={generated} compiled_compared={compiled_compared} histogram_cases={histogram_cases}",
+        seed = fuzz_specs::FUZZ_SEED,
+        generated = cases.len(),
+    );
+}
+
+#[test]
+fn generated_model_histogram_specs_interpret_like_compiled_codegen() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let cases = fuzz_specs::generated_model_histogram_specs();
+    let events = synthetic_events();
+
+    let mut compiled_compared = 0_usize;
+    for case in &cases {
+        let plan = validate(&case.spec, &catalogue).unwrap_or_else(|errors| {
+            panic!(
+                "generated model-histogram fuzz spec {} did not validate: {errors:?}\n{:#?}",
+                case.index, case.spec
+            )
+        });
+        let kir = nano_spec::kir::lower_plan_to_kir(&plan).unwrap_or_else(|error| {
+            panic!(
+                "generated model-histogram fuzz spec {} did not lower to KIR: {error}",
+                case.index
+            )
+        });
+        nano_spec::kir::verify(&kir).unwrap_or_else(|error| {
+            panic!(
+                "generated model-histogram fuzz spec {} produced invalid KIR: {error}",
+                case.index
+            )
+        });
+        generate_producer_source(&plan).unwrap_or_else(|error| {
+            panic!(
+                "generated model-histogram fuzz spec {} was not supported by codegen: {error}",
+                case.index
+            )
+        });
+
+        let interpreted = interpret_case(&plan, &events, case);
+        let compiled = nano_gen_demo::fuzz::run_model_histogram_case(case.index, &events)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "compiled model-histogram fuzz case {} failed: {error}",
+                    case.index
+                )
+            });
+        assert_eq!(
+            compiled, interpreted,
+            "model-histogram fuzz case {}",
+            case.index
+        );
+        compiled_compared += 1;
+    }
+
+    assert_eq!(cases.len(), fuzz_specs::FUZZ_MODEL_HISTOGRAM_SPEC_COUNT);
+    assert_eq!(compiled_compared, cases.len());
+    assert_eq!(
+        compiled_compared,
+        nano_gen_demo::fuzz::FUZZ_MODEL_HISTOGRAM_CASES
+    );
+    eprintln!(
+        "model-histogram differential fuzz seed=0x{seed:016x} generated={generated} compiled_compared={compiled_compared}",
+        seed = fuzz_specs::FUZZ_SEED,
+        generated = cases.len(),
+    );
+}
+
+#[test]
+fn generated_weight_shape_specs_interpret_like_compiled_codegen() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let cases = fuzz_specs::generated_weight_shape_specs();
+    let events = synthetic_events();
+
+    let mut compiled_compared = 0_usize;
+    for case in &cases {
+        let plan = validate(&case.spec, &catalogue).unwrap_or_else(|errors| {
+            panic!(
+                "generated weight+shape fuzz spec {} did not validate: {errors:?}\n{:#?}",
+                case.index, case.spec
+            )
+        });
+        let kir = nano_spec::kir::lower_plan_to_kir(&plan).unwrap_or_else(|error| {
+            panic!(
+                "generated weight+shape fuzz spec {} did not lower to KIR: {error}",
+                case.index
+            )
+        });
+        nano_spec::kir::verify(&kir).unwrap_or_else(|error| {
+            panic!(
+                "generated weight+shape fuzz spec {} produced invalid KIR: {error}",
+                case.index
+            )
+        });
+        generate_producer_source(&plan).unwrap_or_else(|error| {
+            panic!(
+                "generated weight+shape fuzz spec {} was not supported by codegen: {error}",
+                case.index
+            )
+        });
+
+        let interpreted = interpret_case(&plan, &events, case);
+        let compiled = nano_gen_demo::fuzz::run_weight_shape_case(case.index, &events)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "compiled weight+shape fuzz case {} failed: {error}",
+                    case.index
+                )
+            });
+        assert_eq!(
+            compiled, interpreted,
+            "weight+shape fuzz case {}",
+            case.index
+        );
+        compiled_compared += 1;
+    }
+
+    assert_eq!(cases.len(), fuzz_specs::FUZZ_WEIGHT_SHAPE_SPEC_COUNT);
+    assert_eq!(compiled_compared, cases.len());
+    assert_eq!(
+        compiled_compared,
+        nano_gen_demo::fuzz::FUZZ_WEIGHT_SHAPE_CASES
+    );
+    eprintln!(
+        "weight+shape differential fuzz seed=0x{seed:016x} generated={generated} compiled_compared={compiled_compared}",
+        seed = fuzz_specs::FUZZ_SEED,
+        generated = cases.len(),
+    );
+}
+
+#[test]
+#[ignore = "capability gap: model-aware string codegen rejects derived objects"]
+fn derived_under_model_minimal_repro_documents_codegen_gap() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let mut case = fuzz_specs::generated_model_histogram_specs()
+        .into_iter()
+        .next()
+        .expect("deterministic model histogram corpus is non-empty");
+    case.spec.name = "derived_under_model_repro".to_string();
+    case.spec.derived_objects = vec![nano_spec::DerivedObjectDef {
+        name: "tagged_pair".to_string(),
+        source: nano_spec::DerivedSource::Pair(nano_spec::ObjectPairDef {
+            object: case.spec.objects[1].name.clone(),
+            constraints: Vec::new(),
+            filters: Vec::new(),
+            selection: nano_spec::PairSelection::LeadingPt,
+            exclude: Vec::new(),
+        }),
+    }];
+    case.spec.outputs.push(nano_spec::OutputDef {
+        name: "tagged_pair_mass".to_string(),
+        expr: nano_spec::Expr::Attr {
+            object: "tagged_pair".to_string(),
+            attr: "mass".to_string(),
+        },
+    });
+    let plan = validate(&case.spec, &catalogue).expect("minimal repro should validate");
+    let error = generate_producer_source(&plan).expect_err("model-aware derived codegen gap");
+    assert_eq!(
+        error.to_string(),
+        "derived objects are not yet supported by model-aware codegen"
+    );
+}
+
 fn interpret_case(
     plan: &nano_spec::ResolvedPlan,
     events: &[Event],
@@ -200,7 +420,7 @@ fn interpret_case(
         .iter()
         .enumerate()
         .map(|(entry, event)| {
-            if case.has_shape_correction && !case.has_weight_systematic && case.has_histogram {
+            if case.has_shape_correction && case.has_histogram {
                 let row = interpret_systematic(plan, event, "Nominal")
                     .unwrap_or_else(|error| panic!("entry {entry} interpret failed: {error}"))
                     .map(normalize_interpreted_row);
@@ -239,6 +459,75 @@ fn interpret_case(
     });
 
     FuzzCaseResult { rows, histogram }
+}
+
+fn interpret_union_case(
+    plan: &ResolvedPlan,
+    events: &[Event],
+    case: &fuzz_specs::GeneratedSpec,
+) -> FuzzUnionCaseResult {
+    let mut histograms = InterpretedHistograms::new(plan);
+    let rows = events
+        .iter()
+        .enumerate()
+        .map(|(entry, event)| {
+            let rows = interpret_union(plan, event)
+                .unwrap_or_else(|error| panic!("entry {entry} union interpret failed: {error}"))
+                .into_iter()
+                .map(normalize_interpreted_union_row)
+                .collect::<Vec<_>>();
+            for channel in &plan.spec.channels {
+                let channel_plan = ResolvedPlan {
+                    spec: channel_as_spec(channel, &plan.spec),
+                    read_branches: plan.read_branches.clone(),
+                };
+                let _ = interpret_and_fill(&channel_plan, event, &mut histograms).unwrap_or_else(
+                    |error| {
+                        panic!(
+                            "entry {entry} union channel `{}` histogram fill failed: {error}",
+                            channel.name
+                        )
+                    },
+                );
+            }
+            rows
+        })
+        .collect::<Vec<_>>();
+    let histogram = plan.spec.histograms.first().map(|histogram| {
+        let hist = histograms
+            .get(&histogram.name)
+            .unwrap_or_else(|| panic!("missing interpreted histogram `{}`", histogram.name));
+        if case.has_weight_systematic || case.has_shape_correction {
+            systematic_variants(case)
+                .into_iter()
+                .map(|systematic| hist_variation(systematic.clone(), hist.get(systematic)))
+                .collect()
+        } else {
+            vec![hist_variation(
+                "Nominal".to_string(),
+                hist.get("Nominal".to_string()),
+            )]
+        }
+    });
+
+    FuzzUnionCaseResult { rows, histogram }
+}
+
+fn channel_as_spec(channel: &ChannelDef, parent: &AnalysisSpec) -> AnalysisSpec {
+    AnalysisSpec {
+        name: format!("{}_{}", parent.name, channel.name),
+        year: parent.year.clone(),
+        objects: channel.objects.clone(),
+        derived_objects: channel.derived_objects.clone(),
+        models: Vec::new(),
+        regions: channel.regions.clone(),
+        outputs: channel.outputs.clone(),
+        histograms: parent.histograms.clone(),
+        weight: parent.weight.clone(),
+        systematics: parent.systematics.clone(),
+        shape_corrections: parent.shape_corrections.clone(),
+        channels: Vec::new(),
+    }
 }
 
 fn has_sum_region_requirement(case: &fuzz_specs::GeneratedSpec) -> bool {
@@ -304,6 +593,18 @@ fn hist_variation(systematic: String, hist: &nano_analysis::Hist1D) -> FuzzHistV
 fn normalize_interpreted_row(row: OutputRow) -> FuzzRow {
     FuzzRow {
         values: row
+            .values
+            .into_iter()
+            .map(|(name, value)| (name, normalize_value(value)))
+            .collect(),
+    }
+}
+
+fn normalize_interpreted_union_row(row: ChannelOutputRow) -> FuzzUnionRow {
+    FuzzUnionRow {
+        channel: row.channel,
+        values: row
+            .row
             .values
             .into_iter()
             .map(|(name, value)| (name, normalize_value(value)))

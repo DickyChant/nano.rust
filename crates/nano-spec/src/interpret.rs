@@ -277,7 +277,7 @@ pub fn interpret_and_fill_systematic(
         )),
         BlockOutcome::Return(row) => {
             if row.is_some()
-                && !plan.spec.has_weight_systematic()
+                && (!plan.spec.has_weight_systematic() || plan.spec.has_shape_correction())
                 && !evaluator.fill_current_histograms()?
             {
                 return Ok(None);

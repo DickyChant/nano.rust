@@ -118,6 +118,10 @@ impl<'a> Generator<'a> {
 
         if !self.spec().histograms.is_empty() {
             self.emit_histogram_struct(&mut source)?;
+        } else {
+            writeln!(source, "#[derive(Debug, Clone, Copy, PartialEq, Eq)]").unwrap();
+            writeln!(source, "pub struct GenHistograms;").unwrap();
+            writeln!(source).unwrap();
         }
 
         for channel in &self.spec().channels {
@@ -439,7 +443,10 @@ impl<'a> Generator<'a> {
                             &mut unwrapped_required,
                         )?;
                     }
-                    if !(emit_histograms && self.spec().has_weight_systematic()) {
+                    if !(emit_histograms
+                        && self.spec().has_weight_systematic()
+                        && !self.spec().has_shape_correction())
+                    {
                         for histogram in &kir.histograms {
                             self.emit_required_output_unwrap(
                                 source,
@@ -450,7 +457,10 @@ impl<'a> Generator<'a> {
                         }
                     }
 
-                    if emit_histograms && !self.spec().has_weight_systematic() {
+                    if emit_histograms
+                        && (!self.spec().has_weight_systematic()
+                            || self.spec().has_shape_correction())
+                    {
                         self.emit_histogram_fills(source)?;
                     }
 
@@ -643,12 +653,56 @@ impl<'a> Generator<'a> {
         }
         writeln!(source, "}}").unwrap();
         writeln!(source).unwrap();
+        if !self.spec().histograms.is_empty() {
+            self.emit_histogram_struct(&mut source)?;
+        } else {
+            writeln!(source, "#[derive(Debug, Clone, Copy, PartialEq, Eq)]").unwrap();
+            writeln!(source, "pub struct GenHistograms;").unwrap();
+            writeln!(source).unwrap();
+        }
         writeln!(source, "pub struct GeneratedProducer;").unwrap();
         writeln!(source).unwrap();
         writeln!(source, "impl GeneratedProducer {{").unwrap();
         writeln!(
             source,
             "    pub fn analyze(event: &nano_core::Event, predictor: &impl nano_inference::Predictor) -> GenResult<Option<GenRow>> {{"
+        )
+        .unwrap();
+        if self.spec().histograms.is_empty() {
+            writeln!(
+                source,
+                "        Self::analyze_impl(event, predictor, None, Systematic::Nominal)"
+            )
+            .unwrap();
+            writeln!(source, "    }}").unwrap();
+        } else {
+            writeln!(
+                source,
+                "        Self::analyze_impl(event, predictor, None, Systematic::Nominal)"
+            )
+            .unwrap();
+            writeln!(source, "    }}").unwrap();
+            writeln!(
+                source,
+                "    pub fn analyze_and_fill(event: &nano_core::Event, histograms: &mut GenHistograms, systematic: Systematic, predictor: &impl nano_inference::Predictor) -> GenResult<Option<GenRow>> {{"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "        Self::analyze_impl(event, predictor, Some(histograms), systematic)"
+            )
+            .unwrap();
+            writeln!(source, "    }}").unwrap();
+        }
+        let systematic_param = "_systematic";
+        let histograms_param = if self.spec().histograms.is_empty() {
+            "_histograms"
+        } else {
+            "histograms"
+        };
+        writeln!(
+            source,
+            "    fn analyze_impl(event: &nano_core::Event, predictor: &impl nano_inference::Predictor, {histograms_param}: Option<&mut GenHistograms>, {systematic_param}: Systematic) -> GenResult<Option<GenRow>> {{"
         )
         .unwrap();
 
@@ -699,6 +753,9 @@ impl<'a> Generator<'a> {
             }
         }
 
+        if !self.spec().histograms.is_empty() {
+            self.emit_model_histogram_fills(&mut source)?;
+        }
         writeln!(source, "        Ok(Some(GenRow {{").unwrap();
         for output in &self.spec().outputs {
             let field = checked_ident(&output.name, "output field")?;
@@ -776,6 +833,14 @@ impl<'a> Generator<'a> {
         if !self.spec().models.is_empty() && self.spec().has_shape_correction() {
             return Err(CodegenError::UnsupportedFeature(
                 "shape corrections are not yet supported by model-aware codegen".to_string(),
+            ));
+        }
+        if !self.spec().models.is_empty()
+            && !self.spec().histograms.is_empty()
+            && self.spec().has_histogram_systematic()
+        {
+            return Err(CodegenError::UnsupportedFeature(
+                "histogram systematics are not yet supported by model-aware codegen".to_string(),
             ));
         }
 
@@ -1250,6 +1315,39 @@ impl<'a> Generator<'a> {
                 )
                 .unwrap();
             }
+        }
+        writeln!(source, "        }}").unwrap();
+        Ok(())
+    }
+
+    fn emit_model_histogram_fills(&self, source: &mut String) -> Result<(), CodegenError> {
+        if self.spec().histograms.is_empty() {
+            return Ok(());
+        }
+        let Some(region) = self.spec().regions.last() else {
+            return Err(CodegenError::UnsupportedFeature(
+                "histogram outputs require at least one selected region".to_string(),
+            ));
+        };
+        let region_event = checked_ident(&region.name, "region event")?;
+        let region_type = region_type_ident(&region.name)?;
+        writeln!(source, "        if let Some(histograms) = histograms {{").unwrap();
+        writeln!(
+            source,
+            "            let weighted = {region_event}_event.weight(nano_analysis::EventWeight::nominal());"
+        )
+        .unwrap();
+        for histogram in &self.spec().histograms {
+            let field = checked_ident(&histogram.name, "histogram field")?;
+            let value = self.histogram_fill_value_expr(
+                &histogram.expr,
+                &self.emit_model_output_expr(&histogram.expr)?,
+            )?;
+            writeln!(
+                source,
+                "            nano_analysis::fill::<{region_type}, nano_analysis::Nominal>(&mut histograms.{field}, &weighted, {value});"
+            )
+            .unwrap();
         }
         writeln!(source, "        }}").unwrap();
         Ok(())
