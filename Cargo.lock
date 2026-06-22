@@ -1084,6 +1084,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-gen-mutagger-demo"
+version = "0.0.0"
+dependencies = [
+ "nano-analysis",
+ "nano-core",
+ "nano-inference",
+ "nano-spec",
+]
+
+[[package]]
 name = "nano-gen-tagger-demo"
 version = "0.0.0"
 dependencies = [

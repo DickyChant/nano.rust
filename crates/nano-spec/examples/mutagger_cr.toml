@@ -1,0 +1,48 @@
+[analysis]
+name = "mutagger_cr"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = [
+  "pt > 30 GeV",
+  "abs(eta) < 2.4",
+]
+
+[objects.tagged_muon]
+source = "Muon"
+cuts = [
+  "pt > 30 GeV",
+  "abs(eta) < 2.4",
+  "topscore > 0.5",
+]
+
+[[model]]
+name = "muon_tagger"
+inputs = ["Muon_pt", "Muon_eta", "Muon_phi"]
+output = "Muon_topscore"
+batch = "Muon"
+
+[model.provider]
+kind = "mock"
+
+[regions.control]
+require = ["count(tagged_muon) >= 1"]
+
+[[outputs]]
+name = "n_selected_muons"
+expr = "count(good_muon)"
+
+[[outputs]]
+name = "n_tagged_muons"
+expr = "count(tagged_muon)"
+
+[[outputs]]
+name = "leading_muon_pt"
+expr = "leading(good_muon).pt"
+
+[[histogram]]
+name = "leading_muon_pt"
+expr = "leading(good_muon).pt"
+bins = 30
+range = [30.0, 330.0]

@@ -1,0 +1,29 @@
+// Scoped-down ADL companion for mutagger_cr.toml.
+//
+// The current ADL grammar in crates/nano-spec/src/adl.rs has no surface for
+// model bindings, so the [[model]] muon_tagger declaration and the
+// topscore-threshold tagged_muon object cannot be represented here without
+// changing ADL semantics.
+
+analysis mutagger_cr year Run2018;
+
+object good_muon : Muon {
+  pt > 30 GeV;
+  abs(eta) < 2.4;
+}
+
+region control {
+  count(good_muon) >= 1;
+}
+
+define n_selected_muons = count(good_muon);
+define leading_muon_pt = leading(good_muon).pt;
+
+output n_selected_muons;
+output leading_muon_pt;
+
+histogram leading_muon_pt {
+  expr = leading(good_muon).pt;
+  bins = 30;
+  range = [30.0, 330.0];
+}
