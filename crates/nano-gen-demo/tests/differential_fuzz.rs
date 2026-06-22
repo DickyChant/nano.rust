@@ -50,6 +50,8 @@ fn generated_valid_specs_interpret_like_compiled_codegen() {
     let mut shape_systematic_cases = 0_usize;
     let mut derived_cases = 0_usize;
     let mut candidate_cases = 0_usize;
+    let mut sum_region_cases = 0_usize;
+    let mut leading_region_cases = 0_usize;
 
     for case in &cases {
         let plan = validate(&case.spec, &catalogue).unwrap_or_else(|errors| {
@@ -93,6 +95,8 @@ fn generated_valid_specs_interpret_like_compiled_codegen() {
         shape_systematic_cases += usize::from(case.has_shape_correction);
         derived_cases += usize::from(case.has_derived_object);
         candidate_cases += usize::from(case.has_candidate_object);
+        sum_region_cases += usize::from(has_sum_region_requirement(case));
+        leading_region_cases += usize::from(has_leading_region_requirement(case));
     }
 
     assert_eq!(cases.len(), fuzz_specs::FUZZ_SPEC_COUNT);
@@ -120,33 +124,52 @@ fn generated_valid_specs_interpret_like_compiled_codegen() {
         candidate_cases > 0,
         "deterministic generator should include candidate-object cases"
     );
+    assert!(
+        sum_region_cases > 0,
+        "deterministic generator should include sum region requirements"
+    );
+    assert!(
+        leading_region_cases > 0,
+        "deterministic generator should include leading region requirements"
+    );
 
     eprintln!(
-        "differential fuzz seed=0x{seed:016x} generated={generated} validated={validated} kir_verified={kir_verified} codegen_emitted={codegen_emitted} compiled_compared={compiled_compared} histogram_cases={histogram_cases} weight_systematic_cases={weight_systematic_cases} shape_systematic_cases={shape_systematic_cases} derived_cases={derived_cases} candidate_cases={candidate_cases}",
+        "differential fuzz seed=0x{seed:016x} generated={generated} validated={validated} kir_verified={kir_verified} codegen_emitted={codegen_emitted} compiled_compared={compiled_compared} histogram_cases={histogram_cases} weight_systematic_cases={weight_systematic_cases} shape_systematic_cases={shape_systematic_cases} derived_cases={derived_cases} candidate_cases={candidate_cases} sum_region_cases={sum_region_cases} leading_region_cases={leading_region_cases}",
         seed = fuzz_specs::FUZZ_SEED,
         generated = cases.len(),
     );
 }
 
 #[test]
-fn generated_case_128_candidate_min_delta_r_regression() {
+fn generated_candidate_min_delta_r_regression() {
     let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
     let cases = fuzz_specs::generated_specs();
     let events = synthetic_events();
-    let case = &cases[128];
-    assert!(case.has_candidate_object);
-    assert!(case
-        .spec
-        .outputs
+
+    let (case, compiled) = cases
         .iter()
-        .any(|output| output.name == "emu_min_delta_r"));
+        .filter(|case| {
+            case.has_candidate_object
+                && case
+                    .spec
+                    .outputs
+                    .iter()
+                    .any(|output| output.name == "emu_min_delta_r")
+        })
+        .find_map(|case| {
+            let compiled = nano_gen_demo::fuzz::run_case(case.index, &events)
+                .expect("compiled regression case failed");
+            compiled
+                .rows
+                .iter()
+                .any(|row| row.is_some())
+                .then_some((case, compiled))
+        })
+        .expect("deterministic generator should include a populated emu_min_delta_r case");
 
     let plan = validate(&case.spec, &catalogue).expect("validate regression spec");
     let interpreted = interpret_case(&plan, &events, case);
-    let compiled = nano_gen_demo::fuzz::run_case(case.index, &events)
-        .expect("compiled regression case failed");
 
-    assert!(compiled.rows.iter().any(|row| row.is_some()));
     assert_eq!(compiled, interpreted, "fuzz case {}", case.index);
 }
 
@@ -201,6 +224,24 @@ fn interpret_case(
     });
 
     FuzzCaseResult { rows, histogram }
+}
+
+fn has_sum_region_requirement(case: &fuzz_specs::GeneratedSpec) -> bool {
+    case.spec.regions.iter().any(|region| {
+        region
+            .require
+            .iter()
+            .any(|requirement| matches!(requirement.lhs, nano_spec::Expr::SumAttr { .. }))
+    })
+}
+
+fn has_leading_region_requirement(case: &fuzz_specs::GeneratedSpec) -> bool {
+    case.spec.regions.iter().any(|region| {
+        region
+            .require
+            .iter()
+            .any(|requirement| matches!(requirement.lhs, nano_spec::Expr::LeadingAttr { .. }))
+    })
 }
 
 fn hist_variation(systematic: &'static str, hist: &nano_analysis::Hist1D) -> FuzzHistVariation {

@@ -610,10 +610,261 @@ fn output_expr_type(expr: &Expr) -> Type {
 }
 
 pub fn verify(program: &KirProgram) -> Result<(), KirError> {
+    verify_requirements(program)?;
     verify_shape_corrections(program)?;
     let registry = PrimitiveRegistry::standard();
     let mut values = BTreeMap::new();
     verify_block(&program.block, &registry, &mut values)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequirementExprType {
+    Numeric(crate::Dimension),
+    Count,
+    Bool,
+}
+
+fn verify_requirements(program: &KirProgram) -> Result<(), KirError> {
+    for region in &program.regions {
+        for requirement in &region.requirements {
+            let context = format!("region `{}` requirement `{}`", region.name, requirement.lhs);
+            let expr_type = verify_requirement_expr(program, &requirement.lhs, &context)?;
+            let dimension = match expr_type {
+                RequirementExprType::Numeric(dimension) => dimension,
+                RequirementExprType::Count | RequirementExprType::Bool => {
+                    crate::Dimension::Dimensionless
+                }
+            };
+            verify_requirement_unit(&context, &requirement.lhs, dimension, &requirement.rhs)?;
+            if matches!(expr_type, RequirementExprType::Bool) {
+                verify_bool_requirement(&context, requirement)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_requirement_expr(
+    program: &KirProgram,
+    expr: &Expr,
+    context: &str,
+) -> Result<RequirementExprType, KirError> {
+    match expr {
+        Expr::Count(object) => {
+            require_object(program, object, context)?;
+            Ok(RequirementExprType::Count)
+        }
+        Expr::CountWhere { object, predicate } => {
+            require_object(program, object, context)?;
+            verify_selected_numeric_expr(program, object, &predicate.lhs, context)?;
+            Ok(RequirementExprType::Count)
+        }
+        Expr::SumAttr { object, attr } | Expr::LeadingAttr { object, attr } => {
+            require_object_attr(program, object, attr, context).map(RequirementExprType::Numeric)
+        }
+        Expr::All { object, predicate } | Expr::Any { object, predicate } => {
+            require_object(program, object, context)?;
+            verify_selected_numeric_expr(program, object, &predicate.lhs, context)?;
+            Ok(RequirementExprType::Bool)
+        }
+        Expr::EitherPairPt { left, right, .. } => {
+            require_object_attr(program, left, "pt", context)?;
+            require_object_attr(program, right, "pt", context)?;
+            Ok(RequirementExprType::Bool)
+        }
+        Expr::ClosestMass { left, right, .. } | Expr::OtherMass { left, right, .. } => {
+            require_derived_attr(program, left, "mass", context)?;
+            require_derived_attr(program, right, "mass", context)?;
+            Ok(RequirementExprType::Numeric(crate::Dimension::Momentum))
+        }
+        Expr::Attr { object, attr } => if program
+            .derived_objects
+            .iter()
+            .any(|derived| derived.name == *object)
+        {
+            require_derived_attr(program, object, attr, context)
+        } else {
+            require_object_attr(program, object, attr, context)
+        }
+        .map(RequirementExprType::Numeric),
+        Expr::Literal(_)
+        | Expr::Binary { .. }
+        | Expr::Abs(_)
+        | Expr::Sqrt(_)
+        | Expr::PairDeltaR
+        | Expr::PairLeadingPt
+        | Expr::PairSubleadingPt
+        | Expr::CandidateMinDeltaR
+        | Expr::CandidateLeadingPt
+        | Expr::CandidateSubleadingPt => Err(KirError::Unsupported(format!(
+            "{context}: expression `{expr}` is not supported as a region requirement"
+        ))),
+    }
+}
+
+fn verify_selected_numeric_expr(
+    program: &KirProgram,
+    object_name: &str,
+    expr: &Expr,
+    context: &str,
+) -> Result<crate::Dimension, KirError> {
+    match expr {
+        Expr::Attr { object, attr } if object == object_name => {
+            require_object_attr(program, object, attr, context)
+        }
+        Expr::Attr { object, .. } => Err(KirError::Unsupported(format!(
+            "{context}: collection predicate for `{object_name}` references `{object}`"
+        ))),
+        Expr::Literal(_) => Ok(crate::Dimension::Dimensionless),
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs = verify_selected_numeric_expr(program, object_name, lhs, context)?;
+            let rhs = verify_selected_numeric_expr(program, object_name, rhs, context)?;
+            verify_arithmetic_dimension(*op, lhs, rhs, context, expr)
+        }
+        Expr::Abs(inner) | Expr::Sqrt(inner) => {
+            verify_selected_numeric_expr(program, object_name, inner, context)
+        }
+        other => Err(KirError::Unsupported(format!(
+            "{context}: collection predicate expression `{other}` is not supported"
+        ))),
+    }
+}
+
+fn verify_arithmetic_dimension(
+    op: crate::ArithOp,
+    lhs: crate::Dimension,
+    rhs: crate::Dimension,
+    context: &str,
+    expr: &Expr,
+) -> Result<crate::Dimension, KirError> {
+    match op {
+        crate::ArithOp::Add | crate::ArithOp::Sub if lhs == rhs => Ok(lhs),
+        crate::ArithOp::Add | crate::ArithOp::Sub => Err(KirError::Lower(format!(
+            "{context}: `{expr}` cannot add or subtract incompatible dimensions"
+        ))),
+        crate::ArithOp::Mul if lhs == crate::Dimension::Dimensionless => Ok(rhs),
+        crate::ArithOp::Mul if rhs == crate::Dimension::Dimensionless => Ok(lhs),
+        crate::ArithOp::Mul => Ok(crate::Dimension::Dimensionless),
+        crate::ArithOp::Div if rhs == crate::Dimension::Dimensionless => Ok(lhs),
+        crate::ArithOp::Div => Ok(crate::Dimension::Dimensionless),
+        crate::ArithOp::Pow if rhs == crate::Dimension::Dimensionless => Ok(lhs),
+        crate::ArithOp::Pow => Err(KirError::Lower(format!(
+            "{context}: `{expr}` exponent must be dimensionless"
+        ))),
+    }
+}
+
+fn verify_requirement_unit(
+    context: &str,
+    lhs: &Expr,
+    dimension: crate::Dimension,
+    rhs: &Quantity,
+) -> Result<(), KirError> {
+    match (dimension, rhs.unit) {
+        (crate::Dimension::Momentum, crate::Unit::GeV)
+        | (crate::Dimension::Dimensionless, crate::Unit::Dimensionless) => Ok(()),
+        (crate::Dimension::Momentum, crate::Unit::Dimensionless) => Err(KirError::Lower(format!(
+            "{context}: `{lhs}` requires unit GeV"
+        ))),
+        (expected, actual) => Err(KirError::Lower(format!(
+            "{context}: `{lhs}` has dimension {expected:?}, but rhs has unit {actual:?}"
+        ))),
+    }
+}
+
+fn verify_bool_requirement(context: &str, requirement: &KirRequirement) -> Result<(), KirError> {
+    let valid_rhs = requirement.rhs.value == 0.0 || requirement.rhs.value == 1.0;
+    let valid_op = matches!(requirement.op, CmpOp::Eq | CmpOp::Ne);
+    if valid_rhs && valid_op {
+        Ok(())
+    } else {
+        Err(KirError::Lower(format!(
+            "{context}: boolean predicate `{}` supports only == 1, != 0, == 0, or != 1",
+            requirement.lhs
+        )))
+    }
+}
+
+fn require_object<'a>(
+    program: &'a KirProgram,
+    object: &str,
+    context: &str,
+) -> Result<&'a KirObject, KirError> {
+    program
+        .objects
+        .iter()
+        .find(|candidate| candidate.name == object)
+        .ok_or_else(|| KirError::Lower(format!("{context}: unknown object `{object}`")))
+}
+
+fn require_object_attr(
+    program: &KirProgram,
+    object: &str,
+    attr: &str,
+    context: &str,
+) -> Result<crate::Dimension, KirError> {
+    let object = require_object(program, object, context)?;
+    let branch = format!("{}_{}", object.source, attr);
+    let branch_type = program
+        .read_branches
+        .iter()
+        .find(|spec| spec.name == branch)
+        .map(|spec| spec.branch_type)
+        .ok_or_else(|| KirError::Lower(format!("{context}: missing branch `{branch}`")))?;
+    if !is_numeric_vector_branch(branch_type) {
+        return Err(KirError::Lower(format!(
+            "{context}: branch `{branch}` has type {branch_type:?}, expected numeric vector"
+        )));
+    }
+    Ok(attribute_dimension(attr))
+}
+
+fn require_derived_attr(
+    program: &KirProgram,
+    object: &str,
+    attr: &str,
+    context: &str,
+) -> Result<crate::Dimension, KirError> {
+    let derived = program
+        .derived_objects
+        .iter()
+        .find(|candidate| candidate.name == object)
+        .ok_or_else(|| KirError::Lower(format!("{context}: unknown derived object `{object}`")))?;
+    match (&derived.def.source, attr) {
+        (DerivedSource::Pair(_), "mass" | "pt") | (DerivedSource::Candidate(_), "mass" | "pt") => {
+            Ok(crate::Dimension::Momentum)
+        }
+        (DerivedSource::Pair(_), "min_delta_r" | "dR" | "dr")
+        | (DerivedSource::Candidate(_), "min_delta_r" | "dR" | "dr") => {
+            Ok(crate::Dimension::Dimensionless)
+        }
+        _ => Err(KirError::Unsupported(format!(
+            "{context}: derived object `{object}` has no supported attribute `{attr}`"
+        ))),
+    }
+}
+
+fn attribute_dimension(attr: &str) -> crate::Dimension {
+    match attr {
+        "pt" | "mass" | "energy" | "msoftdrop" | "rawFactor" => crate::Dimension::Momentum,
+        value if value.ends_with("Pt") || value.ends_with("Mass") => crate::Dimension::Momentum,
+        _ => crate::Dimension::Dimensionless,
+    }
+}
+
+fn is_numeric_vector_branch(branch_type: BranchType) -> bool {
+    matches!(
+        branch_type,
+        BranchType::VecI8
+            | BranchType::VecU8
+            | BranchType::VecI16
+            | BranchType::VecU16
+            | BranchType::VecI32
+            | BranchType::VecU32
+            | BranchType::VecI64
+            | BranchType::VecU64
+            | BranchType::VecF32
+    )
 }
 
 fn verify_shape_corrections(program: &KirProgram) -> Result<(), KirError> {

@@ -7,13 +7,9 @@ object good_jet : Jet {
 
 region control {
   count(good_jet) >= 4;
-  count(good_jet, pt > 100 GeV) >= 1;
+  sum(good_jet.pt) > 500 GeV;
+  leading(good_jet).pt > 100 GeV;
 }
-// IR gap: the prose requires `sum(good_jet.pt) > 500 GeV` here, but the
-// current semantic IR validates `sum(object.attr)` as dimensionless in region
-// requirements. Keep HT as an output/histogram and gate only on supported cuts.
-// The leading-jet threshold is expressed with count(..., pt > 100 GeV) because
-// non-model region codegen does not support leading(...).pt directly.
 
 define ht = sum(good_jet.pt);
 define n_selected_jets = count(good_jet);

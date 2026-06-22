@@ -295,6 +295,18 @@ fn generated_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
             rng.f64(2.0, 5.0).floor(),
         ));
     }
+    if rng.usize(3) == 0 {
+        first_region_requirements.push(sum_pt_requirement(
+            OBJECTS[rng.usize(OBJECTS.len())].name,
+            rng,
+        ));
+    }
+    if rng.usize(3) == 0 {
+        first_region_requirements.push(leading_pt_requirement(
+            OBJECTS[rng.usize(OBJECTS.len())].name,
+            rng,
+        ));
+    }
     if let Some(requirement) = derived_requirement(&derived_objects, rng) {
         first_region_requirements.push(requirement);
     }
@@ -317,6 +329,12 @@ fn generated_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
         )];
         if rng.bool() {
             require.push(collection_predicate_requirement(object, rng));
+        }
+        if rng.usize(3) == 0 {
+            require.push(sum_pt_requirement(object, rng));
+        }
+        if rng.usize(3) == 0 {
+            require.push(leading_pt_requirement(object, rng));
         }
         if let Some(requirement) = derived_requirement(&derived_objects, rng) {
             require.push(requirement);
@@ -764,6 +782,22 @@ fn count_requirement(object: &str, op: CmpOp, value: f64) -> Requirement {
         lhs: Expr::Count(object.to_string()),
         op,
         rhs: q(value, Unit::Dimensionless),
+    }
+}
+
+fn sum_pt_requirement(object: &str, rng: &mut SplitMix64) -> Requirement {
+    Requirement {
+        lhs: sum_pt(object),
+        op: if rng.bool() { CmpOp::Gt } else { CmpOp::Le },
+        rhs: q(round(rng.f64(30.0, 360.0)), Unit::GeV),
+    }
+}
+
+fn leading_pt_requirement(object: &str, rng: &mut SplitMix64) -> Requirement {
+    Requirement {
+        lhs: leading_pt(object),
+        op: if rng.bool() { CmpOp::Gt } else { CmpOp::Le },
+        rhs: q(round(rng.f64(15.0, 180.0)), Unit::GeV),
     }
 }
 

@@ -1726,8 +1726,7 @@ fn validate_expr(expr: &Expr, context: &str, ctx: &mut ValidationContext<'_>) ->
             validate_collection_predicate(object, predicate, context, ctx);
             Some(ExprType::Count)
         }
-        Expr::SumAttr { object, attr } => validate_attr(object, attr, context, ctx)
-            .map(|_| ExprType::Numeric(Dimension::Dimensionless)),
+        Expr::SumAttr { object, attr } => validate_attr(object, attr, context, ctx),
         Expr::All { object, predicate } | Expr::Any { object, predicate } => {
             let Some(source) = ctx.object_sources.get(object.as_str()) else {
                 ctx.errors.push(SpecError::UndefinedObject {

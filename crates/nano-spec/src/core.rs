@@ -694,7 +694,7 @@ fn standard_primitives() -> Vec<PrimitiveSpec> {
         primitive(
             "sum",
             exact(vec![object_set(), numeric()]),
-            DimensionRule::Fixed(quantity(Dimension::Dimensionless)),
+            DimensionRule::Argument(1),
             EffectRule::UnionArgs,
         ),
         primitive(

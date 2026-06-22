@@ -2273,6 +2273,16 @@ impl<'a> Generator<'a> {
                     f64_literal(rhs)
                 ))
             }
+            Expr::LeadingAttr { object, attr } => {
+                let selected = selected_objects_ident(object)?;
+                let item = format!("{}_leading_item", checked_ident(object, "leading object")?);
+                let attr = checked_ident(attr, "leading attribute")?;
+                Ok(format!(
+                    "{selected}.iter().map(|{item}| {item}.{attr} as f64).reduce(f64::max).is_some_and(|value| value {} {})",
+                    cmp_op(op),
+                    f64_literal(rhs)
+                ))
+            }
             Expr::All { object, predicate } => {
                 let predicate = self.emit_collection_bool_expr("all", object, predicate)?;
                 Ok(bool_comparison_expr(
@@ -2509,6 +2519,10 @@ impl<'a> Generator<'a> {
                 self.validate_derived_attr(right, "mass", context)
             }
             Expr::SumAttr { object, attr } => {
+                self.object(object)?;
+                self.require_supported_object_attr(object, attr, context)
+            }
+            Expr::LeadingAttr { object, attr } => {
                 self.object(object)?;
                 self.require_supported_object_attr(object, attr, context)
             }
@@ -3252,7 +3266,12 @@ fn collect_selected_attr_names(
             attrs.insert(attr.clone());
             Ok(())
         }
-        Expr::Attr { .. } | Expr::Literal(_) | Expr::Count(_) | Expr::LeadingAttr { .. } => Ok(()),
+        Expr::Attr { .. } | Expr::Literal(_) | Expr::Count(_) => Ok(()),
+        Expr::LeadingAttr { object, attr } if object == object_name => {
+            attrs.insert(attr.clone());
+            Ok(())
+        }
+        Expr::LeadingAttr { .. } => Ok(()),
         Expr::Binary { lhs, rhs, .. } => {
             collect_selected_attr_names(lhs, object_name, attrs)?;
             collect_selected_attr_names(rhs, object_name, attrs)

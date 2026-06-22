@@ -37,7 +37,8 @@ fn generated_multijet_ht_matches_reference_and_interpreter_on_synthetic_events()
     let mut reference_histograms = ReferenceHistograms::new();
     let mut interpreted_histograms = InterpretedHistograms::new(&plan);
 
-    for entry in 0..7 {
+    let expected_selected = [true, false, false, false, true, false, true];
+    for (entry, expected_selected) in expected_selected.into_iter().enumerate() {
         let event = synthetic_event(entry);
         let generated = GeneratedProducer::analyze_and_fill(
             &event,
@@ -66,6 +67,11 @@ fn generated_multijet_ht_matches_reference_and_interpreter_on_synthetic_events()
         assert_eq!(
             interpreted, reference,
             "entry {entry}: interpreter != reference"
+        );
+        assert_eq!(
+            reference.is_some(),
+            expected_selected,
+            "entry {entry}: unexpected selection decision"
         );
     }
 
@@ -102,15 +108,15 @@ fn columns() -> Vec<(String, BranchColumn)> {
     vec![
         (
             "nJet".to_string(),
-            BranchColumn::U32(vec![4, 4, 5, 5, 5, 4, 6]),
+            BranchColumn::U32(vec![4, 4, 6, 5, 5, 4, 6]),
         ),
         (
             "Jet_pt".to_string(),
             BranchColumn::VecF32(vec![
                 vec![180.0, 140.0, 120.0, 90.0],
                 vec![99.0, 98.0, 97.0, 96.0],
-                vec![99.0, 98.0, 97.0, 96.0, 95.0],
-                vec![220.0, 140.0, 120.0, 80.0, 25.0],
+                vec![99.0, 98.0, 97.0, 96.0, 95.0, 94.0],
+                vec![220.0, 100.0, 90.0, 80.0, 25.0],
                 vec![250.0, 120.0, 80.0, 70.0, 60.0],
                 vec![150.0, 140.0, 130.0, 120.0],
                 vec![400.0, 90.0, 70.0, 40.0, 35.0, 20.0],
@@ -121,8 +127,8 @@ fn columns() -> Vec<(String, BranchColumn)> {
             BranchColumn::VecF32(vec![
                 vec![0.1, -1.0, 2.0, -2.4],
                 vec![0.2, -0.5, 1.3, -2.0],
-                vec![0.0, 0.4, -0.8, 1.1, -1.5],
-                vec![0.0, -0.8, 2.49, 2.7, 0.1],
+                vec![0.0, 0.4, -0.8, 1.1, -1.5, 2.2],
+                vec![0.0, -0.8, 2.49, -2.4, 0.1],
                 vec![0.3, -1.2, 1.8, -2.1, 0.0],
                 vec![2.6, -0.2, 1.7, -2.3],
                 vec![0.1, -0.3, 2.2, -1.0, 2.49, 0.0],
@@ -133,7 +139,7 @@ fn columns() -> Vec<(String, BranchColumn)> {
             BranchColumn::VecF32(vec![
                 vec![0.0, 0.4, -1.1, 2.2],
                 vec![0.3, -0.2, 1.4, -2.4],
-                vec![0.1, -0.5, 2.0, -2.1, 0.7],
+                vec![0.1, -0.5, 2.0, -2.1, 0.7, 1.2],
                 vec![0.8, -1.0, 2.2, -0.4, 1.6],
                 vec![0.5, -1.8, 2.6, -0.9, 1.1],
                 vec![1.0, -1.5, 0.2, 2.8],
