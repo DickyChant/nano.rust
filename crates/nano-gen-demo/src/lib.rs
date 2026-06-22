@@ -150,6 +150,19 @@ pub mod muon_sf {
     clippy::neg_cmp_op_on_partial_ord,
     clippy::unnecessary_cast
 )]
+pub mod jes_payload {
+    include!(concat!(env!("OUT_DIR"), "/generated_jes_payload.rs"));
+}
+
+#[allow(
+    dead_code,
+    non_snake_case,
+    unused_parens,
+    clippy::collapsible_if,
+    clippy::double_parens,
+    clippy::neg_cmp_op_on_partial_ord,
+    clippy::unnecessary_cast
+)]
 pub mod lumi_mask_trigger {
     include!(concat!(env!("OUT_DIR"), "/generated_lumi_mask_trigger.rs"));
 }

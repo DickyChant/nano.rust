@@ -1,0 +1,37 @@
+{
+  "schema_version": 2,
+  "corrections": [
+    {
+      "name": "synthetic_jes_uncertainty",
+      "description": "Synthetic binned JES fractional uncertainty for nano-spec tests",
+      "version": 1,
+      "inputs": [
+        { "name": "eta", "type": "real" },
+        { "name": "pt", "type": "real" }
+      ],
+      "output": { "name": "uncertainty", "type": "real" },
+      "data": {
+        "nodetype": "binning",
+        "input": "eta",
+        "edges": [-5.0, 0.0, 5.0],
+        "flow": "clamp",
+        "content": [
+          {
+            "nodetype": "binning",
+            "input": "pt",
+            "edges": [0.0, 40.0, 100.0, 1000.0],
+            "flow": "clamp",
+            "content": [0.20, 0.05, 0.12]
+          },
+          {
+            "nodetype": "binning",
+            "input": "pt",
+            "edges": [0.0, 40.0, 100.0, 1000.0],
+            "flow": "clamp",
+            "content": [0.10, 0.03, 0.07]
+          }
+        ]
+      }
+    }
+  ]
+}

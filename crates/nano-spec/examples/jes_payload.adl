@@ -1,0 +1,22 @@
+analysis jes_payload year Run2018;
+
+correction jes_total kind jes file ../nano-spec/tests/data/jes_uncertainty.json correction synthetic_jes_uncertainty collection good_jet attr pt input eta from eta input pt from pt;
+
+object good_jet : Jet {
+  pt > 30 GeV;
+  abs(eta) < 5.0;
+}
+
+region signal {
+  count(good_jet) >= 1;
+}
+
+output n_good_jet = count(good_jet);
+output leading_jet_pt = leading(good_jet).pt;
+output ht = sum(good_jet.pt);
+
+histogram n_good_jet_hist {
+  expr = count(good_jet);
+  bins = 5;
+  range = [0.0, 5.0];
+}

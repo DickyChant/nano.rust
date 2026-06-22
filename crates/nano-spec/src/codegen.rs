@@ -15,7 +15,7 @@ use crate::kir::{ForEachAxis, KirProgram, Rvalue, Stmt, ValueId};
 use crate::{
     AnalysisSpec, ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef,
     ModelProviderKind, ObjectCandidateDef, ObjectDef, ObjectPairDef, PairConstraint, PairSelection,
-    ResolvedPlan, ScaleFactorInputSource, ScaleFactorLiteral,
+    ResolvedPlan, ScaleFactorInputSource, ScaleFactorLiteral, ShapeCorrectionPayload,
 };
 
 /// Generate compilable Rust producer source from a validated plan.
@@ -1187,7 +1187,13 @@ impl<'a> Generator<'a> {
     }
 
     fn emit_correction_error_mapper(&self, source: &mut String) -> Result<(), CodegenError> {
-        if self.spec().scale_factor_corrections.is_empty() {
+        if self.spec().scale_factor_corrections.is_empty()
+            && !self
+                .spec()
+                .shape_corrections()
+                .iter()
+                .any(|correction| matches!(correction.payload, ShapeCorrectionPayload::Jes { .. }))
+        {
             return Ok(());
         }
         writeln!(source).unwrap();
@@ -1832,6 +1838,13 @@ impl<'a> Generator<'a> {
 
     fn emit_shape_factor_bindings(&self, source: &mut String) -> Result<(), CodegenError> {
         for correction in self.spec().shape_corrections() {
+            let ShapeCorrectionPayload::Scale {
+                up: scale_up,
+                down: scale_down,
+            } = &correction.payload
+            else {
+                continue;
+            };
             let factor = shape_factor_ident(&correction.collection, &correction.attr)?;
             let up = generated_systematic_variation(
                 &correction.name,
@@ -1848,20 +1861,148 @@ impl<'a> Generator<'a> {
                 source,
                 "            Systematic::{} => {},",
                 up.variant,
-                f64_literal(correction.up)
+                f64_literal(*scale_up)
             )
             .unwrap();
             writeln!(
                 source,
                 "            Systematic::{} => {},",
                 down.variant,
-                f64_literal(correction.down)
+                f64_literal(*scale_down)
             )
             .unwrap();
             writeln!(source, "            _ => 1.0_f64,").unwrap();
             writeln!(source, "        }};").unwrap();
         }
         Ok(())
+    }
+
+    fn shape_factor_expr(
+        &self,
+        correction: &crate::ShapeCorrectionDef,
+        item_ident: &str,
+        core_mapper: Option<&str>,
+    ) -> Result<String, CodegenError> {
+        match &correction.payload {
+            ShapeCorrectionPayload::Scale { .. } => {
+                shape_factor_ident(&correction.collection, &correction.attr)
+            }
+            ShapeCorrectionPayload::Jes {
+                file,
+                correction: payload_name,
+                inputs,
+            } => {
+                let prefix = checked_ident(&correction.name, "JES correction")?;
+                let correction_mapper = core_mapper.unwrap_or("gen_correction_error");
+                let set_ident = format!("{prefix}_set");
+                let correction_ident = format!("{prefix}_correction");
+                let values_ident = format!("{prefix}_values");
+                let uncertainty_ident = format!("{prefix}_uncertainty");
+                let up = generated_systematic_variation(
+                    &correction.name,
+                    "Up",
+                    GeneratedSystematicSource::ShapeUp,
+                )?;
+                let down = generated_systematic_variation(
+                    &correction.name,
+                    "Down",
+                    GeneratedSystematicSource::ShapeDown,
+                )?;
+                let mut expr = String::new();
+                writeln!(expr, "{{").unwrap();
+                writeln!(
+                    expr,
+                    "                let {set_ident} = nano_corrections::CorrectionSet::from_path({}).map_err({correction_mapper})?;",
+                    rust_string(file)
+                )
+                .unwrap();
+                writeln!(
+                    expr,
+                    "                let {correction_ident} = {set_ident}.correction({}).map_err({correction_mapper})?;",
+                    rust_string(payload_name)
+                )
+                .unwrap();
+                writeln!(expr, "                let {values_ident} = vec![").unwrap();
+                for input in inputs {
+                    let value_expr =
+                        self.jes_input_value_expr(correction, input, item_ident, core_mapper)?;
+                    writeln!(expr, "                    {value_expr},").unwrap();
+                }
+                writeln!(expr, "                ];").unwrap();
+                writeln!(
+                    expr,
+                    "                let {uncertainty_ident} = {correction_ident}.evaluate(&{values_ident}).map_err({correction_mapper})?;"
+                )
+                .unwrap();
+                writeln!(expr, "                match systematic {{").unwrap();
+                writeln!(
+                    expr,
+                    "                    Systematic::{} => 1.0_f64 + {uncertainty_ident},",
+                    up.variant
+                )
+                .unwrap();
+                writeln!(
+                    expr,
+                    "                    Systematic::{} => 1.0_f64 - {uncertainty_ident},",
+                    down.variant
+                )
+                .unwrap();
+                writeln!(expr, "                    _ => 1.0_f64,").unwrap();
+                writeln!(expr, "                }}").unwrap();
+                write!(expr, "            }}").unwrap();
+                Ok(expr)
+            }
+        }
+    }
+
+    fn jes_input_value_expr(
+        &self,
+        correction: &crate::ShapeCorrectionDef,
+        input: &crate::ScaleFactorInputDef,
+        item_ident: &str,
+        core_mapper: Option<&str>,
+    ) -> Result<String, CodegenError> {
+        let ScaleFactorInputSource::From(source) = &input.source else {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "JES correction `{}` input `{}` must use an object attribute",
+                correction.name, input.name
+            )));
+        };
+        let branch_type = self.object_attr_branch_type(&correction.collection, source)?;
+        let rust_type = vector_rust_type(branch_type).ok_or_else(|| {
+            CodegenError::UnsupportedFeature(format!(
+                "JES correction `{}` input `{}` has unsupported branch type {branch_type:?}",
+                correction.name, input.name
+            ))
+        })?;
+        let read = if let Some(mapper) = core_mapper {
+            format!(
+                "{item_ident}.get::<{rust_type}>({}).map_err({mapper})?",
+                rust_string(source)
+            )
+        } else {
+            format!("{item_ident}.get::<{rust_type}>({})?", rust_string(source))
+        };
+        Ok(match branch_type {
+            BranchType::VecF32 => format!("nano_corrections::Value::Real(f64::from({read}))"),
+            BranchType::VecI8
+            | BranchType::VecU8
+            | BranchType::VecI16
+            | BranchType::VecU16
+            | BranchType::VecI32
+            | BranchType::VecU32
+            | BranchType::VecI64 => format!("nano_corrections::Value::Int(i64::from({read}))"),
+            BranchType::VecU64 => format!(
+                "nano_corrections::Value::Int(i64::try_from({read}).map_err({})?)",
+                core_mapper.unwrap_or("gen_correction_error")
+            ),
+            other => {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "JES correction `{}` input `{}` has unsupported branch type {other:?}",
+                    correction.name, input.name
+                )));
+            }
+        })
     }
 
     fn histogram_fill_value_expr(
@@ -2092,12 +2233,19 @@ impl<'a> Generator<'a> {
             self.require_supported_object_attr(&object.name, &attr, "object attribute")?;
             let attr_ident = attr_ident(&object.name, &attr)?;
             let rust_type = self.object_attr_rust_type(&object.name, &attr)?;
-            if self.shape_correction_for(&object.name, &attr).is_some() {
-                let factor = shape_factor_ident(&object.name, &attr)?;
+            if let Some(correction) = self.shape_correction_for(&object.name, &attr) {
+                let factor = self.shape_factor_expr(correction, &item_ident, error_mapper)?;
+                let raw_read = if let Some(mapper) = error_mapper {
+                    format!(
+                        "{item_ident}.get::<{rust_type}>({}).map_err({mapper})?",
+                        rust_string(&attr)
+                    )
+                } else {
+                    format!("{item_ident}.get::<{rust_type}>({})?", rust_string(&attr))
+                };
                 writeln!(
                     source,
-                    "            let {attr_ident} = (f64::from({item_ident}.get::<{rust_type}>({})?) * {factor}) as {rust_type};",
-                    rust_string(&attr)
+                    "            let {attr_ident} = (f64::from({raw_read}) * {factor}) as {rust_type};"
                 )
                 .unwrap();
             } else if let Some(mapper) = error_mapper {
@@ -3425,6 +3573,7 @@ impl<'a> Generator<'a> {
         &self,
         source: &str,
         attr: &str,
+        item_ident: &str,
     ) -> Result<Option<String>, CodegenError> {
         let factors = self
             .spec()
@@ -3436,7 +3585,9 @@ impl<'a> Generator<'a> {
                         object.name == correction.collection && object.source == source
                     })
             })
-            .map(|correction| shape_factor_ident(&correction.collection, &correction.attr))
+            .map(|correction| {
+                self.shape_factor_expr(correction, item_ident, Some("gen_core_error"))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(match factors.len() {
             0 => None,
@@ -3821,7 +3972,9 @@ impl<'a> Generator<'a> {
                     )));
                 }
             };
-            if let Some(factor) = self.shape_factor_for_source_attr(&batch, attr)? {
+            if let Some(factor) =
+                self.shape_factor_for_source_attr(&batch, attr, &format!("{model_ident}_item"))?
+            {
                 writeln!(
                     source,
                     "            let {local_ident} = (f64::from({value_expr}.map_err(gen_core_error)?) * {factor}) as f32;"
@@ -3925,8 +4078,9 @@ impl<'a> Generator<'a> {
         for attr in attrs {
             self.require_f32_attr(&object.name, &attr, "object attribute")?;
             let attr_ident = attr_ident(&object.name, &attr)?;
-            if self.shape_correction_for(&object.name, &attr).is_some() {
-                let factor = shape_factor_ident(&object.name, &attr)?;
+            if let Some(correction) = self.shape_correction_for(&object.name, &attr) {
+                let factor =
+                    self.shape_factor_expr(correction, &item_ident, Some("gen_core_error"))?;
                 writeln!(
                     source,
                     "            let {attr_ident} = (f64::from({item_ident}.get::<f32>({}).map_err(gen_core_error)?) * {factor}) as f32;",
@@ -4494,6 +4648,21 @@ fn scalar_rust_type(branch_type: BranchType) -> Option<&'static str> {
     }
 }
 
+fn vector_rust_type(branch_type: BranchType) -> Option<&'static str> {
+    match branch_type {
+        BranchType::VecI8 => Some("i8"),
+        BranchType::VecU8 => Some("u8"),
+        BranchType::VecI16 => Some("i16"),
+        BranchType::VecU16 => Some("u16"),
+        BranchType::VecI32 => Some("i32"),
+        BranchType::VecU32 => Some("u32"),
+        BranchType::VecI64 => Some("i64"),
+        BranchType::VecU64 => Some("u64"),
+        BranchType::VecF32 => Some("f32"),
+        _ => None,
+    }
+}
+
 fn checked_count_rhs(value: f64, context: &str) -> Result<u32, CodegenError> {
     if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= u32::MAX as f64 {
         Ok(value as u32)
@@ -4622,13 +4791,14 @@ mod tests {
     #[test]
     fn model_aware_codegen_supports_shape_corrections() {
         let mut spec = AnalysisSpec::from_toml_str(MUON_TAGGER_SPEC).unwrap();
-        spec.shape_corrections.push(crate::ShapeCorrectionDef {
-            name: "jes".to_string(),
-            collection: "good_muon".to_string(),
-            attr: "pt".to_string(),
-            up: 1.1,
-            down: 0.9,
-        });
+        spec.shape_corrections
+            .push(crate::ShapeCorrectionDef::fixed_scale(
+                "jes".to_string(),
+                "good_muon".to_string(),
+                "pt".to_string(),
+                1.1,
+                0.9,
+            ));
         let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
         let plan = validate(&spec, &catalogue).unwrap();
         let source = generate_producer_source(&plan).expect("model+shape codegen should emit");

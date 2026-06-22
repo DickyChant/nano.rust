@@ -192,8 +192,20 @@ pub struct KirShapeCorrection {
     pub name: String,
     pub collection: String,
     pub attr: String,
-    pub up: f64,
-    pub down: f64,
+    pub payload: KirShapeCorrectionPayload,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum KirShapeCorrectionPayload {
+    Scale {
+        up: f64,
+        down: f64,
+    },
+    Jes {
+        file: String,
+        correction: String,
+        inputs: Vec<crate::ScaleFactorInputDef>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -446,8 +458,23 @@ pub fn lower_plan_to_kir(plan: &ResolvedPlan) -> Result<KirProgram, KirError> {
             name: correction.name.clone(),
             collection: correction.collection.clone(),
             attr: correction.attr.clone(),
-            up: correction.up,
-            down: correction.down,
+            payload: match &correction.payload {
+                crate::ShapeCorrectionPayload::Scale { up, down } => {
+                    KirShapeCorrectionPayload::Scale {
+                        up: *up,
+                        down: *down,
+                    }
+                }
+                crate::ShapeCorrectionPayload::Jes {
+                    file,
+                    correction,
+                    inputs,
+                } => KirShapeCorrectionPayload::Jes {
+                    file: file.clone(),
+                    correction: correction.clone(),
+                    inputs: inputs.clone(),
+                },
+            },
         })
         .collect();
     program.scale_factor_corrections = plan
@@ -1006,11 +1033,50 @@ fn verify_shape_corrections(program: &KirProgram) -> Result<(), KirError> {
                 correction.name, correction.attr
             )));
         }
-        if !(correction.up.is_finite() && correction.down.is_finite()) {
-            return Err(KirError::Lower(format!(
-                "shape correction `{}` has non-finite up/down scale factor",
-                correction.name
-            )));
+        match &correction.payload {
+            KirShapeCorrectionPayload::Scale { up, down } => {
+                if !(up.is_finite() && down.is_finite()) {
+                    return Err(KirError::Lower(format!(
+                        "shape correction `{}` has non-finite up/down scale factor",
+                        correction.name
+                    )));
+                }
+            }
+            KirShapeCorrectionPayload::Jes {
+                file,
+                correction: payload_name,
+                inputs,
+            } => {
+                let set = nano_corrections::CorrectionSet::from_path(file).map_err(|error| {
+                    KirError::Lower(format!(
+                        "JES correction `{}` failed to load `{}`: {error}",
+                        correction.name, file
+                    ))
+                })?;
+                let payload = set.correction(payload_name).map_err(|error| {
+                    KirError::Lower(format!(
+                        "JES correction `{}` payload lookup failed: {error}",
+                        correction.name
+                    ))
+                })?;
+                let declared = inputs
+                    .iter()
+                    .map(|input| input.name.as_str())
+                    .collect::<Vec<_>>();
+                let expected = payload
+                    .inputs
+                    .iter()
+                    .map(|input| input.name.as_str())
+                    .collect::<Vec<_>>();
+                if declared != expected {
+                    return Err(KirError::Lower(format!(
+                        "JES correction `{}` declared inputs [{}] do not match correctionlib inputs [{}]",
+                        correction.name,
+                        declared.join(", "),
+                        expected.join(", ")
+                    )));
+                }
+            }
         }
     }
     Ok(())

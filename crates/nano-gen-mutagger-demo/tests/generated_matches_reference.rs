@@ -258,13 +258,13 @@ fn model_weight_systematic_histogram_fanout_matches_interpreter_and_preserves_no
 fn model_shape_correction_reruns_inference_per_variation_and_preserves_nominal() {
     let mut shape_spec =
         AnalysisSpec::from_toml_str(MUTAGGER_SHAPE_CROSSING_TOML).expect("parse shape spec");
-    shape_spec.shape_corrections = vec![ShapeCorrectionDef {
-        name: "muon_pt_shape".to_string(),
-        collection: "tagged_muon".to_string(),
-        attr: "pt".to_string(),
-        up: 1.5,
-        down: 0.5,
-    }];
+    shape_spec.shape_corrections = vec![ShapeCorrectionDef::fixed_scale(
+        "muon_pt_shape".to_string(),
+        "tagged_muon".to_string(),
+        "pt".to_string(),
+        1.5,
+        0.5,
+    )];
     let catalogue =
         Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
     let shape_plan = validate(&shape_spec, &catalogue).expect("validate shape spec");

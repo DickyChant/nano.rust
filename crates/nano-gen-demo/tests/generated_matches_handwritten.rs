@@ -17,6 +17,7 @@ use nano_workflow::{
     KernelRegistry, RunChunkRequest,
 };
 
+use nano_gen_demo::jes_payload::Systematic as JesSystematic;
 use nano_gen_demo::muon_hist_nominal::Systematic as MuonHistNominalSystematic;
 use nano_gen_demo::muon_hist_shape_correction::Systematic as ShapeSystematic;
 use nano_gen_demo::muon_hist_shape_nominal::Systematic as ShapeNominalSystematic;
@@ -34,6 +35,7 @@ const MUON_HIST_SHAPE_NOMINAL_SPEC: &str =
 const MUON_HIST_SHAPE_CORRECTION_SPEC: &str =
     include_str!("../../nano-spec/examples/muon_hist_shape_correction.toml");
 const MUON_SF_SPEC: &str = include_str!("../../nano-spec/examples/muon_sf.toml");
+const JES_PAYLOAD_SPEC: &str = include_str!("../../nano-spec/examples/jes_payload.toml");
 const LUMI_MASK_TRIGGER_SPEC: &str =
     include_str!("../../nano-spec/examples/lumi_mask_trigger.toml");
 
@@ -462,6 +464,103 @@ fn scale_factor_weight_uses_correctionlib_in_generated_and_interpreter() {
 }
 
 #[test]
+fn jes_shape_uses_binned_correctionlib_payload_in_generated_interpreter_and_reference() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let jes_spec = AnalysisSpec::from_toml_str(JES_PAYLOAD_SPEC).unwrap();
+    let mut no_correction_spec = jes_spec.clone();
+    no_correction_spec.shape_corrections.clear();
+    no_correction_spec.systematics = vec![nano_spec::SystematicDef::Nominal];
+    let jes_plan = validate(&jes_spec, &catalogue).unwrap();
+    let no_correction_plan = validate(&no_correction_spec, &catalogue).unwrap();
+    let event = jes_event();
+
+    let payload = CorrectionSet::from_path("../nano-spec/tests/data/jes_uncertainty.json").unwrap();
+    let correction = payload.correction("synthetic_jes_uncertainty").unwrap();
+    let u_low_positive_eta = correction
+        .evaluate(&[CorrectionValue::Real(1.0), CorrectionValue::Real(29.0)])
+        .unwrap();
+    let u_mid_negative_eta = correction
+        .evaluate(&[CorrectionValue::Real(-1.0), CorrectionValue::Real(45.0)])
+        .unwrap();
+    let u_high_positive_eta = correction
+        .evaluate(&[CorrectionValue::Real(1.0), CorrectionValue::Real(110.0)])
+        .unwrap();
+    assert_eq!(u_low_positive_eta, 0.10);
+    assert_eq!(u_mid_negative_eta, 0.05);
+    assert_eq!(u_high_positive_eta, 0.07);
+    assert_ne!(u_mid_negative_eta, u_high_positive_eta);
+
+    let mut generated_histograms = nano_gen_demo::jes_payload::GenHistograms::new();
+    let mut interpreted_histograms = InterpretedHistograms::new(&jes_plan);
+    let mut rows = Vec::new();
+
+    for systematic in [
+        JesSystematic::Nominal,
+        JesSystematic::JesTotalUp,
+        JesSystematic::JesTotalDown,
+    ] {
+        let generated = nano_gen_demo::jes_payload::GeneratedProducer::analyze_and_fill(
+            &event,
+            &mut generated_histograms,
+            systematic,
+        )
+        .unwrap()
+        .map(jes_generated_row_bits);
+        let interpreted = interpret_and_fill_systematic(
+            &jes_plan,
+            &event,
+            &mut interpreted_histograms,
+            &format!("{systematic:?}"),
+        )
+        .unwrap()
+        .map(jes_interpreted_row_bits);
+        let reference = reference_jes_row(&event, &format!("{systematic:?}"));
+
+        assert_eq!(generated, interpreted, "{systematic:?}");
+        assert_eq!(generated, reference, "{systematic:?}");
+        rows.push((systematic, generated));
+    }
+
+    let no_correction = interpret(&no_correction_plan, &event)
+        .unwrap()
+        .map(jes_interpreted_row_bits);
+    let nominal = rows
+        .iter()
+        .find(|(systematic, _)| *systematic == JesSystematic::Nominal)
+        .and_then(|(_, row)| *row);
+    let up = rows
+        .iter()
+        .find(|(systematic, _)| *systematic == JesSystematic::JesTotalUp)
+        .and_then(|(_, row)| *row);
+    let down = rows
+        .iter()
+        .find(|(systematic, _)| *systematic == JesSystematic::JesTotalDown)
+        .and_then(|(_, row)| *row);
+
+    assert_eq!(nominal, no_correction);
+    assert_eq!(nominal.map(|row| row.0), Some(2));
+    assert_eq!(up.map(|row| row.0), Some(3));
+    assert_eq!(down.map(|row| row.0), Some(2));
+    assert_ne!(up, nominal);
+    assert_ne!(down, nominal);
+
+    let interpreted = interpreted_histograms
+        .get("n_good_jet_hist")
+        .expect("interpreted histogram");
+    for systematic in [
+        JesSystematic::Nominal,
+        JesSystematic::JesTotalUp,
+        JesSystematic::JesTotalDown,
+    ] {
+        assert_eq!(
+            generated_histograms.n_good_jet_hist.get(systematic),
+            interpreted.get(format!("{systematic:?}")),
+            "{systematic:?}"
+        );
+    }
+}
+
+#[test]
 fn workflow_executes_generated_muon_kernel_like_handwritten_kernel() {
     let fixture = Fixture::new("generated-workflow");
     let input = fixture.path("input.root");
@@ -606,6 +705,88 @@ fn reference_sf_weight(event: &Event, systematic: &str) -> f64 {
         }
     }
     weight
+}
+
+fn jes_event() -> Event {
+    Event::from_columns(jes_schema(), jes_columns(), 0).unwrap()
+}
+
+fn jes_schema() -> BranchSchema {
+    BranchSchema::new([
+        BranchSpec::new("nJet", BranchType::U32),
+        BranchSpec::new("Jet_pt", BranchType::VecF32),
+        BranchSpec::new("Jet_eta", BranchType::VecF32),
+    ])
+    .unwrap()
+}
+
+fn jes_columns() -> Vec<(String, BranchColumn)> {
+    vec![
+        ("nJet".to_string(), BranchColumn::U32(vec![3])),
+        (
+            "Jet_pt".to_string(),
+            BranchColumn::VecF32(vec![vec![29.0, 45.0, 110.0]]),
+        ),
+        (
+            "Jet_eta".to_string(),
+            BranchColumn::VecF32(vec![vec![1.0, -1.0, 1.0]]),
+        ),
+    ]
+}
+
+fn jes_generated_row_bits(row: nano_gen_demo::jes_payload::GenRow) -> (u32, u32, u64) {
+    (
+        row.n_good_jet,
+        row.leading_jet_pt.to_bits(),
+        row.ht.to_bits(),
+    )
+}
+
+fn jes_interpreted_row_bits(row: nano_spec::interpret::OutputRow) -> (u32, u32, u64) {
+    let n_good_jet = match row.get("n_good_jet").unwrap() {
+        Value::U32(value) => value,
+        value => panic!("unexpected interpreted count {value:?}"),
+    };
+    let leading_jet_pt = match row.get("leading_jet_pt").unwrap() {
+        Value::F64(value) => (value as f32).to_bits(),
+        value => panic!("unexpected interpreted leading pt {value:?}"),
+    };
+    let ht = match row.get("ht").unwrap() {
+        Value::F64(value) => value.to_bits(),
+        value => panic!("unexpected interpreted ht {value:?}"),
+    };
+    (n_good_jet, leading_jet_pt, ht)
+}
+
+fn reference_jes_row(event: &Event, systematic: &str) -> Option<(u32, u32, u64)> {
+    let payload = CorrectionSet::from_path("../nano-spec/tests/data/jes_uncertainty.json").unwrap();
+    let correction = payload.correction("synthetic_jes_uncertainty").unwrap();
+    let collection = event.collection("Jet").unwrap();
+    let mut count = 0_u32;
+    let mut leading = None::<f32>;
+    let mut ht = 0.0_f64;
+    for jet in collection.iter() {
+        let raw_pt = jet.get::<f32>("pt").unwrap();
+        let eta = jet.get::<f32>("eta").unwrap();
+        let uncertainty = correction
+            .evaluate(&[
+                CorrectionValue::Real(f64::from(eta)),
+                CorrectionValue::Real(f64::from(raw_pt)),
+            ])
+            .unwrap();
+        let factor = match systematic {
+            "JesTotalUp" => 1.0 + uncertainty,
+            "JesTotalDown" => 1.0 - uncertainty,
+            _ => 1.0,
+        };
+        let pt = (f64::from(raw_pt) * factor) as f32;
+        if pt > 30.0 && eta.abs() < 5.0 {
+            count += 1;
+            leading = Some(leading.map_or(pt, |lead| lead.max(pt)));
+            ht += f64::from(pt);
+        }
+    }
+    (count >= 1).then(|| (count, leading.unwrap().to_bits(), ht.to_bits()))
 }
 
 fn schema() -> BranchSchema {

@@ -356,13 +356,13 @@ pub fn generated_model_shape_specs() -> Vec<GeneratedSpec> {
             );
             generated.spec.name = format!("fuzz_model_shape_diff_{index:03}");
             let tagged = generated.spec.objects[1].name.clone();
-            generated.spec.shape_corrections = vec![ShapeCorrectionDef {
-                name: format!("fuzz_model_shape_{index:03}"),
-                collection: tagged,
-                attr: "pt".to_string(),
-                up: round(rng.f64(1.05, 1.35)),
-                down: round(rng.f64(0.65, 0.95)),
-            }];
+            generated.spec.shape_corrections = vec![ShapeCorrectionDef::fixed_scale(
+                format!("fuzz_model_shape_{index:03}"),
+                tagged,
+                "pt".to_string(),
+                round(rng.f64(1.05, 1.35)),
+                round(rng.f64(0.65, 0.95)),
+            )];
             generated.has_shape_correction = true;
             generated
         })
@@ -469,13 +469,13 @@ pub fn generated_weight_shape_specs() -> Vec<GeneratedSpec> {
             let shape_object = generated.spec.objects[index % generated.spec.objects.len()]
                 .name
                 .clone();
-            generated.spec.shape_corrections = vec![ShapeCorrectionDef {
-                name: format!("fuzz_shape_weight_{index:03}"),
-                collection: shape_object,
-                attr: "pt".to_string(),
-                up: round(rng.f64(1.02, 1.18)),
-                down: round(rng.f64(0.82, 0.98)),
-            }];
+            generated.spec.shape_corrections = vec![ShapeCorrectionDef::fixed_scale(
+                format!("fuzz_shape_weight_{index:03}"),
+                shape_object,
+                "pt".to_string(),
+                round(rng.f64(1.02, 1.18)),
+                round(rng.f64(0.82, 0.98)),
+            )];
             generated.has_histogram = true;
             generated.has_weight_systematic = true;
             generated.has_shape_correction = true;
@@ -678,13 +678,13 @@ fn generated_standard_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec 
         WeightDef::default()
     };
     let shape_corrections = if has_shape_correction {
-        vec![ShapeCorrectionDef {
-            name: format!("fuzz_shape_{index:03}"),
-            collection: OBJECTS[rng.usize(OBJECTS.len())].name.to_string(),
-            attr: "pt".to_string(),
-            up: round(rng.f64(1.02, 1.18)),
-            down: round(rng.f64(0.82, 0.98)),
-        }]
+        vec![ShapeCorrectionDef::fixed_scale(
+            format!("fuzz_shape_{index:03}"),
+            OBJECTS[rng.usize(OBJECTS.len())].name.to_string(),
+            "pt".to_string(),
+            round(rng.f64(1.02, 1.18)),
+            round(rng.f64(0.82, 0.98)),
+        )]
     } else {
         Vec::new()
     };

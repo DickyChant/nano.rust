@@ -14,7 +14,8 @@ use nano_corrections::Value as CorrectionValue;
 use nano_inference::{mock_scores, InferRequest, Tensor, TensorData};
 
 use crate::kir::{
-    Block, ForEachAxis, KirObject, KirProgram, KirShapeCorrection, Rvalue, Stmt, ValueId,
+    Block, ForEachAxis, KirObject, KirProgram, KirShapeCorrection, KirShapeCorrectionPayload,
+    Rvalue, Stmt, ValueId,
 };
 use crate::{
     ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef, ModelProviderKind,
@@ -387,7 +388,7 @@ fn model_input_value(
             )));
         }
         let value = object_input_value(item, attr, branch_type)?;
-        let factor = shape_factor_for_source(program, batch, attr, systematic);
+        let factor = shape_factor_for_source(program, batch, attr, item, systematic)?;
         Ok((f64::from(value) * factor) as f32)
     } else {
         scalar_input_value(event, input, branch_type)
@@ -1610,7 +1611,7 @@ fn read_object_attr(
         BranchType::VecU64 => Ok(NumericValue::U64(item.get::<u64>(attr)?)),
         BranchType::VecF32 => {
             let value = item.get::<f32>(attr)?;
-            let factor = shape_factor(program, collection, attr, systematic);
+            let factor = shape_factor(program, collection, source, item, attr, systematic)?;
             Ok(NumericValue::F64(f64::from(
                 (f64::from(value) * factor) as f32,
             )))
@@ -1623,17 +1624,130 @@ fn read_object_attr(
     }
 }
 
-fn shape_factor(program: &KirProgram, collection: &str, attr: &str, systematic: &str) -> f64 {
+fn shape_factor(
+    program: &KirProgram,
+    collection: &str,
+    source: &str,
+    item: &ObjectView<'_>,
+    attr: &str,
+    systematic: &str,
+) -> Result<f64> {
     program
         .shape_corrections
         .iter()
         .find(|correction| correction.collection == collection && correction.attr == attr)
-        .map(|correction| match systematic {
-            value if value == interpreted_variant_name(&correction.name, "Up") => correction.up,
-            value if value == interpreted_variant_name(&correction.name, "Down") => correction.down,
+        .map(|correction| shape_correction_factor(program, source, item, correction, systematic))
+        .unwrap_or(Ok(1.0))
+}
+
+fn shape_correction_factor(
+    program: &KirProgram,
+    source: &str,
+    item: &ObjectView<'_>,
+    correction: &KirShapeCorrection,
+    systematic: &str,
+) -> Result<f64> {
+    match &correction.payload {
+        KirShapeCorrectionPayload::Scale { up, down } => Ok(match systematic {
+            value if value == interpreted_variant_name(&correction.name, "Up") => *up,
+            value if value == interpreted_variant_name(&correction.name, "Down") => *down,
             _ => 1.0,
-        })
-        .unwrap_or(1.0)
+        }),
+        KirShapeCorrectionPayload::Jes { .. } => {
+            if systematic == interpreted_variant_name(&correction.name, "Up") {
+                Ok(1.0 + evaluate_jes_uncertainty(program, source, item, correction)?)
+            } else if systematic == interpreted_variant_name(&correction.name, "Down") {
+                Ok(1.0 - evaluate_jes_uncertainty(program, source, item, correction)?)
+            } else {
+                Ok(1.0)
+            }
+        }
+    }
+}
+
+fn evaluate_jes_uncertainty(
+    program: &KirProgram,
+    source: &str,
+    item: &ObjectView<'_>,
+    correction: &KirShapeCorrection,
+) -> Result<f64> {
+    let KirShapeCorrectionPayload::Jes {
+        file,
+        correction: payload_name,
+        inputs,
+    } = &correction.payload
+    else {
+        return Ok(0.0);
+    };
+    let set = nano_corrections::CorrectionSet::from_path(file).map_err(|error| {
+        InterpretError::Correction(format!(
+            "JES correction `{}` failed to load `{}`: {error}",
+            correction.name, file
+        ))
+    })?;
+    let payload = set.correction(payload_name).map_err(|error| {
+        InterpretError::Correction(format!(
+            "JES correction `{}` payload lookup failed: {error}",
+            correction.name
+        ))
+    })?;
+    let mut values = Vec::with_capacity(payload.inputs.len());
+    for payload_input in &payload.inputs {
+        let input = inputs
+            .iter()
+            .find(|input| input.name == payload_input.name)
+            .ok_or_else(|| {
+                InterpretError::Correction(format!(
+                    "JES correction `{}` is missing input `{}`",
+                    correction.name, payload_input.name
+                ))
+            })?;
+        values.push(jes_input_value(program, source, item, input)?);
+    }
+    payload.evaluate(&values).map_err(|error| {
+        InterpretError::Correction(format!(
+            "JES correction `{}` evaluation failed: {error}",
+            correction.name
+        ))
+    })
+}
+
+fn jes_input_value(
+    program: &KirProgram,
+    source: &str,
+    item: &ObjectView<'_>,
+    input: &crate::ScaleFactorInputDef,
+) -> Result<CorrectionValue> {
+    let crate::ScaleFactorInputSource::From(attr) = &input.source else {
+        return Err(InterpretError::Correction(format!(
+            "JES correction input `{}` must use an object attribute",
+            input.name
+        )));
+    };
+    let branch = format!("{source}_{attr}");
+    let branch_type = branch_type(program, &branch)?;
+    match branch_type {
+        BranchType::VecI8 => Ok(CorrectionValue::Int(i64::from(item.get::<i8>(attr)?))),
+        BranchType::VecU8 => Ok(CorrectionValue::Int(i64::from(item.get::<u8>(attr)?))),
+        BranchType::VecI16 => Ok(CorrectionValue::Int(i64::from(item.get::<i16>(attr)?))),
+        BranchType::VecU16 => Ok(CorrectionValue::Int(i64::from(item.get::<u16>(attr)?))),
+        BranchType::VecI32 => Ok(CorrectionValue::Int(i64::from(item.get::<i32>(attr)?))),
+        BranchType::VecU32 => Ok(CorrectionValue::Int(i64::from(item.get::<u32>(attr)?))),
+        BranchType::VecI64 => Ok(CorrectionValue::Int(item.get::<i64>(attr)?)),
+        BranchType::VecU64 => i64::try_from(item.get::<u64>(attr)?)
+            .map(CorrectionValue::Int)
+            .map_err(|error| {
+                InterpretError::NumericConversion(format!(
+                    "unsigned JES input `{attr}` cannot fit into i64: {error}"
+                ))
+            }),
+        BranchType::VecF32 => Ok(CorrectionValue::Real(f64::from(item.get::<f32>(attr)?))),
+        other => Err(InterpretError::TypeMismatch {
+            branch,
+            branch_type: other,
+            expected: "numeric vector branch",
+        }),
+    }
 }
 
 fn evaluate_scale_factor_correction(
@@ -1815,8 +1929,9 @@ fn shape_factor_for_source(
     program: &KirProgram,
     source: &str,
     attr: &str,
+    item: &ObjectView<'_>,
     systematic: &str,
-) -> f64 {
+) -> Result<f64> {
     program
         .shape_corrections
         .iter()
@@ -1827,12 +1942,8 @@ fn shape_factor_for_source(
                     .iter()
                     .any(|object| object.name == correction.collection && object.source == source)
         })
-        .map(|correction| match systematic {
-            value if value == interpreted_variant_name(&correction.name, "Up") => correction.up,
-            value if value == interpreted_variant_name(&correction.name, "Down") => correction.down,
-            _ => 1.0,
-        })
-        .product()
+        .map(|correction| shape_correction_factor(program, source, item, correction, systematic))
+        .try_fold(1.0, |product, factor| factor.map(|factor| product * factor))
 }
 
 fn expr_has_missing_value(

@@ -20,6 +20,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let catalogue_path = repo_root.join("configs/branches/nanov9.yaml");
     println!("cargo:rerun-if-changed={}", catalogue_path.display());
+    let jes_payload_path = repo_root.join("crates/nano-spec/tests/data/jes_uncertainty.json");
+    println!("cargo:rerun-if-changed={}", jes_payload_path.display());
 
     let catalogue_text = fs::read_to_string(&catalogue_path)?;
     let catalogue = Catalogue::from_nanoaod_yaml_str(&catalogue_text, "v9")?;
@@ -48,6 +50,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "generated_muon_hist_shape_correction.rs",
         ),
         ("muon_sf.toml", "generated_muon_sf.rs"),
+        ("jes_payload.toml", "generated_jes_payload.rs"),
         ("lumi_mask_trigger.toml", "generated_lumi_mask_trigger.rs"),
     ] {
         let spec_path = repo_root.join("crates/nano-spec/examples").join(spec_file);

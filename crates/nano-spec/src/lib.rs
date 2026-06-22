@@ -536,13 +536,76 @@ pub struct WeightSystematicDef {
 }
 
 /// A two-sided shape correction that scales one selected collection attribute.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ShapeCorrectionDef {
     pub name: String,
     pub collection: String,
     pub attr: String,
-    pub up: f64,
-    pub down: f64,
+    pub payload: ShapeCorrectionPayload,
+}
+
+/// Source of the per-object shape multiplier.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShapeCorrectionPayload {
+    Scale {
+        up: f64,
+        down: f64,
+    },
+    Jes {
+        file: String,
+        correction: String,
+        inputs: Vec<ScaleFactorInputDef>,
+    },
+}
+
+impl ShapeCorrectionDef {
+    pub fn fixed_scale(name: String, collection: String, attr: String, up: f64, down: f64) -> Self {
+        Self {
+            name,
+            collection,
+            attr,
+            payload: ShapeCorrectionPayload::Scale { up, down },
+        }
+    }
+
+    pub fn jes(
+        name: String,
+        collection: String,
+        attr: String,
+        file: String,
+        correction: String,
+        inputs: Vec<ScaleFactorInputDef>,
+    ) -> Self {
+        Self {
+            name,
+            collection,
+            attr,
+            payload: ShapeCorrectionPayload::Jes {
+                file,
+                correction,
+                inputs,
+            },
+        }
+    }
+
+    pub fn fixed_scale_factors(&self) -> Option<(f64, f64)> {
+        match self.payload {
+            ShapeCorrectionPayload::Scale { up, down } => Some((up, down)),
+            ShapeCorrectionPayload::Jes { .. } => None,
+        }
+    }
+
+    pub fn jes_payload(&self) -> Option<(&str, &str, &[ScaleFactorInputDef])> {
+        match &self.payload {
+            ShapeCorrectionPayload::Scale { .. } => None,
+            ShapeCorrectionPayload::Jes {
+                file,
+                correction,
+                inputs,
+            } => Some((file, correction, inputs)),
+        }
+    }
 }
 
 /// A per-object correctionlib v2 scale-factor weight.
@@ -1550,6 +1613,7 @@ fn validate_shape_corrections(spec: &AnalysisSpec, ctx: &mut ValidationContext<'
             });
             continue;
         };
+        ctx.required.require_counter(source);
         require_attr_branch_type(
             source,
             &correction.attr,
@@ -1558,6 +1622,124 @@ fn validate_shape_corrections(spec: &AnalysisSpec, ctx: &mut ValidationContext<'
             &context,
             ctx,
         );
+        match &correction.payload {
+            ShapeCorrectionPayload::Scale { up, down } => {
+                if !(up.is_finite() && down.is_finite()) {
+                    ctx.errors.push(SpecError::InvalidExpression {
+                        context,
+                        detail: "shape correction has non-finite up/down scale factor".to_string(),
+                    });
+                }
+            }
+            ShapeCorrectionPayload::Jes {
+                file,
+                correction: payload_name,
+                inputs,
+            } => {
+                validate_jes_shape_correction(
+                    correction,
+                    source,
+                    file,
+                    payload_name,
+                    inputs,
+                    &context,
+                    ctx,
+                );
+            }
+        }
+    }
+}
+
+fn validate_jes_shape_correction(
+    correction: &ShapeCorrectionDef,
+    collection_source: &str,
+    file: &str,
+    payload_name: &str,
+    inputs: &[ScaleFactorInputDef],
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    let set = match nano_corrections::CorrectionSet::from_path(file) {
+        Ok(set) => set,
+        Err(error) => {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.to_string(),
+                detail: format!("failed to load correctionlib payload `{file}`: {error}"),
+            });
+            return;
+        }
+    };
+    let payload = match set.correction(payload_name) {
+        Ok(payload) => payload,
+        Err(error) => {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.to_string(),
+                detail: error.to_string(),
+            });
+            return;
+        }
+    };
+    if payload.output.kind != nano_corrections::InputType::Real {
+        ctx.errors.push(SpecError::InvalidExpression {
+            context: context.to_string(),
+            detail: format!(
+                "JES correction `{}` output has correctionlib type {:?}, expected real",
+                correction.name, payload.output.kind
+            ),
+        });
+    }
+    let declared = inputs
+        .iter()
+        .map(|input| input.name.as_str())
+        .collect::<Vec<_>>();
+    let expected = payload
+        .inputs
+        .iter()
+        .map(|input| input.name.as_str())
+        .collect::<Vec<_>>();
+    if declared != expected {
+        ctx.errors.push(SpecError::InvalidExpression {
+            context: context.to_string(),
+            detail: format!(
+                "declared inputs [{}] do not match correctionlib inputs [{}]",
+                declared.join(", "),
+                expected.join(", ")
+            ),
+        });
+        return;
+    }
+    for input in inputs {
+        let Some(payload_input) = payload
+            .inputs
+            .iter()
+            .find(|payload_input| payload_input.name == input.name)
+        else {
+            unreachable!("input names were checked above");
+        };
+        let ScaleFactorInputSource::From(source) = &input.source else {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.to_string(),
+                detail: format!("JES input `{}` must use an object attribute", input.name),
+            });
+            continue;
+        };
+        let attr_branch = format!("{collection_source}_{source}");
+        let Some(entry) = ctx.catalogue.branch(&attr_branch) else {
+            ctx.errors.push(SpecError::MissingBranch {
+                context: context.to_string(),
+                branch: attr_branch,
+            });
+            continue;
+        };
+        validate_scale_factor_branch_type(
+            context,
+            &attr_branch,
+            entry.branch_type,
+            &entry.raw_type,
+            payload_input.kind,
+            ctx,
+        );
+        ctx.required.require_attr(collection_source, source);
     }
 }
 
@@ -3079,7 +3261,7 @@ fn validate_raw_analysis_spec(raw: &RawAnalysisSpec) -> Result<(), ParseError> {
             )));
         }
         match correction.kind.as_str() {
-            "scale" => shape_correction_count += 1,
+            "scale" | "jes" => shape_correction_count += 1,
             "scale_factor" => scale_factor_correction_count += 1,
             _ => {}
         }
@@ -4001,12 +4183,13 @@ fn correction_defs_from_raw(
     for raw in raw_corrections {
         match raw.kind.as_str() {
             "scale" => shape_corrections.push(shape_correction_def_from_raw(raw)?),
+            "jes" => shape_corrections.push(jes_shape_correction_def_from_raw(raw)?),
             "scale_factor" => {
                 scale_factor_corrections.push(scale_factor_correction_def_from_raw(raw)?);
             }
             other => {
                 return Err(ParseError::InvalidSpec(format!(
-                    "correction `{}` has unsupported kind `{other}`; expected `scale` or `scale_factor`",
+                    "correction `{}` has unsupported kind `{other}`; expected `scale`, `jes`, or `scale_factor`",
                     raw.name
                 )));
             }
@@ -4040,13 +4223,72 @@ fn shape_correction_def_from_raw(raw: RawCorrection) -> Result<ShapeCorrectionDe
             raw.name
         )));
     }
-    Ok(ShapeCorrectionDef {
-        name: raw.name,
-        collection: raw.collection,
+    Ok(ShapeCorrectionDef::fixed_scale(
+        raw.name,
+        raw.collection,
         attr,
         up,
         down,
-    })
+    ))
+}
+
+fn jes_shape_correction_def_from_raw(raw: RawCorrection) -> Result<ShapeCorrectionDef, ParseError> {
+    validate_identifier(&raw.name, "correction name")?;
+    validate_identifier(&raw.collection, "correction collection")?;
+    let attr = raw.attr.ok_or_else(|| {
+        ParseError::InvalidSpec(format!("JES correction `{}` is missing `attr`", raw.name))
+    })?;
+    validate_identifier(&attr, "correction attribute")?;
+    if attr != "pt" {
+        return Err(ParseError::InvalidSpec(format!(
+            "correction `{}` scales `{}`; this compiler slice only supports `pt`",
+            raw.name, attr
+        )));
+    }
+    let file = required_raw_string(raw.file, &raw.name, "file")?;
+    let correction = required_raw_string(raw.correction, &raw.name, "correction")?;
+    if raw.inputs.is_empty() {
+        return Err(ParseError::InvalidSpec(format!(
+            "JES correction `{}` declares no inputs",
+            raw.name
+        )));
+    }
+    let inputs = raw
+        .inputs
+        .into_iter()
+        .map(|input| {
+            validate_identifier(&input.name, "JES input name")?;
+            match (input.from, input.value) {
+                (Some(from), None) => {
+                    validate_identifier(&from, "JES input source")?;
+                    Ok(ScaleFactorInputDef {
+                        name: input.name,
+                        source: ScaleFactorInputSource::From(from),
+                    })
+                }
+                (None, Some(_)) => Err(ParseError::InvalidSpec(format!(
+                    "JES correction `{}` input `{}` must use `from`, not `value`",
+                    raw.name, input.name
+                ))),
+                (Some(_), Some(_)) => Err(ParseError::InvalidSpec(format!(
+                    "JES correction `{}` input `{}` cannot set both `from` and `value`",
+                    raw.name, input.name
+                ))),
+                (None, None) => Err(ParseError::InvalidSpec(format!(
+                    "JES correction `{}` input `{}` must set `from`",
+                    raw.name, input.name
+                ))),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ShapeCorrectionDef::jes(
+        raw.name,
+        raw.collection,
+        attr,
+        file,
+        correction,
+        inputs,
+    ))
 }
 
 fn scale_factor_correction_def_from_raw(
@@ -4589,6 +4831,8 @@ mod tests {
         include_str!("../examples/muon_hist_shape_correction.adl");
     const MUON_SF_SPEC_TOML: &str = include_str!("../examples/muon_sf.toml");
     const MUON_SF_SPEC_ADL: &str = include_str!("../examples/muon_sf.adl");
+    const JES_PAYLOAD_SPEC_TOML: &str = include_str!("../examples/jes_payload.toml");
+    const JES_PAYLOAD_SPEC_ADL: &str = include_str!("../examples/jes_payload.adl");
     const HIGGS4MU_MINIMAL_SPEC_TOML: &str = include_str!("../examples/higgs4mu_minimal.toml");
     const HIGGS2E2MU_MINIMAL_SPEC_TOML: &str = include_str!("../examples/higgs2e2mu_minimal.toml");
     const EXAMPLE_SPECS: &[(&str, &str)] = &[
@@ -4636,6 +4880,10 @@ mod tests {
             include_str!("../examples/muon_hist_shape_correction.toml"),
         ),
         ("muon_sf.toml", include_str!("../examples/muon_sf.toml")),
+        (
+            "jes_payload.toml",
+            include_str!("../examples/jes_payload.toml"),
+        ),
         (
             "muon_tagger.toml",
             include_str!("../examples/muon_tagger.toml"),
@@ -4766,8 +5014,7 @@ mod tests {
         assert_eq!(correction.name, "jes");
         assert_eq!(correction.collection, "good_muon");
         assert_eq!(correction.attr, "pt");
-        assert_eq!(correction.up, 1.05);
-        assert_eq!(correction.down, 0.95);
+        assert_eq!(correction.fixed_scale_factors(), Some((1.05, 0.95)));
     }
 
     #[test]
@@ -4792,6 +5039,31 @@ mod tests {
             Some(("scale_factors", "nominal", "systup", "systdown"))
         );
         assert!(spec.has_weight_systematic());
+    }
+
+    #[test]
+    fn parses_jes_shape_correction_surface_and_adl_round_trips() {
+        let toml = AnalysisSpec::from_toml_str(JES_PAYLOAD_SPEC_TOML).expect("parse JES TOML spec");
+        let adl = AnalysisSpec::from_adl_str(JES_PAYLOAD_SPEC_ADL).expect("parse JES ADL spec");
+
+        assert_eq!(adl, toml);
+        assert_eq!(toml.shape_corrections.len(), 1);
+        let correction = &toml.shape_corrections[0];
+        assert_eq!(correction.name, "jes_total");
+        assert_eq!(correction.collection, "good_jet");
+        assert_eq!(correction.attr, "pt");
+        let Some((file, payload, inputs)) = correction.jes_payload() else {
+            panic!("expected JES payload");
+        };
+        assert_eq!(file, "../nano-spec/tests/data/jes_uncertainty.json");
+        assert_eq!(payload, "synthetic_jes_uncertainty");
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|input| input.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eta", "pt"]
+        );
     }
 
     #[test]
@@ -5128,6 +5400,35 @@ object good_muon : Muon {}
             error,
             SpecError::InvalidExpression { detail, .. }
                 if detail.contains("declared inputs [eta, scale_factors] do not match correctionlib inputs [eta, pt, scale_factors]")
+        )));
+    }
+
+    #[test]
+    fn validation_rejects_bad_jes_payload_name() {
+        let spec_text = JES_PAYLOAD_SPEC_TOML.replace(
+            "correction = \"synthetic_jes_uncertainty\"",
+            "correction = \"missing_jes\"",
+        );
+        let spec = AnalysisSpec::from_toml_str(&spec_text).expect("parse modified JES spec");
+        let errors = validate(&spec, &catalogue()).expect_err("bad correction name should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidExpression { detail, .. }
+                if detail.contains("correction `missing_jes` was not found")
+        )));
+    }
+
+    #[test]
+    fn validation_rejects_jes_missing_payload_input() {
+        let spec_text = JES_PAYLOAD_SPEC_TOML.replace("  { name = \"pt\", from = \"pt\" },\n", "");
+        let spec = AnalysisSpec::from_toml_str(&spec_text).expect("parse modified JES spec");
+        let errors = validate(&spec, &catalogue()).expect_err("missing input should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidExpression { detail, .. }
+                if detail.contains("declared inputs [eta] do not match correctionlib inputs [eta, pt]")
         )));
     }
 

@@ -83,13 +83,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut shape_spec = shape_base_spec;
     shape_spec.name = "mutagger_shape_crossing".to_string();
-    shape_spec.shape_corrections = vec![ShapeCorrectionDef {
-        name: "muon_pt_shape".to_string(),
-        collection: "tagged_muon".to_string(),
-        attr: "pt".to_string(),
-        up: 1.5,
-        down: 0.5,
-    }];
+    shape_spec.shape_corrections = vec![ShapeCorrectionDef::fixed_scale(
+        "muon_pt_shape".to_string(),
+        "tagged_muon".to_string(),
+        "pt".to_string(),
+        1.5,
+        0.5,
+    )];
     let shape_plan = validate(&shape_spec, &catalogue).map_err(|errors| {
         io::Error::new(
             io::ErrorKind::InvalidData,

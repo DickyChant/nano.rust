@@ -46,7 +46,7 @@ use crate::{
     RawAnalysisSpec, RawCorrection, RawDerivedObject, RawHistogram, RawModel, RawModelProvider,
     RawObject, RawOutput, RawRegion, RawScaleFactorInput, RawScaleFactorSystematic, RawSystematic,
     RawWeight, RegionDef, ScaleFactorCorrectionDef, ScaleFactorInputSource, ScaleFactorLiteral,
-    ShapeCorrectionDef, SystematicDef, Unit, Year,
+    ShapeCorrectionDef, ShapeCorrectionPayload, SystematicDef, Unit, Year,
 };
 
 pub fn parse_adl(input: &str) -> Result<AnalysisSpec, ParseError> {
@@ -304,14 +304,45 @@ fn write_histogram(out: &mut String, histogram: &HistogramDef) {
 fn write_shape_correction(out: &mut String, correction: &ShapeCorrectionDef) {
     out.push_str("correction ");
     out.push_str(&correction.name);
-    out.push_str(" kind scale collection ");
-    out.push_str(&correction.collection);
-    out.push_str(" attr ");
-    out.push_str(&correction.attr);
-    out.push_str(" up ");
-    out.push_str(&format_f64(correction.up));
-    out.push_str(" down ");
-    out.push_str(&format_f64(correction.down));
+    match &correction.payload {
+        ShapeCorrectionPayload::Scale { up, down } => {
+            out.push_str(" kind scale collection ");
+            out.push_str(&correction.collection);
+            out.push_str(" attr ");
+            out.push_str(&correction.attr);
+            out.push_str(" up ");
+            out.push_str(&format_f64(*up));
+            out.push_str(" down ");
+            out.push_str(&format_f64(*down));
+        }
+        ShapeCorrectionPayload::Jes {
+            file,
+            correction: payload_name,
+            inputs,
+        } => {
+            out.push_str(" kind jes file ");
+            out.push_str(file);
+            out.push_str(" correction ");
+            out.push_str(payload_name);
+            out.push_str(" collection ");
+            out.push_str(&correction.collection);
+            out.push_str(" attr ");
+            out.push_str(&correction.attr);
+            for input in inputs {
+                out.push_str(" input ");
+                out.push_str(&input.name);
+                match &input.source {
+                    ScaleFactorInputSource::From(source) => {
+                        out.push_str(" from ");
+                        out.push_str(source);
+                    }
+                    ScaleFactorInputSource::Literal(_) => {
+                        panic!("ADL emitter cannot render literal JES inputs")
+                    }
+                }
+            }
+        }
+    }
     out.push_str(";\n");
 }
 
@@ -987,6 +1018,14 @@ impl Parser {
             self.corrections.push(raw);
             return Ok(());
         }
+        if kind == "jes" {
+            let rest = self.read_until_semicolon()?.trim().to_string();
+            self.expect_char(';')?;
+            let mut raw = parse_jes_correction_adl(&name, &rest)?;
+            raw.name = name;
+            self.corrections.push(raw);
+            return Ok(());
+        }
         self.expect_keyword("collection")?;
         let collection = self.parse_identifier("correction collection")?;
         self.expect_keyword("attr")?;
@@ -1557,6 +1596,84 @@ fn parse_scale_factor_correction_adl(name: &str, input: &str) -> Result<RawCorre
         correction: payload_correction,
         inputs,
         systematic,
+    })
+}
+
+fn parse_jes_correction_adl(name: &str, input: &str) -> Result<RawCorrection, ParseError> {
+    let tokens = input.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0_usize;
+    let mut file = None;
+    let mut payload_correction = None;
+    let mut collection = None;
+    let mut attr = None;
+    let mut inputs = Vec::new();
+
+    while index < tokens.len() {
+        match tokens[index] {
+            "file" => {
+                index += 1;
+                file = Some(parse_required_token(&tokens, index, name, "file")?.to_string());
+                index += 1;
+            }
+            "correction" => {
+                index += 1;
+                payload_correction =
+                    Some(parse_required_token(&tokens, index, name, "correction")?.to_string());
+                index += 1;
+            }
+            "collection" => {
+                index += 1;
+                let value = parse_required_token(&tokens, index, name, "collection")?;
+                validate_identifier(value, "JES correction collection")?;
+                collection = Some(value.to_string());
+                index += 1;
+            }
+            "attr" => {
+                index += 1;
+                let value = parse_required_token(&tokens, index, name, "attr")?;
+                validate_identifier(value, "JES correction attribute")?;
+                attr = Some(value.to_string());
+                index += 1;
+            }
+            "input" => {
+                index += 1;
+                let input_name = parse_required_token(&tokens, index, name, "input name")?;
+                validate_identifier(input_name, "JES input name")?;
+                index += 1;
+                expect_token(&tokens, index, name, "from")?;
+                index += 1;
+                let value = parse_required_token(&tokens, index, name, "input source")?;
+                validate_identifier(value, "JES input source")?;
+                index += 1;
+                inputs.push(RawScaleFactorInput {
+                    name: input_name.to_string(),
+                    from: Some(value.to_string()),
+                    value: None,
+                });
+            }
+            other => {
+                return Err(ParseError::InvalidSpec(format!(
+                    "failed to parse ADL correction `{name}`: unsupported token `{other}`"
+                )));
+            }
+        }
+    }
+
+    Ok(RawCorrection {
+        name: name.to_string(),
+        kind: "jes".to_string(),
+        collection: collection.ok_or_else(|| {
+            ParseError::InvalidSpec(format!(
+                "failed to parse ADL correction `{name}`: missing `collection`"
+            ))
+        })?,
+        attr,
+        up: None,
+        down: None,
+        file,
+        correction: payload_correction,
+        inputs,
+        systematic: None,
     })
 }
 

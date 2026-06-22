@@ -77,8 +77,18 @@ pub struct ShapeCorrectionCertificate {
     pub name: String,
     pub collection: String,
     pub attr: String,
-    pub up: f64,
-    pub down: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub down: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correction: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -333,8 +343,22 @@ fn shape_correction_certificates(
             name: correction.name.clone(),
             collection: correction.collection.clone(),
             attr: correction.attr.clone(),
-            up: correction.up,
-            down: correction.down,
+            kind: match &correction.payload {
+                crate::ShapeCorrectionPayload::Scale { .. } => None,
+                crate::ShapeCorrectionPayload::Jes { .. } => Some("jes".to_string()),
+            },
+            up: correction.fixed_scale_factors().map(|(up, _)| up),
+            down: correction.fixed_scale_factors().map(|(_, down)| down),
+            file: correction
+                .jes_payload()
+                .map(|(file, _, _)| file.to_string()),
+            correction: correction
+                .jes_payload()
+                .map(|(_, correction, _)| correction.to_string()),
+            inputs: correction
+                .jes_payload()
+                .map(|(_, _, inputs)| inputs.iter().map(|input| input.name.clone()).collect())
+                .unwrap_or_default(),
         })
         .collect::<Vec<_>>();
     corrections.sort_by(|left, right| left.name.cmp(&right.name));
@@ -687,8 +711,34 @@ fn kir_summary(kir: &KirProgram) -> KirSummary {
                 name: correction.name.clone(),
                 collection: correction.collection.clone(),
                 attr: correction.attr.clone(),
-                up: correction.up,
-                down: correction.down,
+                kind: match &correction.payload {
+                    kir::KirShapeCorrectionPayload::Scale { .. } => None,
+                    kir::KirShapeCorrectionPayload::Jes { .. } => Some("jes".to_string()),
+                },
+                up: match &correction.payload {
+                    kir::KirShapeCorrectionPayload::Scale { up, .. } => Some(*up),
+                    kir::KirShapeCorrectionPayload::Jes { .. } => None,
+                },
+                down: match &correction.payload {
+                    kir::KirShapeCorrectionPayload::Scale { down, .. } => Some(*down),
+                    kir::KirShapeCorrectionPayload::Jes { .. } => None,
+                },
+                file: match &correction.payload {
+                    kir::KirShapeCorrectionPayload::Scale { .. } => None,
+                    kir::KirShapeCorrectionPayload::Jes { file, .. } => Some(file.clone()),
+                },
+                correction: match &correction.payload {
+                    kir::KirShapeCorrectionPayload::Scale { .. } => None,
+                    kir::KirShapeCorrectionPayload::Jes { correction, .. } => {
+                        Some(correction.clone())
+                    }
+                },
+                inputs: match &correction.payload {
+                    kir::KirShapeCorrectionPayload::Scale { .. } => Vec::new(),
+                    kir::KirShapeCorrectionPayload::Jes { inputs, .. } => {
+                        inputs.iter().map(|input| input.name.clone()).collect()
+                    }
+                },
             })
             .collect(),
         statements: block_statements(&kir.block),
