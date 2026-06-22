@@ -66,16 +66,37 @@ not hand-branched in codegen; ADL/TOML/YAML desugar onto the registry.
    effects). Proof: KIR verifier + compile-fail suite + differential fuzzing +
    per-primitive translation tests.
 
-## Staged roadmap (rough)
+## Staged roadmap (rough) — status as of the 2026-06-21→22 build
 
-1. Core IR + primitive registry + dimension lattice; lower current TOML/YAML into it.
-2. KIR verifier + KIR interpreter; port interpreter behavior to KIR.
-3. Typed Rust emitter (syn/quote); remove string-branch codegen; `trybuild` preservation tests.
-4. Generic systematics, `Weighted<R,S>`, histogram/table fan-out, visitor exhaustiveness.
-5. Correction graph (JES/JER shape + norm weights).
-6. Inference over object/derived scopes; ONNX provider.
-7. ADL front-end coverage (objects/regions/define/comb/bins/tables/weights/systematics/aliases).
-8. Adversarial suite + blinded benchmark + two external analyses + the preservation write-up.
+1. **DONE** — Core IR + primitive registry; lower TOML/YAML into it (`nano-spec::core`).
+   Dimension lattice partial (sum/attr carry dimensions; full `Quantity<Dim>` deferred).
+2. **DONE** — KIR + verifier; the interpreter **executes** KIR and codegen **emits**
+   from KIR (`nano-spec::kir`). Both back-ends share one semantics → no drift.
+3. **PARTIAL** — codegen emits *from KIR* (structural goal met). Still string-based;
+   the syn/quote typed emitter + `trybuild` preservation tests remain deferred polish.
+4. **DONE** — `Weighted<R,S>` + closed exhaustive `SystematicVisitor` (compile_fail
+   proof); weight + shape systematic histogram fan-out **executes** (interpret==codegen).
+   Remaining: per-analysis *generated* systematic variants (currently mapped onto a
+   fixed closed enum); table fan-out.
+5. **PARTIAL** — shape-variation corrections (`[[correction]]` kind="scale", pt-shift
+   that recomputes dependent selections). Full correctionlib-payload JES/JER deferred.
+6. **DEFERRED** — inference over scopes / ONNX provider (a `nano-inference` boundary
+   exists; real `ort` not wired — deferred from the thesis narrative per scope review).
+7. **DONE** — ADL front-end: `from_adl_str` desugars to the SAME AnalysisSpec/Core IR/
+   ResolvedPlan as TOML (proven equal + execution-equal); covers objects/regions/
+   define/alias/outputs/histograms/weight-systematics/shape-corrections.
+8. **PARTIAL** — adversarial reject matrix (9 classes) **DONE**; differential fuzzing
+   (400 cases, found+fixed 3 real interpret-vs-codegen bugs) **DONE**; **two** non-Higgs
+   analyses authored from prose (Z→μμ, multijet HT), each == an independent imperative
+   reference **DONE** (the multijet one found 2 region-requirement IR gaps, since
+   closed). Remaining: a blinded benchmark vs an *external* (non-self) ROOT oracle, and
+   the preservation write-up.
+
+The two-verifier preservation contract is real and tested: `validate` (domain facts:
+branch/era/units/regions/output-before-use) + the typestate/`rustc` (stage/region/
+weight-before-fill/score-before-use/exhaustive-systematic) — proven by the adversarial
+matrix (validator rejects) and the nano-analysis compile_fail doctests (rustc rejects),
+with differential fuzzing showing interpret==compiled across the supported surface.
 
 ## Highest-leverage moves & risks
 
