@@ -78,6 +78,7 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
         .iter()
         .filter(|case| case.has_candidate_object)
         .count();
+    let model_cases = specs.iter().filter(|case| case.has_model).count();
     writeln!(
         modules,
         "pub const FUZZ_DERIVED_CASES: usize = {derived_cases};"
@@ -85,6 +86,10 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     writeln!(
         modules,
         "pub const FUZZ_CANDIDATE_CASES: usize = {candidate_cases};"
+    )?;
+    writeln!(
+        modules,
+        "pub const FUZZ_MODEL_CASES: usize = {model_cases};"
     )?;
     writeln!(modules)?;
     writeln!(modules, "#[derive(Debug, Clone, Copy, PartialEq)]")?;
@@ -255,10 +260,27 @@ fn emit_run_case(
         }
     } else {
         writeln!(modules, "    for event in events {{")?;
-        writeln!(
-            modules,
-            "        rows.push({module_name}::GeneratedProducer::analyze(event)?.map(normalize_{module_name}));"
-        )?;
+        if generated.has_model {
+            let model_name = generated
+                .spec
+                .models
+                .first()
+                .map(|model| model.name.as_str())
+                .expect("model flag implies model spec");
+            writeln!(
+                modules,
+                "        let predictor = nano_inference::MockPredictor::new({model_name:?});"
+            )?;
+            writeln!(
+                modules,
+                "        rows.push({module_name}::GeneratedProducer::analyze(event, &predictor).map_err(|error| nano_core::NanoError::MissingAttachment {{ name: error.to_string() }})?.map(normalize_{module_name}));"
+            )?;
+        } else {
+            writeln!(
+                modules,
+                "        rows.push({module_name}::GeneratedProducer::analyze(event)?.map(normalize_{module_name}));"
+            )?;
+        }
         writeln!(modules, "    }}")?;
         writeln!(modules, "    let histogram = None;")?;
     }

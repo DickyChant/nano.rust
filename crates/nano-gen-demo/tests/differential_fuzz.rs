@@ -7,7 +7,10 @@
 //! leading-pt/sum-pt/bool/derived outputs, pair-derived objects, nested
 //! pair-plus-candidate objects, cross-collection candidate objects, and optional
 //! histograms over object or derived attributes with optional weight or pt-shape
-//! systematics.
+//! systematics. A deterministic subset of otherwise no-derived specs is replaced
+//! with mock-model taggers over real Muon or Jet batches; those model specs use
+//! the generated score in object cuts, region requirements, and leading-score
+//! outputs.
 //!
 //! This test validates every generated spec, lowers it to KIR, verifies KIR,
 //! requires string codegen to succeed, then compares the KIR interpreter against
@@ -15,7 +18,11 @@
 //! deterministic synthetic event batch. Rows are normalized to one stable shape;
 //! histogram contents are compared for Nominal on nominal-only histograms and
 //! Nominal/JesUp/JesDown when a weight or shape systematic is present.
-//! Multi-channel union specs, model inference, and combined weight-plus-shape
+//! Random mock-model specs are included in the same build-time compiled corpus
+//! and are compared interpreter == compiled producer using the shared mock score
+//! routine through the interpreter and `MockPredictor` through generated code.
+//! Multi-channel union specs, non-mock model providers, model-aware histograms,
+//! derived objects under model-aware codegen, and combined weight-plus-shape
 //! histogram systematics remain outside this dependency-free fuzz slice because
 //! both dynamic and compiled backends do not yet share one fully supported path
 //! for those combinations.
@@ -50,8 +57,10 @@ fn generated_valid_specs_interpret_like_compiled_codegen() {
     let mut shape_systematic_cases = 0_usize;
     let mut derived_cases = 0_usize;
     let mut candidate_cases = 0_usize;
+    let mut model_cases = 0_usize;
     let mut sum_region_cases = 0_usize;
     let mut leading_region_cases = 0_usize;
+    let skipped = 0_usize;
 
     for case in &cases {
         let plan = validate(&case.spec, &catalogue).unwrap_or_else(|errors| {
@@ -95,6 +104,7 @@ fn generated_valid_specs_interpret_like_compiled_codegen() {
         shape_systematic_cases += usize::from(case.has_shape_correction);
         derived_cases += usize::from(case.has_derived_object);
         candidate_cases += usize::from(case.has_candidate_object);
+        model_cases += usize::from(case.has_model);
         sum_region_cases += usize::from(has_sum_region_requirement(case));
         leading_region_cases += usize::from(has_leading_region_requirement(case));
     }
@@ -125,6 +135,11 @@ fn generated_valid_specs_interpret_like_compiled_codegen() {
         "deterministic generator should include candidate-object cases"
     );
     assert!(
+        model_cases > 0,
+        "deterministic generator should include mock-model cases"
+    );
+    assert_eq!(model_cases, nano_gen_demo::fuzz::FUZZ_MODEL_CASES);
+    assert!(
         sum_region_cases > 0,
         "deterministic generator should include sum region requirements"
     );
@@ -134,7 +149,7 @@ fn generated_valid_specs_interpret_like_compiled_codegen() {
     );
 
     eprintln!(
-        "differential fuzz seed=0x{seed:016x} generated={generated} validated={validated} kir_verified={kir_verified} codegen_emitted={codegen_emitted} compiled_compared={compiled_compared} histogram_cases={histogram_cases} weight_systematic_cases={weight_systematic_cases} shape_systematic_cases={shape_systematic_cases} derived_cases={derived_cases} candidate_cases={candidate_cases} sum_region_cases={sum_region_cases} leading_region_cases={leading_region_cases}",
+        "differential fuzz seed=0x{seed:016x} generated={generated} validated={validated} kir_verified={kir_verified} codegen_emitted={codegen_emitted} compiled_compared={compiled_compared} skipped={skipped} skipped_reasons=[] model_cases={model_cases} histogram_cases={histogram_cases} weight_systematic_cases={weight_systematic_cases} shape_systematic_cases={shape_systematic_cases} derived_cases={derived_cases} candidate_cases={candidate_cases} sum_region_cases={sum_region_cases} leading_region_cases={leading_region_cases}",
         seed = fuzz_specs::FUZZ_SEED,
         generated = cases.len(),
     );

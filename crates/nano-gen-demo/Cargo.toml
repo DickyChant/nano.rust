@@ -10,6 +10,7 @@ build = "build.rs"
 [dependencies]
 nano-analysis = { workspace = true }
 nano-core = { workspace = true }
+nano-inference = { workspace = true }
 
 [dev-dependencies]
 nano-io = { workspace = true }

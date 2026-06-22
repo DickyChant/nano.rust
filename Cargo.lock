@@ -1048,6 +1048,7 @@ version = "0.0.0"
 dependencies = [
  "nano-analysis",
  "nano-core",
+ "nano-inference",
  "nano-io",
  "nano-producers",
  "nano-spec",

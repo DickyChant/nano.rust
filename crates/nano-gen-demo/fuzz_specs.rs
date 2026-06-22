@@ -1,8 +1,8 @@
 use nano_spec::{
-    AnalysisSpec, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, HistogramDef,
-    ObjectCandidateDef, ObjectDef, ObjectPairDef, OutputDef, PairConstraint, PairSelection,
-    Quantity, RegionDef, Requirement, ShapeCorrectionDef, SystematicDef, Unit, WeightDef,
-    WeightSystematicDef, Year,
+    AnalysisSpec, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, HistogramDef, ModelDef,
+    ModelOutputDType, ModelProviderKind, ModelProviderSpec, ObjectCandidateDef, ObjectDef,
+    ObjectPairDef, OutputDef, PairConstraint, PairSelection, Quantity, RegionDef, Requirement,
+    ShapeCorrectionDef, SystematicDef, Unit, WeightDef, WeightSystematicDef, Year,
 };
 
 pub const FUZZ_SEED: u64 = 0x4e41_4e4f_5f44_4946;
@@ -17,6 +17,7 @@ pub struct GeneratedSpec {
     pub has_shape_correction: bool,
     pub has_derived_object: bool,
     pub has_candidate_object: bool,
+    pub has_model: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -267,6 +268,16 @@ pub fn generated_specs() -> Vec<GeneratedSpec> {
 }
 
 fn generated_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
+    let generated = generated_standard_spec(index, rng);
+    if !generated.has_derived_object && index.is_multiple_of(3) {
+        let mut model_rng =
+            SplitMix64::new(FUZZ_SEED ^ (index as u64).wrapping_mul(0xd1b5_4a32_d192_ed03));
+        return generated_model_spec(index, &mut model_rng);
+    }
+    generated
+}
+
+fn generated_standard_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
     let objects = OBJECTS
         .iter()
         .map(|object| ObjectDef {
@@ -411,7 +422,162 @@ fn generated_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
         has_shape_correction,
         has_derived_object,
         has_candidate_object,
+        has_model: false,
     }
+}
+
+fn generated_model_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
+    let target = if rng.bool() {
+        ModelTarget {
+            source: "Muon",
+            selected: "good_muon",
+            tagged: "tagged_muon",
+            score: "topscore",
+            inputs: &["Muon_pt", "Muon_eta", "Muon_phi"],
+            base_cuts: MUON_CUTS,
+            pt_low: 5.0,
+            pt_high: 45.0,
+        }
+    } else {
+        ModelTarget {
+            source: "Jet",
+            selected: "good_jet",
+            tagged: "tagged_jet",
+            score: "mock_score",
+            inputs: &["Jet_pt", "Jet_eta", "Jet_phi", "Jet_mass"],
+            base_cuts: JET_CUTS,
+            pt_low: 20.0,
+            pt_high: 110.0,
+        }
+    };
+    let score_cut = round(rng.f64(0.15, 0.75));
+    let leading_score_cut = round((score_cut - rng.f64(0.05, 0.12)).max(0.0));
+
+    let selected = ObjectDef {
+        name: target.selected.to_string(),
+        source: target.source.to_string(),
+        cuts: object_cuts(
+            &ObjectTemplate {
+                name: target.selected,
+                source: target.source,
+                cut_attrs: target.base_cuts,
+            },
+            rng,
+        ),
+    };
+    let tagged = ObjectDef {
+        name: target.tagged.to_string(),
+        source: target.source.to_string(),
+        cuts: vec![
+            Cut {
+                lhs: Expr::Attr {
+                    object: target.tagged.to_string(),
+                    attr: "pt".to_string(),
+                },
+                op: CmpOp::Gt,
+                rhs: q(round(rng.f64(target.pt_low, target.pt_high)), Unit::GeV),
+            },
+            Cut {
+                lhs: Expr::Attr {
+                    object: target.tagged.to_string(),
+                    attr: target.score.to_string(),
+                },
+                op: CmpOp::Gt,
+                rhs: q(score_cut, Unit::Dimensionless),
+            },
+        ],
+    };
+
+    GeneratedSpec {
+        index,
+        spec: AnalysisSpec {
+            name: format!("fuzz_model_diff_{index:03}"),
+            year: Year::Run2018,
+            objects: vec![selected, tagged],
+            derived_objects: Vec::new(),
+            models: vec![ModelDef {
+                name: format!(
+                    "fuzz_{}_tagger_{index:03}",
+                    target.source.to_ascii_lowercase()
+                ),
+                inputs: target
+                    .inputs
+                    .iter()
+                    .map(|input| (*input).to_string())
+                    .collect(),
+                output: format!("{}_{}", target.source, target.score),
+                output_dtype: ModelOutputDType::F32,
+                batch: target.source.to_string(),
+                provider: ModelProviderSpec {
+                    kind: ModelProviderKind::Mock,
+                    endpoint: None,
+                    launch: None,
+                    onnx_path: None,
+                },
+            }],
+            regions: vec![RegionDef {
+                name: "model_signal".to_string(),
+                require: vec![
+                    count_requirement(target.tagged, CmpOp::Ge, 1.0),
+                    Requirement {
+                        lhs: Expr::LeadingAttr {
+                            object: target.tagged.to_string(),
+                            attr: target.score.to_string(),
+                        },
+                        op: CmpOp::Gt,
+                        rhs: q(leading_score_cut, Unit::Dimensionless),
+                    },
+                ],
+            }],
+            outputs: vec![
+                output(
+                    &format!("n_{}", target.selected),
+                    Expr::Count(target.selected.to_string()),
+                ),
+                output(
+                    &format!("n_{}", target.tagged),
+                    Expr::Count(target.tagged.to_string()),
+                ),
+                output(
+                    &format!("lead_{}_pt", target.tagged),
+                    Expr::LeadingAttr {
+                        object: target.tagged.to_string(),
+                        attr: "pt".to_string(),
+                    },
+                ),
+                output(
+                    &format!("lead_{}_{}", target.tagged, target.score),
+                    Expr::LeadingAttr {
+                        object: target.tagged.to_string(),
+                        attr: target.score.to_string(),
+                    },
+                ),
+            ],
+            histograms: Vec::new(),
+            weight: WeightDef::default(),
+            systematics: vec![SystematicDef::Nominal],
+            shape_corrections: Vec::new(),
+            channels: Vec::new(),
+        },
+        has_histogram: false,
+        has_weight_systematic: false,
+        has_shape_correction: false,
+        has_derived_object: false,
+        has_candidate_object: false,
+        has_model: true,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelTarget {
+    source: &'static str,
+    selected: &'static str,
+    tagged: &'static str,
+    score: &'static str,
+    inputs: &'static [&'static str],
+    base_cuts: &'static [CutAttr],
+    pt_low: f64,
+    pt_high: f64,
 }
 
 fn has_weight_systematic_candidate(rng: &mut SplitMix64) -> bool {

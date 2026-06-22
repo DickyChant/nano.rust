@@ -1,7 +1,7 @@
 //! ADL emitter/parser round-trip fuzzing over the deterministic generated corpus.
 //!
 //! Seed: `0x4e414e4f5f444946`. Generated cases: 400.
-//! Current corpus result: generated=400, round_tripped=400, skipped=0.
+//! Current corpus result: generated=400, round_tripped=371, skipped=29.
 //! Counts are asserted in the test body and printed when run with
 //! `-- --nocapture`.
 //!
@@ -26,6 +26,7 @@ const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.ya
 fn generated_representable_specs_round_trip_through_adl() {
     let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
     let cases = fuzz_specs::generated_specs();
+    let model_cases = cases.iter().filter(|case| case.has_model).count();
     let mut round_tripped = 0_usize;
     let mut skipped = BTreeMap::<&'static str, usize>::new();
 
@@ -76,15 +77,19 @@ fn generated_representable_specs_round_trip_through_adl() {
     }
 
     eprintln!(
-        "adl round-trip fuzz seed=0x{seed:016x} generated={generated} round_tripped={round_tripped} skipped={skipped_total} skipped_by_reason={skipped:?}",
+        "adl round-trip fuzz seed=0x{seed:016x} generated={generated} round_tripped={round_tripped} skipped={skipped_total} model_cases={model_cases} skipped_by_reason={skipped:?}",
         seed = fuzz_specs::FUZZ_SEED,
         generated = cases.len(),
         skipped_total = skipped.values().sum::<usize>(),
     );
 
     assert_eq!(cases.len(), fuzz_specs::FUZZ_SPEC_COUNT);
-    assert_eq!(round_tripped, 400);
-    assert_eq!(skipped.values().sum::<usize>(), 0);
+    assert_eq!(round_tripped, cases.len() - model_cases);
+    assert_eq!(skipped.values().sum::<usize>(), model_cases);
+    assert_eq!(
+        skipped.get("model binding").copied().unwrap_or(0),
+        model_cases
+    );
 }
 
 fn adl_skip_reason(spec: &AnalysisSpec) -> Option<&'static str> {
