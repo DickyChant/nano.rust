@@ -14,6 +14,8 @@ use nano_core::{BranchSchema, Event};
 #[cfg(feature = "http")]
 pub use nano_rootio::HttpSourceOptions;
 
+pub mod datacard;
+
 pub type Result<T> = std::result::Result<T, RootError>;
 
 #[derive(Debug)]
