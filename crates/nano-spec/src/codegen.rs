@@ -283,7 +283,7 @@ impl<'a> Generator<'a> {
         )
         .unwrap();
         if kir.histograms.is_empty() {
-            self.emit_analyze_body_from_kir(&mut source, false, &kir)?;
+            self.emit_analyze_body_from_kir(&mut source, false, &kir, None)?;
             writeln!(source, "    }}").unwrap();
         } else {
             writeln!(
@@ -314,7 +314,7 @@ impl<'a> Generator<'a> {
                 "    fn analyze_impl(event: &nano_core::Event, histograms: Option<&mut GenHistograms>, {systematic_param}: Systematic) -> nano_core::Result<Option<GenRow>> {{"
             )
             .unwrap();
-            self.emit_analyze_body_from_kir(&mut source, true, &kir)?;
+            self.emit_analyze_body_from_kir(&mut source, true, &kir, None)?;
             writeln!(source, "    }}").unwrap();
         }
         writeln!(source, "}}").unwrap();
@@ -333,6 +333,7 @@ impl<'a> Generator<'a> {
         source: &mut String,
         emit_histograms: bool,
         kir: &KirProgram,
+        error_mapper: Option<&str>,
     ) -> Result<(), CodegenError> {
         let mut requirement_conditions = BTreeMap::new();
         let mut output_exprs = BTreeMap::new();
@@ -355,7 +356,7 @@ impl<'a> Generator<'a> {
                             source: object.source.clone(),
                             cuts: object.cuts.clone(),
                         };
-                        self.emit_object_selection(source, &object)?;
+                        self.emit_object_selection(source, &object, error_mapper)?;
                     }
                     Rvalue::DeriveObject { object } => match &object.def.source {
                         DerivedSource::Pair(pair) => {
@@ -606,6 +607,11 @@ impl<'a> Generator<'a> {
 
     fn generate_with_models(&self) -> Result<String, CodegenError> {
         self.validate_supported_spec()?;
+        let kir = if self.spec().derived_objects.is_empty() {
+            None
+        } else {
+            Some(self.lower_codegen_kir()?)
+        };
 
         let mut source = String::new();
         writeln!(
@@ -660,6 +666,8 @@ impl<'a> Generator<'a> {
             writeln!(source, "pub struct GenHistograms;").unwrap();
             writeln!(source).unwrap();
         }
+        self.emit_derived_row_structs(&mut source)?;
+        self.emit_kinematic_helpers(&mut source)?;
         writeln!(source, "pub struct GeneratedProducer;").unwrap();
         writeln!(source).unwrap();
         writeln!(source, "impl GeneratedProducer {{").unwrap();
@@ -694,7 +702,11 @@ impl<'a> Generator<'a> {
             .unwrap();
             writeln!(source, "    }}").unwrap();
         }
-        let systematic_param = "_systematic";
+        let systematic_param = if kir.is_some() && !self.spec().histograms.is_empty() {
+            "systematic"
+        } else {
+            "_systematic"
+        };
         let histograms_param = if self.spec().histograms.is_empty() {
             "_histograms"
         } else {
@@ -708,6 +720,18 @@ impl<'a> Generator<'a> {
 
         for model in &self.spec().models {
             self.emit_model_inference(&mut source, model)?;
+        }
+        if let Some(kir) = &kir {
+            self.emit_analyze_body_from_kir(
+                &mut source,
+                !self.spec().histograms.is_empty(),
+                kir,
+                Some("gen_core_error"),
+            )?;
+            writeln!(source, "    }}").unwrap();
+            writeln!(source, "}}").unwrap();
+
+            return Ok(source);
         }
         let baseline_ident = self
             .spec()
@@ -825,11 +849,6 @@ impl<'a> Generator<'a> {
     }
 
     fn validate_supported_spec(&self) -> Result<(), CodegenError> {
-        if !self.spec().models.is_empty() && !self.spec().derived_objects.is_empty() {
-            return Err(CodegenError::UnsupportedFeature(
-                "derived objects are not yet supported by model-aware codegen".to_string(),
-            ));
-        }
         if !self.spec().models.is_empty() && self.spec().has_shape_correction() {
             return Err(CodegenError::UnsupportedFeature(
                 "shape corrections are not yet supported by model-aware codegen".to_string(),
@@ -860,7 +879,7 @@ impl<'a> Generator<'a> {
         for region in &self.spec().regions {
             checked_ident(&region.name, "region name")?;
             for requirement in &region.require {
-                if self.spec().models.is_empty() {
+                if self.spec().models.is_empty() || !self.spec().derived_objects.is_empty() {
                     self.validate_region_expr(&requirement.lhs, "region requirement")?;
                     if matches!(requirement.lhs, Expr::Count(_)) {
                         checked_count_rhs(requirement.rhs.value, "region requirement")?;
@@ -1575,6 +1594,7 @@ impl<'a> Generator<'a> {
         &self,
         source: &mut String,
         object: &ObjectDef,
+        error_mapper: Option<&str>,
     ) -> Result<(), CodegenError> {
         let object_name = checked_ident(&object.name, "object name")?;
         let collection_ident = format!("{object_name}_collection");
@@ -1606,12 +1626,21 @@ impl<'a> Generator<'a> {
             writeln!(source, "        let mut {selected_ident} = Vec::new();").unwrap();
         }
 
-        writeln!(
-            source,
-            "        let {collection_ident} = event.collection({})?;",
-            rust_string(&object.source)
-        )
-        .unwrap();
+        if let Some(mapper) = error_mapper {
+            writeln!(
+                source,
+                "        let {collection_ident} = event.collection({}).map_err({mapper})?;",
+                rust_string(&object.source)
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                source,
+                "        let {collection_ident} = event.collection({})?;",
+                rust_string(&object.source)
+            )
+            .unwrap();
+        }
         writeln!(source, "        let mut {count_ident} = 0_u32;").unwrap();
 
         for output in &self.spec().outputs {
@@ -1643,6 +1672,13 @@ impl<'a> Generator<'a> {
                 writeln!(
                     source,
                     "            let {attr_ident} = (f64::from({item_ident}.get::<{rust_type}>({})?) * {factor}) as {rust_type};",
+                    rust_string(&attr)
+                )
+                .unwrap();
+            } else if let Some(mapper) = error_mapper {
+                writeln!(
+                    source,
+                    "            let {attr_ident} = {item_ident}.get::<{rust_type}>({}).map_err({mapper})?;",
                     rust_string(&attr)
                 )
                 .unwrap();
@@ -2837,9 +2873,17 @@ impl<'a> Generator<'a> {
         attr: &str,
         context: &str,
     ) -> Result<(), CodegenError> {
+        let object = self.object(object_name)?;
+        if self
+            .spec()
+            .models
+            .iter()
+            .any(|model| self.model_output_matches_object_attr(model, &object.source, attr))
+        {
+            return Ok(());
+        }
         let branch_type = self.object_attr_branch_type(object_name, attr)?;
         if !matches!(branch_type, BranchType::VecF32 | BranchType::VecI32) {
-            let object = self.object(object_name)?;
             let branch = format!("{}_{}", object.source, attr);
             return Err(CodegenError::UnsupportedFeature(format!(
                 "{context}: branch `{branch}` has type {:?}; this slice only emits f32/i32 object reads",
@@ -2854,6 +2898,15 @@ impl<'a> Generator<'a> {
         object_name: &str,
         attr: &str,
     ) -> Result<&'static str, CodegenError> {
+        let object = self.object(object_name)?;
+        if self
+            .spec()
+            .models
+            .iter()
+            .any(|model| self.model_output_matches_object_attr(model, &object.source, attr))
+        {
+            return Ok("f32");
+        }
         match self.object_attr_branch_type(object_name, attr)? {
             BranchType::VecF32 => Ok("f32"),
             BranchType::VecI32 => Ok("i32"),

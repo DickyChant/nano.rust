@@ -9,6 +9,7 @@ pub const FUZZ_SEED: u64 = 0x4e41_4e4f_5f44_4946;
 pub const FUZZ_SPEC_COUNT: usize = 400;
 pub const FUZZ_UNION_SPEC_COUNT: usize = 24;
 pub const FUZZ_MODEL_HISTOGRAM_SPEC_COUNT: usize = 24;
+pub const FUZZ_DERIVED_MODEL_SPEC_COUNT: usize = 24;
 pub const FUZZ_WEIGHT_SHAPE_SPEC_COUNT: usize = 24;
 
 #[derive(Debug, Clone)]
@@ -309,6 +310,78 @@ pub fn generated_model_histogram_specs() -> Vec<GeneratedSpec> {
                 range: [0.0, if index.is_multiple_of(2) { 1.0 } else { 220.0 }],
             }];
             generated.has_histogram = true;
+            generated
+        })
+        .collect()
+}
+
+pub fn generated_derived_under_model_specs() -> Vec<GeneratedSpec> {
+    (0..FUZZ_DERIVED_MODEL_SPEC_COUNT)
+        .map(|index| {
+            let mut rng = SplitMix64::new(
+                FUZZ_SEED
+                    ^ 0x56e1_2d8f_c614_7a03
+                    ^ (index as u64).wrapping_mul(0x94d0_49bb_1331_11eb),
+            );
+            let mut generated = generated_model_spec(index, &mut rng);
+            generated.spec.name = format!("fuzz_derived_model_diff_{index:03}");
+            let tagged = generated.spec.objects[1].name.clone();
+            let score = generated.spec.models[0]
+                .output
+                .split_once('_')
+                .expect("mock model output is source_attr")
+                .1
+                .to_string();
+
+            let derived_name = if index.is_multiple_of(2) {
+                "tagged_pair".to_string()
+            } else {
+                "tagged_candidate".to_string()
+            };
+            generated.spec.derived_objects = if index.is_multiple_of(2) {
+                vec![DerivedObjectDef {
+                    name: derived_name.clone(),
+                    source: DerivedSource::Pair(ObjectPairDef {
+                        object: tagged.clone(),
+                        constraints: Vec::new(),
+                        filters: maybe_pair_filters(&mut rng),
+                        selection: PairSelection::LeadingPt,
+                        exclude: Vec::new(),
+                    }),
+                }]
+            } else {
+                vec![DerivedObjectDef {
+                    name: derived_name.clone(),
+                    source: DerivedSource::Candidate(ObjectCandidateDef {
+                        items: vec![tagged.clone(), tagged.clone()],
+                        filters: maybe_candidate_filters(&mut rng),
+                    }),
+                }]
+            };
+            generated.spec.outputs.push(output(
+                &format!("{derived_name}_mass"),
+                derived_attr(&derived_name, "mass"),
+            ));
+            generated.spec.outputs.push(output(
+                &format!("{derived_name}_min_delta_r"),
+                derived_attr(&derived_name, "min_delta_r"),
+            ));
+            generated.spec.histograms = vec![HistogramDef {
+                name: "fuzz_derived_model_hist".to_string(),
+                expr: if index.is_multiple_of(3) {
+                    Expr::LeadingAttr {
+                        object: tagged,
+                        attr: score,
+                    }
+                } else {
+                    derived_attr(&derived_name, "mass")
+                },
+                bins: 10,
+                range: [0.0, if index.is_multiple_of(3) { 1.0 } else { 220.0 }],
+            }];
+            generated.has_histogram = true;
+            generated.has_derived_object = true;
+            generated.has_candidate_object = !index.is_multiple_of(2);
             generated
         })
         .collect()

@@ -11,6 +11,9 @@
 //! otherwise no-derived specs is replaced with mock-model taggers over real Muon
 //! or Jet batches; those model specs use the generated score in object cuts,
 //! region requirements, leading-score outputs, and targeted score histograms.
+//! A targeted 24-case derived-under-model corpus adds mock-model specs whose selected
+//! score-cut objects feed pair or candidate derived objects, with rows and
+//! histograms reading both score and derived attributes.
 //! A targeted union corpus adds multi-channel Muon/Electron/Jet specs with
 //! matching output schemas and shared histograms.
 //!
@@ -24,13 +27,11 @@
 //! Random mock-model specs are included in the same build-time compiled corpus
 //! and are compared interpreter == compiled producer using the shared mock score
 //! routine through the interpreter and `MockPredictor` through generated code.
+//! Derived objects under model-aware codegen are compared in their own targeted
+//! corpus, covering pair and candidate construction after mock inference.
 //! Multi-channel union specs are compared as rows per event plus their shared
 //! histogram contents. Non-mock model providers remain excluded because the
 //! dependency-free interpreter intentionally supports only the mock provider.
-//! Derived objects under model-aware codegen remain excluded: model-aware
-//! string codegen currently rejects them with `derived objects are not yet
-//! supported by model-aware codegen`; an ignored minimal repro below pins that
-//! capability gap.
 
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
 use nano_gen_demo::fuzz::{
@@ -315,6 +316,74 @@ fn generated_model_histogram_specs_interpret_like_compiled_codegen() {
 }
 
 #[test]
+fn generated_derived_under_model_specs_interpret_like_compiled_codegen() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let cases = fuzz_specs::generated_derived_under_model_specs();
+    let events = synthetic_events();
+
+    let mut compiled_compared = 0_usize;
+    let mut pair_cases = 0_usize;
+    let mut candidate_cases = 0_usize;
+    for case in &cases {
+        let plan = validate(&case.spec, &catalogue).unwrap_or_else(|errors| {
+            panic!(
+                "generated derived-under-model fuzz spec {} did not validate: {errors:?}\n{:#?}",
+                case.index, case.spec
+            )
+        });
+        let kir = nano_spec::kir::lower_plan_to_kir(&plan).unwrap_or_else(|error| {
+            panic!(
+                "generated derived-under-model fuzz spec {} did not lower to KIR: {error}",
+                case.index
+            )
+        });
+        nano_spec::kir::verify(&kir).unwrap_or_else(|error| {
+            panic!(
+                "generated derived-under-model fuzz spec {} produced invalid KIR: {error}",
+                case.index
+            )
+        });
+        generate_producer_source(&plan).unwrap_or_else(|error| {
+            panic!(
+                "generated derived-under-model fuzz spec {} was not supported by codegen: {error}",
+                case.index
+            )
+        });
+
+        let interpreted = interpret_case(&plan, &events, case);
+        let compiled = nano_gen_demo::fuzz::run_derived_model_case(case.index, &events)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "compiled derived-under-model fuzz case {} failed: {error}",
+                    case.index
+                )
+            });
+        assert_eq!(
+            compiled, interpreted,
+            "derived-under-model fuzz case {}",
+            case.index
+        );
+        compiled_compared += 1;
+        candidate_cases += usize::from(case.has_candidate_object);
+        pair_cases += usize::from(!case.has_candidate_object);
+    }
+
+    assert_eq!(cases.len(), fuzz_specs::FUZZ_DERIVED_MODEL_SPEC_COUNT);
+    assert_eq!(compiled_compared, cases.len());
+    assert_eq!(
+        compiled_compared,
+        nano_gen_demo::fuzz::FUZZ_DERIVED_MODEL_CASES
+    );
+    assert!(pair_cases > 0);
+    assert!(candidate_cases > 0);
+    eprintln!(
+        "derived-under-model differential fuzz seed=0x{seed:016x} generated={generated} compiled_compared={compiled_compared} pair_cases={pair_cases} candidate_cases={candidate_cases}",
+        seed = fuzz_specs::FUZZ_SEED,
+        generated = cases.len(),
+    );
+}
+
+#[test]
 fn generated_weight_shape_specs_interpret_like_compiled_codegen() {
     let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
     let cases = fuzz_specs::generated_weight_shape_specs();
@@ -377,37 +446,20 @@ fn generated_weight_shape_specs_interpret_like_compiled_codegen() {
 }
 
 #[test]
-#[ignore = "capability gap: model-aware string codegen rejects derived objects"]
-fn derived_under_model_minimal_repro_documents_codegen_gap() {
+fn derived_under_model_minimal_repro_interpret_like_compiled_codegen() {
     let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
-    let mut case = fuzz_specs::generated_model_histogram_specs()
+    let case = fuzz_specs::generated_derived_under_model_specs()
         .into_iter()
         .next()
         .expect("deterministic model histogram corpus is non-empty");
-    case.spec.name = "derived_under_model_repro".to_string();
-    case.spec.derived_objects = vec![nano_spec::DerivedObjectDef {
-        name: "tagged_pair".to_string(),
-        source: nano_spec::DerivedSource::Pair(nano_spec::ObjectPairDef {
-            object: case.spec.objects[1].name.clone(),
-            constraints: Vec::new(),
-            filters: Vec::new(),
-            selection: nano_spec::PairSelection::LeadingPt,
-            exclude: Vec::new(),
-        }),
-    }];
-    case.spec.outputs.push(nano_spec::OutputDef {
-        name: "tagged_pair_mass".to_string(),
-        expr: nano_spec::Expr::Attr {
-            object: "tagged_pair".to_string(),
-            attr: "mass".to_string(),
-        },
-    });
     let plan = validate(&case.spec, &catalogue).expect("minimal repro should validate");
-    let error = generate_producer_source(&plan).expect_err("model-aware derived codegen gap");
-    assert_eq!(
-        error.to_string(),
-        "derived objects are not yet supported by model-aware codegen"
-    );
+    generate_producer_source(&plan).expect("model-aware derived codegen should emit");
+
+    let events = synthetic_events();
+    let interpreted = interpret_case(&plan, &events, &case);
+    let compiled = nano_gen_demo::fuzz::run_derived_model_case(case.index, &events)
+        .expect("compiled derived-under-model repro failed");
+    assert_eq!(compiled, interpreted, "derived-under-model repro");
 }
 
 fn interpret_case(
