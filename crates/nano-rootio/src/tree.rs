@@ -26,6 +26,7 @@ pub struct LeafInfo {
 pub struct BranchInfo {
     pub name: String,
     pub types: Vec<String>,
+    pub counter_name: Option<String>,
     pub basket_count: usize,
     pub basket_first_entries: Vec<i64>,
 }
@@ -213,6 +214,10 @@ impl Tree {
                     .iter()
                     .map(|leaf| leaf.type_name.clone())
                     .collect(),
+                counter_name: branch
+                    .leaves
+                    .iter()
+                    .find_map(|leaf| leaf.leaf_count_name.clone()),
                 basket_count: branch.baskets.len(),
                 basket_first_entries: branch.basket_entry.clone(),
             })
@@ -356,14 +361,7 @@ impl Tree {
         let branch = self.find_branch(branch_name)?;
         let _leaf = branch.jagged_leaf::<T>()?;
         let counter = self.find_branch(counter_branch_name)?;
-        let counter_leaf = counter.scalar_leaf()?;
-        if counter_leaf.type_name != u32::TYPE_NAME {
-            return Err(Error::TypeMismatch {
-                branch: counter_branch_name.to_string(),
-                root_type: counter_leaf.type_name.clone(),
-                requested: u32::TYPE_NAME,
-            });
-        }
+        let counter_type = counter.scalar_leaf()?.type_name.clone();
         if branch.entries != counter.entries {
             return Err(Error::unsupported(
                 branch_name,
@@ -382,8 +380,9 @@ impl Tree {
             let overlap_start = range.start.max(basket_start);
             let overlap_end = range.end.min(basket_end);
             let counts_len = usize::try_from(overlap_end - basket_start).unwrap();
-            let counts = self.read_scalar_range_inner::<u32>(
+            let counts = self.read_counter_counts_range(
                 counter_branch_name,
+                &counter_type,
                 basket_start,
                 counts_len,
                 cache.as_deref_mut(),
@@ -463,14 +462,7 @@ impl Tree {
         let branch = self.find_branch(branch_name)?;
         let _leaf = branch.jagged_leaf::<T>()?;
         let counter = self.find_branch(counter_branch_name)?;
-        let counter_leaf = counter.scalar_leaf()?;
-        if counter_leaf.type_name != u32::TYPE_NAME {
-            return Err(Error::TypeMismatch {
-                branch: counter_branch_name.to_string(),
-                root_type: counter_leaf.type_name.clone(),
-                requested: u32::TYPE_NAME,
-            });
-        }
+        let counter_type = counter.scalar_leaf()?.type_name.clone();
         if branch.entries != counter.entries {
             return Err(Error::unsupported(
                 branch_name,
@@ -492,8 +484,9 @@ impl Tree {
             let overlap_start = range.start.max(basket_start);
             let overlap_end = range.end.min(basket_end);
             let counts_len = usize::try_from(overlap_end - basket_start).unwrap();
-            let counts = self.read_scalar_range_inner::<u32>(
+            let counts = self.read_counter_counts_range(
                 counter_branch_name,
+                &counter_type,
                 basket_start,
                 counts_len,
                 cache.as_deref_mut(),
@@ -539,6 +532,38 @@ impl Tree {
             }
         }
         Ok(JaggedArray { offsets, values })
+    }
+
+    fn read_counter_counts_range(
+        &self,
+        counter_branch_name: &str,
+        counter_type: &str,
+        start: i64,
+        len: usize,
+        cache: Option<&mut BasketPayloadCache>,
+    ) -> Result<Vec<u32>> {
+        match counter_type {
+            "u32" => self.read_scalar_range_inner::<u32>(counter_branch_name, start, len, cache),
+            "i32" => self
+                .read_scalar_range_inner::<i32>(counter_branch_name, start, len, cache)?
+                .into_iter()
+                .map(|count| {
+                    u32::try_from(count).map_err(|_| {
+                        Error::parse(
+                            0,
+                            format!(
+                                "negative jagged counter {count} in branch {counter_branch_name}"
+                            ),
+                        )
+                    })
+                })
+                .collect(),
+            other => Err(Error::TypeMismatch {
+                branch: counter_branch_name.to_string(),
+                root_type: other.to_string(),
+                requested: "u32 or non-negative i32",
+            }),
+        }
     }
 
     pub fn read_jagged_range_auto<T: Scalar>(

@@ -262,10 +262,7 @@ impl<'a> ObjectContext<'a> {
     }
 
     fn class_name_at(&self, absolute: u32) -> Result<&'a str> {
-        self.ref_at(absolute).map(|raw| raw.class_name).map_or_else(
-            || self.raw_at_class_tag(absolute).map(|raw| raw.class_name),
-            Ok,
-        )
+        self.raw_at_class_tag(absolute).map(|raw| raw.class_name)
     }
 
     fn raw_at_class_tag(&self, absolute: u32) -> Result<RawObject<'a>> {

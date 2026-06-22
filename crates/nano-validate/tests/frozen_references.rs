@@ -14,15 +14,57 @@ const TTBARFL_2024_NANOV15: &str =
 
 #[test]
 fn singlemu_2018_nanov9_frozen_reference_round_trips_and_compares() {
-    let reference = repo_path(SINGLEMU_2018_NANOV9);
+    assert_frozen_reference_round_trips_and_compares(
+        SINGLEMU_2018_NANOV9,
+        "singlemu-2018-nanov9",
+        954,
+        122,
+        assert_sane_singlemu_values,
+        "met",
+    );
+}
+
+#[test]
+fn ttbarfl_2022ee_nanov12_frozen_reference_round_trips_and_compares() {
+    assert_frozen_reference_round_trips_and_compares(
+        TTBARFL_2022EE_NANOV12,
+        "ttbarfl-2022ee-nanov12",
+        4772,
+        163,
+        assert_sane_ttbarfl_values,
+        "muon_pt",
+    );
+}
+
+#[test]
+fn ttbarfl_2024_nanov15_frozen_reference_round_trips_and_compares() {
+    assert_frozen_reference_round_trips_and_compares(
+        TTBARFL_2024_NANOV15,
+        "ttbarfl-2024-nanov15",
+        3591,
+        195,
+        assert_sane_ttbarfl_values,
+        "muon_pt",
+    );
+}
+
+fn assert_frozen_reference_round_trips_and_compares(
+    relative: &str,
+    fixture_name: &str,
+    expected_entries: i64,
+    expected_branch_count: usize,
+    assert_sane_values: fn(&Tree),
+    perturb_branch: &str,
+) {
+    let reference = repo_path(relative);
     let tree = open_events_tree(&reference);
-    assert_eq!(tree.entries(), 954);
-    assert_sane_singlemu_values(&tree);
+    assert_eq!(tree.entries(), expected_entries);
+    assert_sane_values(&tree);
 
     let branches = read_all_branches(&tree);
-    assert_eq!(branches.len(), 122);
+    assert_eq!(branches.len(), expected_branch_count);
 
-    let fixture = Fixture::new("singlemu-2018-nanov9");
+    let fixture = Fixture::new(fixture_name);
     let roundtrip = fixture.path("roundtrip.root");
     write_snapshot(&roundtrip, &branches);
 
@@ -36,7 +78,7 @@ fn singlemu_2018_nanov9_frozen_reference_round_trips_and_compares() {
 
     let perturbed = fixture.path("perturbed.root");
     let mut perturbed_branches = branches.clone();
-    perturb_scalar_f32(&mut perturbed_branches, "met");
+    perturb_scalar_f32(&mut perturbed_branches, perturb_branch);
     write_snapshot(&perturbed, &perturbed_branches);
 
     let different = compare_root_files(&reference, &perturbed, &options).unwrap();
@@ -46,28 +88,16 @@ fn singlemu_2018_nanov9_frozen_reference_round_trips_and_compares() {
         "perturbed branch unexpectedly compared equal:\n{}",
         different.summary()
     );
-    let met = different
+    let perturbed_report = different
         .branches
         .iter()
-        .find(|branch| branch.name == "met")
-        .expect("met comparison");
+        .find(|branch| branch.name == perturb_branch)
+        .unwrap_or_else(|| panic!("{perturb_branch} comparison"));
     assert!(
-        met.n_mismatched > 0,
-        "met perturbation was not reported:\n{}",
+        perturbed_report.n_mismatched > 0,
+        "{perturb_branch} perturbation was not reported:\n{}",
         different.summary()
     );
-}
-
-#[test]
-#[ignore = "nano-rootio opens this file but RootFile::tree(\"Events\") returns Parse { offset: 0, message: \"unexpected branch object class TLeafF\" }"]
-fn ttbarfl_2022ee_nanov12_frozen_reference_documents_reader_gap() {
-    assert_events_tree_parse_gap(TTBARFL_2022EE_NANOV12);
-}
-
-#[test]
-#[ignore = "nano-rootio opens this file but RootFile::tree(\"Events\") returns Parse { offset: 0, message: \"unexpected branch object class TLeafF\" }"]
-fn ttbarfl_2024_nanov15_frozen_reference_documents_reader_gap() {
-    assert_events_tree_parse_gap(TTBARFL_2024_NANOV15);
 }
 
 fn open_events_tree(path: &Path) -> Tree {
@@ -118,6 +148,41 @@ fn assert_sane_singlemu_values(tree: &Tree) {
     assert!(pass_mu_trig.iter().any(|value| *value));
 }
 
+fn assert_sane_ttbarfl_values(tree: &Tree) {
+    let entries = usize::try_from(tree.entries()).expect("non-negative entries");
+    let run = tree.read_scalar::<u32>("run").expect("run");
+    let event = tree.read_scalar::<u64>("event").expect("event");
+    let gen_weight = tree.read_scalar::<f32>("genWeight").expect("genWeight");
+    let pass_mu_trig = tree.read_scalar::<bool>("passMuTrig").expect("passMuTrig");
+    let muon_pt = tree.read_scalar::<f32>("muon_pt").expect("muon_pt");
+    let fj_1_pt = tree.read_scalar::<f32>("fj_1_pt").expect("fj_1_pt");
+    let ps_weight = tree.read_jagged_auto::<f32>("PSWeight").expect("PSWeight");
+
+    for (name, len) in [
+        ("run", run.len()),
+        ("event", event.len()),
+        ("genWeight", gen_weight.len()),
+        ("passMuTrig", pass_mu_trig.len()),
+        ("muon_pt", muon_pt.len()),
+        ("fj_1_pt", fj_1_pt.len()),
+        ("PSWeight", ps_weight.len()),
+    ] {
+        assert_eq!(len, entries, "{name} length differs from Events entries");
+    }
+
+    assert!(run.iter().all(|value| *value > 0));
+    assert!(event.iter().all(|value| *value > 0));
+    assert!(gen_weight.iter().any(|value| value.is_finite()));
+    assert!(muon_pt
+        .iter()
+        .any(|value| value.is_finite() && *value > 0.0));
+    assert!(fj_1_pt
+        .iter()
+        .any(|value| value.is_finite() && *value > 0.0));
+    assert!(ps_weight.iter().flatten().any(|value| value.is_finite()));
+    assert!(pass_mu_trig.iter().any(|value| *value));
+}
+
 fn read_all_branches(tree: &Tree) -> Vec<BranchSnapshot> {
     tree.branches()
         .iter()
@@ -139,6 +204,7 @@ fn read_branch(tree: &Tree, branch: &BranchInfo) -> BranchSnapshot {
                 Ok(values) => BranchSnapshot::$scalar(branch.name.clone(), values),
                 Err(RootError::UnsupportedLayout { .. }) => BranchSnapshot::$jagged(
                     branch.name.clone(),
+                    branch.counter_name.clone(),
                     read_jagged_auto::<$ty>(tree, branch),
                 ),
                 Err(error) => panic!("failed to read `{}` as {type_name}: {error}", branch.name),
@@ -180,17 +246,17 @@ enum BranchSnapshot {
     U64(String, Vec<u64>),
     F32(String, Vec<f32>),
     F64(String, Vec<f64>),
-    VecBool(String, Vec<Vec<bool>>),
-    VecI8(String, Vec<Vec<i8>>),
-    VecU8(String, Vec<Vec<u8>>),
-    VecI16(String, Vec<Vec<i16>>),
-    VecU16(String, Vec<Vec<u16>>),
-    VecI32(String, Vec<Vec<i32>>),
-    VecU32(String, Vec<Vec<u32>>),
-    VecI64(String, Vec<Vec<i64>>),
-    VecU64(String, Vec<Vec<u64>>),
-    VecF32(String, Vec<Vec<f32>>),
-    VecF64(String, Vec<Vec<f64>>),
+    VecBool(String, Option<String>, Vec<Vec<bool>>),
+    VecI8(String, Option<String>, Vec<Vec<i8>>),
+    VecU8(String, Option<String>, Vec<Vec<u8>>),
+    VecI16(String, Option<String>, Vec<Vec<i16>>),
+    VecU16(String, Option<String>, Vec<Vec<u16>>),
+    VecI32(String, Option<String>, Vec<Vec<i32>>),
+    VecU32(String, Option<String>, Vec<Vec<u32>>),
+    VecI64(String, Option<String>, Vec<Vec<i64>>),
+    VecU64(String, Option<String>, Vec<Vec<u64>>),
+    VecF32(String, Option<String>, Vec<Vec<f32>>),
+    VecF64(String, Option<String>, Vec<Vec<f64>>),
 }
 
 impl BranchSnapshot {
@@ -207,17 +273,17 @@ impl BranchSnapshot {
             | Self::U64(name, _)
             | Self::F32(name, _)
             | Self::F64(name, _)
-            | Self::VecBool(name, _)
-            | Self::VecI8(name, _)
-            | Self::VecU8(name, _)
-            | Self::VecI16(name, _)
-            | Self::VecU16(name, _)
-            | Self::VecI32(name, _)
-            | Self::VecU32(name, _)
-            | Self::VecI64(name, _)
-            | Self::VecU64(name, _)
-            | Self::VecF32(name, _)
-            | Self::VecF64(name, _) => name,
+            | Self::VecBool(name, _, _)
+            | Self::VecI8(name, _, _)
+            | Self::VecU8(name, _, _)
+            | Self::VecI16(name, _, _)
+            | Self::VecU16(name, _, _)
+            | Self::VecI32(name, _, _)
+            | Self::VecU32(name, _, _)
+            | Self::VecI64(name, _, _)
+            | Self::VecU64(name, _, _)
+            | Self::VecF32(name, _, _)
+            | Self::VecF64(name, _, _) => name,
         }
     }
 
@@ -234,20 +300,47 @@ impl BranchSnapshot {
             Self::U64(name, values) => Branch::u64(name, values.clone()),
             Self::F32(name, values) => Branch::f32(name, values.clone()),
             Self::F64(name, values) => Branch::f64(name, values.clone()),
-            Self::VecBool(name, _) => {
+            Self::VecBool(name, _, _) => {
                 panic!("nano-rootio writer cannot write jagged bool branch `{name}`")
             }
-            Self::VecI8(name, values) => Branch::vec_i8(name, values.clone()),
-            Self::VecU8(name, values) => Branch::vec_u8(name, values.clone()),
-            Self::VecI16(name, values) => Branch::vec_i16(name, values.clone()),
-            Self::VecU16(name, values) => Branch::vec_u16(name, values.clone()),
-            Self::VecI32(name, values) => Branch::vec_i32(name, values.clone()),
-            Self::VecU32(name, values) => Branch::vec_u32(name, values.clone()),
-            Self::VecI64(name, values) => Branch::vec_i64(name, values.clone()),
-            Self::VecU64(name, values) => Branch::vec_u64(name, values.clone()),
-            Self::VecF32(name, values) => Branch::vec_f32(name, values.clone()),
-            Self::VecF64(name, values) => Branch::vec_f64(name, values.clone()),
+            Self::VecI8(name, counter, values) => {
+                with_counter(Branch::vec_i8(name, values.clone()), counter)
+            }
+            Self::VecU8(name, counter, values) => {
+                with_counter(Branch::vec_u8(name, values.clone()), counter)
+            }
+            Self::VecI16(name, counter, values) => {
+                with_counter(Branch::vec_i16(name, values.clone()), counter)
+            }
+            Self::VecU16(name, counter, values) => {
+                with_counter(Branch::vec_u16(name, values.clone()), counter)
+            }
+            Self::VecI32(name, counter, values) => {
+                with_counter(Branch::vec_i32(name, values.clone()), counter)
+            }
+            Self::VecU32(name, counter, values) => {
+                with_counter(Branch::vec_u32(name, values.clone()), counter)
+            }
+            Self::VecI64(name, counter, values) => {
+                with_counter(Branch::vec_i64(name, values.clone()), counter)
+            }
+            Self::VecU64(name, counter, values) => {
+                with_counter(Branch::vec_u64(name, values.clone()), counter)
+            }
+            Self::VecF32(name, counter, values) => {
+                with_counter(Branch::vec_f32(name, values.clone()), counter)
+            }
+            Self::VecF64(name, counter, values) => {
+                with_counter(Branch::vec_f64(name, values.clone()), counter)
+            }
         }
+    }
+}
+
+fn with_counter(branch: Branch, counter: &Option<String>) -> Branch {
+    match counter {
+        Some(counter) => branch.with_counter_name(counter.clone()),
+        None => branch,
     }
 }
 
@@ -303,37 +396,81 @@ fn assert_same_branch(reference: &BranchSnapshot, candidate: &BranchSnapshot) {
         (BranchSnapshot::F64(_, reference), BranchSnapshot::F64(_, candidate)) => {
             assert_same_floats(reference, candidate)
         }
-        (BranchSnapshot::VecBool(_, reference), BranchSnapshot::VecBool(_, candidate)) => {
+        (
+            BranchSnapshot::VecBool(_, reference_counter, reference),
+            BranchSnapshot::VecBool(_, candidate_counter, candidate),
+        ) => {
+            assert_eq!(reference_counter, candidate_counter);
             assert_eq!(reference, candidate)
         }
-        (BranchSnapshot::VecI8(_, reference), BranchSnapshot::VecI8(_, candidate)) => {
+        (
+            BranchSnapshot::VecI8(_, reference_counter, reference),
+            BranchSnapshot::VecI8(_, candidate_counter, candidate),
+        ) => {
+            assert_eq!(reference_counter, candidate_counter);
             assert_eq!(reference, candidate)
         }
-        (BranchSnapshot::VecU8(_, reference), BranchSnapshot::VecU8(_, candidate)) => {
+        (
+            BranchSnapshot::VecU8(_, reference_counter, reference),
+            BranchSnapshot::VecU8(_, candidate_counter, candidate),
+        ) => {
+            assert_eq!(reference_counter, candidate_counter);
             assert_eq!(reference, candidate)
         }
-        (BranchSnapshot::VecI16(_, reference), BranchSnapshot::VecI16(_, candidate)) => {
+        (
+            BranchSnapshot::VecI16(_, reference_counter, reference),
+            BranchSnapshot::VecI16(_, candidate_counter, candidate),
+        ) => {
+            assert_eq!(reference_counter, candidate_counter);
             assert_eq!(reference, candidate)
         }
-        (BranchSnapshot::VecU16(_, reference), BranchSnapshot::VecU16(_, candidate)) => {
+        (
+            BranchSnapshot::VecU16(_, reference_counter, reference),
+            BranchSnapshot::VecU16(_, candidate_counter, candidate),
+        ) => {
+            assert_eq!(reference_counter, candidate_counter);
             assert_eq!(reference, candidate)
         }
-        (BranchSnapshot::VecI32(_, reference), BranchSnapshot::VecI32(_, candidate)) => {
+        (
+            BranchSnapshot::VecI32(_, reference_counter, reference),
+            BranchSnapshot::VecI32(_, candidate_counter, candidate),
+        ) => {
+            assert_eq!(reference_counter, candidate_counter);
             assert_eq!(reference, candidate)
         }
-        (BranchSnapshot::VecU32(_, reference), BranchSnapshot::VecU32(_, candidate)) => {
+        (
+            BranchSnapshot::VecU32(_, reference_counter, reference),
+            BranchSnapshot::VecU32(_, candidate_counter, candidate),
+        ) => {
+            assert_eq!(reference_counter, candidate_counter);
             assert_eq!(reference, candidate)
         }
-        (BranchSnapshot::VecI64(_, reference), BranchSnapshot::VecI64(_, candidate)) => {
+        (
+            BranchSnapshot::VecI64(_, reference_counter, reference),
+            BranchSnapshot::VecI64(_, candidate_counter, candidate),
+        ) => {
+            assert_eq!(reference_counter, candidate_counter);
             assert_eq!(reference, candidate)
         }
-        (BranchSnapshot::VecU64(_, reference), BranchSnapshot::VecU64(_, candidate)) => {
+        (
+            BranchSnapshot::VecU64(_, reference_counter, reference),
+            BranchSnapshot::VecU64(_, candidate_counter, candidate),
+        ) => {
+            assert_eq!(reference_counter, candidate_counter);
             assert_eq!(reference, candidate)
         }
-        (BranchSnapshot::VecF32(_, reference), BranchSnapshot::VecF32(_, candidate)) => {
+        (
+            BranchSnapshot::VecF32(_, reference_counter, reference),
+            BranchSnapshot::VecF32(_, candidate_counter, candidate),
+        ) => {
+            assert_eq!(reference_counter, candidate_counter);
             assert_same_jagged_floats(reference, candidate)
         }
-        (BranchSnapshot::VecF64(_, reference), BranchSnapshot::VecF64(_, candidate)) => {
+        (
+            BranchSnapshot::VecF64(_, reference_counter, reference),
+            BranchSnapshot::VecF64(_, candidate_counter, candidate),
+        ) => {
+            assert_eq!(reference_counter, candidate_counter);
             assert_same_jagged_floats(reference, candidate)
         }
         (reference, candidate) => panic!(
@@ -408,27 +545,6 @@ fn tight_compare_options() -> CompareOptions {
         atol: 0.0,
         max_mismatches: 5,
     }
-}
-
-fn assert_events_tree_parse_gap(relative: &str) {
-    let path = repo_path(relative);
-    let file = RootFile::open(&path).unwrap_or_else(|error| {
-        panic!("failed to open {}: {error}", path.display());
-    });
-    assert!(
-        file.objects()
-            .iter()
-            .any(|object| object.name() == "Events" && object.class() == "TTree"),
-        "{} does not list an Events TTree",
-        path.display()
-    );
-    let error = file
-        .tree("Events")
-        .expect_err("nano-rootio now parses this file; remove the ignore and enable full coverage");
-    assert_eq!(
-        format!("{error:?}"),
-        "Parse { offset: 0, message: \"unexpected branch object class TLeafF\" }"
-    );
 }
 
 fn repo_path(relative: &str) -> PathBuf {

@@ -15,6 +15,7 @@ const TREE_OFFSET: u64 = DIRECTORY_OFFSET + DIRECTORY_SIZE;
 pub struct Branch {
     name: String,
     data: BranchData,
+    counter_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,7 @@ macro_rules! branch_ctor {
             Self {
                 name: name.into(),
                 data: BranchData::$variant(values),
+                counter_name: None,
             }
         }
     };
@@ -59,6 +61,7 @@ macro_rules! branch_vec_ctor {
             Self {
                 name: name.into(),
                 data: BranchData::$variant(values),
+                counter_name: None,
             }
         }
     };
@@ -87,6 +90,11 @@ impl Branch {
     branch_vec_ctor!(vec_i64, VecI64, i64);
     branch_vec_ctor!(vec_f32, VecF32, f32);
     branch_vec_ctor!(vec_f64, VecF64, f64);
+
+    pub fn with_counter_name(mut self, counter_name: impl Into<String>) -> Self {
+        self.counter_name = Some(counter_name.into());
+        self
+    }
 }
 
 impl BranchData {
@@ -368,7 +376,7 @@ fn build_branch_meta(branches: &[Branch]) -> Result<Vec<BranchMeta>> {
         if !branch.data.is_jagged() {
             continue;
         }
-        let counter_name = counter_name_for(&branch.name).ok_or_else(|| {
+        let counter_name = counter_name_for_branch(branch).ok_or_else(|| {
             Error::unsupported(
                 &branch.name,
                 "jagged branches need a NanoAOD-style `Prefix_attr` name",
@@ -383,15 +391,10 @@ fn build_branch_meta(branches: &[Branch]) -> Result<Vec<BranchMeta>> {
                     format!("jagged branch needs earlier counter branch `{counter_name}`"),
                 )
             })?;
-        let BranchData::U32(counts) = &branches[counter_index].data else {
-            return Err(Error::unsupported(
-                &branch.name,
-                format!("counter branch `{counter_name}` must be UInt_t/u32"),
-            ));
-        };
+        let counts = counter_lengths(&branch.name, &counter_name, &branches[counter_index].data)?;
         let lengths = branch.data.row_lengths().unwrap_or_default();
         for (entry, (&row_len, count)) in lengths.iter().zip(counts).enumerate() {
-            if row_len != *count as usize {
+            if row_len != count {
                 return Err(Error::unsupported(
                     &branch.name,
                     format!("entry {entry} has {row_len} values but `{counter_name}` is {count}"),
@@ -403,6 +406,34 @@ fn build_branch_meta(branches: &[Branch]) -> Result<Vec<BranchMeta>> {
     }
 
     Ok(meta)
+}
+
+fn counter_lengths(branch_name: &str, counter_name: &str, data: &BranchData) -> Result<Vec<usize>> {
+    match data {
+        BranchData::U32(counts) => Ok(counts.iter().map(|&count| count as usize).collect()),
+        BranchData::I32(counts) => counts
+            .iter()
+            .map(|&count| {
+                usize::try_from(count).map_err(|_| {
+                    Error::unsupported(
+                        branch_name,
+                        format!("counter branch `{counter_name}` contains negative count {count}"),
+                    )
+                })
+            })
+            .collect(),
+        _ => Err(Error::unsupported(
+            branch_name,
+            format!("counter branch `{counter_name}` must be UInt_t/u32 or Int_t/i32"),
+        )),
+    }
+}
+
+fn counter_name_for_branch(branch: &Branch) -> Option<String> {
+    branch
+        .counter_name
+        .clone()
+        .or_else(|| counter_name_for(&branch.name))
 }
 
 fn counter_name_for(branch_name: &str) -> Option<String> {
@@ -783,7 +814,7 @@ fn byte_reference_tag(map_offset: u64, local_offset: usize) -> Result<u32> {
 }
 
 fn leaf_count_name(branch: &Branch) -> String {
-    counter_name_for(&branch.name).unwrap_or_default()
+    counter_name_for_branch(branch).unwrap_or_default()
 }
 
 fn build_leaf(branch: &Branch, meta: &BranchMeta, counter_ref: Option<u32>) -> Result<Vec<u8>> {
