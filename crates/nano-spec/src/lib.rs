@@ -13,6 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 mod adl;
+pub mod certificate;
 pub mod codegen;
 pub mod core;
 pub mod interpret;

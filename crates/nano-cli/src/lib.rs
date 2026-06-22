@@ -8,6 +8,7 @@ use nano_review::{
     repair_spec, semantic_diff, suggest_repairs, RepairOutcome, RepairSuggestion, SemanticDiff,
 };
 use nano_rootio::RootFile;
+use nano_spec::certificate::PlanCertificate;
 use nano_spec::codegen;
 use nano_spec::interpret::{interpret, InterpretError, OutputRow, Value};
 use nano_spec::{AnalysisSpec, Catalogue, Expr, OutputDef, ParseError, SpecError};
@@ -34,6 +35,7 @@ pub struct RunOptions {
 pub enum Output {
     Validate(ValidateReport),
     Branches(BranchesReport),
+    Certify(CertifyReport),
     Inspect(InspectReport),
     Compare(ComparisonReport),
     Codegen(CodegenReport),
@@ -83,6 +85,14 @@ pub struct BranchesReport {
     pub catalogue_version: String,
     pub models: Vec<ModelSummary>,
     pub branches: Vec<BranchReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CertifyReport {
+    pub status: Status,
+    pub spec_path: PathBuf,
+    pub catalogue_version: String,
+    pub certificate: PlanCertificate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -194,6 +204,7 @@ pub enum ErrorKind {
     Catalogue,
     Validation,
     Compare,
+    Certificate,
     Codegen,
     Inspect,
     Interpret,
@@ -248,6 +259,7 @@ where
     match parsed.command {
         Command::Validate { spec } => validate_command(&spec),
         Command::Branches { spec } => branches_command(&spec),
+        Command::Certify { spec } => certify_command(&spec),
         Command::Inspect { source, insecure } => inspect_command(&source, insecure),
         Command::Compare(options) => compare_command(options).map(Output::Compare),
         Command::Codegen { spec } => codegen_command(&spec),
@@ -293,6 +305,9 @@ pub fn render_text(output: &Output) -> String {
                 lines.push(format!("models: {}", format_models(&report.models)));
             }
             lines.join("\n")
+        }
+        Output::Certify(report) => {
+            serde_json::to_string_pretty(&report.certificate).expect("serialize certificate")
         }
         Output::Inspect(report) => {
             let mut lines = Vec::new();
@@ -450,6 +465,23 @@ fn branches_command(spec_path: &Path) -> Result<Output> {
         catalogue_version: DEFAULT_CATALOGUE_VERSION.to_string(),
         models: analysis_summary(&plan.spec).models,
         branches: branch_reports(plan.read_branches.specs()),
+    }))
+}
+
+fn certify_command(spec_path: &Path) -> Result<Output> {
+    let (_, plan) = load_validated_plan(spec_path)?;
+    let certificate = nano_spec::certificate::try_certify(&plan).map_err(|error| CliError {
+        status: ErrorStatus::Error,
+        kind: ErrorKind::Certificate,
+        message: error.to_string(),
+        spec_path: Some(spec_path.to_path_buf()),
+        validation_errors: Vec::new(),
+    })?;
+    Ok(Output::Certify(CertifyReport {
+        status: Status::Ok,
+        spec_path: spec_path.to_path_buf(),
+        catalogue_version: DEFAULT_CATALOGUE_VERSION.to_string(),
+        certificate,
     }))
 }
 
@@ -1295,6 +1327,7 @@ struct ParsedArgs {
 enum Command {
     Validate { spec: PathBuf },
     Branches { spec: PathBuf },
+    Certify { spec: PathBuf },
     Inspect { source: String, insecure: bool },
     Compare(CompareCommandOptions),
     Codegen { spec: PathBuf },
@@ -1325,6 +1358,9 @@ impl ParsedArgs {
                 spec: one_operand(command, &positional[1..])?,
             },
             "branches" => Command::Branches {
+                spec: one_operand(command, &positional[1..])?,
+            },
+            "certify" => Command::Certify {
                 spec: one_operand(command, &positional[1..])?,
             },
             "inspect" => parse_inspect_args(&positional[1..])?,

@@ -84,6 +84,29 @@ fn branches_muon_toml_reports_derived_read_branches() {
 }
 
 #[test]
+fn certify_muon_toml_reports_certificate_json() {
+    let spec = repo_path("crates/nano-spec/examples/muon.toml");
+    let output = run(["certify", spec.to_str().unwrap()]).expect("certify command");
+
+    let Output::Certify(report) = output else {
+        panic!("expected certify report");
+    };
+
+    assert_eq!(report.certificate.analysis, "muon_demo");
+    assert!(report
+        .certificate
+        .required_branches
+        .iter()
+        .any(|branch| branch.name == "Muon_pt"));
+    assert_eq!(report.certificate.hash.len(), 16);
+
+    let text = nano_cli::render_text(&Output::Certify(report));
+    let json = serde_json::from_str::<serde_json::Value>(&text).expect("certificate JSON");
+    assert_eq!(json["analysis"], "muon_demo");
+    assert!(json["hash"].as_str().is_some());
+}
+
+#[test]
 fn validate_and_branches_report_models() {
     let spec = repo_path("crates/nano-spec/examples/muon_tagger.toml");
     let output = run(["validate", spec.to_str().unwrap()]).expect("validate command");
