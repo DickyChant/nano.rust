@@ -1,0 +1,13 @@
+analysis nominal_weight_demo year Run2018;
+
+weight nominal [1.0, 0.95];
+
+object good_muon : Muon {
+  pt > 30 GeV;
+}
+
+region signal {
+  count(good_muon) >= 1;
+}
+
+output n_good_muon = count(good_muon);

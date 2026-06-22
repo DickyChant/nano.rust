@@ -1,0 +1,40 @@
+analysis higgs4l_4mu year Run2012;
+
+object good_muon : Muon {
+}
+
+object h : combine(z1, z2) {
+}
+
+object z1 : pair(good_muon) {
+  opposite_charge;
+  nearest_mass_truncated 91.2 GeV;
+}
+
+object z2 : pair(good_muon) {
+  opposite_charge;
+  selection leading_pt;
+  exclude z1;
+}
+
+region signal {
+  count(good_muon) == 4;
+  all(good_muon, pt > 5 GeV);
+  all(good_muon, abs(eta) < 2.4);
+  all(good_muon, abs(pfRelIso04_all) < 0.40);
+  all(good_muon, (sqrt(((dxy * dxy) + (dz * dz))) / sqrt(((dxyErr * dxyErr) + (dzErr * dzErr)))) < 4.0);
+  all(good_muon, abs(dxy) < 0.5);
+  all(good_muon, abs(dz) < 1.0);
+  count(good_muon, charge == 1) == 2;
+  count(good_muon, charge == -1) == 2;
+  z1.min_delta_r >= 0.02;
+  z2.min_delta_r >= 0.02;
+  closest_mass(z1, z2, 91.2 GeV) > 40 GeV;
+  closest_mass(z1, z2, 91.2 GeV) < 120 GeV;
+  other_mass(z1, z2, 91.2 GeV) > 12 GeV;
+  other_mass(z1, z2, 91.2 GeV) < 120 GeV;
+}
+
+output z1_mass = closest_mass(z1, z2, 91.2 GeV);
+output z2_mass = other_mass(z1, z2, 91.2 GeV);
+output h_mass = h.mass;

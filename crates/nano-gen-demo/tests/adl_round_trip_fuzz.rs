@@ -1,13 +1,13 @@
 //! ADL emitter/parser round-trip fuzzing over the deterministic generated corpus.
 //!
 //! Seed: `0x4e414e4f5f444946`. Generated cases: 400.
-//! Current corpus result: generated=400, round_tripped=154, skipped=246.
+//! Current corpus result: generated=400, round_tripped=400, skipped=0.
 //! Counts are asserted in the test body and printed when run with
 //! `-- --nocapture`.
 //!
-//! Skips are limited to real gaps in the hand-written ADL grammar: candidate
-//! derived objects, model bindings, multi-channel unions, non-empty nominal
-//! weight vectors, and built-in JES/JER systematic enum declarations.
+//! Skips are limited to real gaps in the hand-written ADL grammar: model
+//! bindings, multi-channel unions, and built-in JES/JER systematic enum
+//! declarations.
 
 use std::collections::BTreeMap;
 
@@ -83,10 +83,8 @@ fn generated_representable_specs_round_trip_through_adl() {
     );
 
     assert_eq!(cases.len(), fuzz_specs::FUZZ_SPEC_COUNT);
-    assert_eq!(round_tripped, 154);
-    assert_eq!(skipped.values().sum::<usize>(), 246);
-    assert_eq!(skipped.get("candidate derived object").copied(), Some(113));
-    assert_eq!(skipped.get("non-empty nominal weight").copied(), Some(133));
+    assert_eq!(round_tripped, 400);
+    assert_eq!(skipped.values().sum::<usize>(), 0);
 }
 
 fn adl_skip_reason(spec: &AnalysisSpec) -> Option<&'static str> {
@@ -95,16 +93,6 @@ fn adl_skip_reason(spec: &AnalysisSpec) -> Option<&'static str> {
     }
     if !spec.channels.is_empty() {
         return Some("multi-channel union");
-    }
-    if !spec.weight.nominal.is_empty() {
-        return Some("non-empty nominal weight");
-    }
-    if spec
-        .derived_objects
-        .iter()
-        .any(|object| matches!(object.source, DerivedSource::Candidate(_)))
-    {
-        return Some("candidate derived object");
     }
     if let Some(reason) = systematics_skip_reason(&spec.systematics) {
         return Some(reason);

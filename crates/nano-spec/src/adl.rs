@@ -8,6 +8,7 @@
 //! analysis <name> year <year>;
 //! object <name> : <NanoAOD source> { [select] <cut>; ... }
 //! object <name> : pair(<object>) { opposite_charge; selection leading_pt; ... }
+//! object <name> : combine(<item>, <item>[, ...]) { filter <comparison>; ... }
 //! region <name> { [select] <requirement>; ... }
 //! define <name> = <expr>;
 //! alias <name> = <expr>;
@@ -15,6 +16,7 @@
 //! output <name> = <expr>;
 //! histogram <name> { expr = <expr>; bins = <usize>; range = [<lo>, <hi>]; }
 //! weight nominal;
+//! weight nominal [<factor>, ...];
 //! systematic <name> kind weight up <factor> down <factor>;
 //! correction <name> kind scale collection <object> attr <attr> up <factor> down <factor>;
 //! ```
@@ -23,13 +25,13 @@
 //! `nearest_mass <quantity>`, `nearest_mass_truncated <quantity>`,
 //! `exclude <pair>[, ...]`, and `filter <comparison>`. Expressions, cuts,
 //! requirements, and units are then parsed by the same helpers used by the
-//! TOML/YAML/JSON path.
+//! TOML/YAML/JSON path. Candidate/combine objects also accept `candidate(...)`
+//! as an alias for `combine(...)` and `filter <comparison>` statements.
 //!
 //! [`to_adl_string`] emits the same surface for specs that fit this grammar.
 //! The current ADL grammar has no surface for model bindings, multi-channel
-//! unions, candidate/combine derived objects, non-empty nominal weight factors,
-//! or built-in JES/JER systematic enum declarations. Those constructs must be
-//! skipped by callers that need exact `AnalysisSpec` round trips.
+//! unions, or built-in JES/JER systematic enum declarations. Those constructs
+//! must be skipped by callers that need exact `AnalysisSpec` round trips.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -57,6 +59,18 @@ pub fn to_adl_string(spec: &AnalysisSpec) -> String {
 
     if spec.weight.nominal.is_empty() {
         out.push_str("weight nominal;\n");
+    } else {
+        out.push_str("weight nominal [");
+        out.push_str(
+            &spec
+                .weight
+                .nominal
+                .iter()
+                .map(|value| format_f64(*value))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push_str("];\n");
     }
     for systematic in &spec.systematics {
         if let SystematicDef::Weight(systematic) = systematic {
@@ -72,15 +86,7 @@ pub fn to_adl_string(spec: &AnalysisSpec) -> String {
     for correction in &spec.shape_corrections {
         write_correction(&mut out, correction);
     }
-    if spec.weight.nominal.is_empty()
-        || spec
-            .systematics
-            .iter()
-            .any(|systematic| matches!(systematic, SystematicDef::Weight(_)))
-        || !spec.shape_corrections.is_empty()
-    {
-        out.push('\n');
-    }
+    out.push('\n');
 
     for object in &spec.objects {
         write_object(&mut out, object);
@@ -120,16 +126,6 @@ fn assert_adl_representable(spec: &AnalysisSpec) {
     assert!(
         spec.channels.is_empty(),
         "ADL emitter cannot render multi-channel unions"
-    );
-    assert!(
-        spec.weight.nominal.is_empty(),
-        "ADL emitter cannot render non-empty nominal weight factors"
-    );
-    assert!(
-        spec.derived_objects
-            .iter()
-            .all(|object| matches!(object.source, DerivedSource::Pair(_))),
-        "ADL emitter cannot render derived candidate objects"
     );
     assert!(
         spec.shape_corrections
@@ -177,48 +173,55 @@ fn write_object(out: &mut String, object: &ObjectDef) {
 }
 
 fn write_derived_object(out: &mut String, object: &DerivedObjectDef) {
-    let DerivedSource::Pair(pair) = &object.source else {
-        panic!(
-            "ADL emitter cannot render derived candidate object `{}`",
-            object.name
-        );
-    };
-
     out.push_str("object ");
     out.push_str(&object.name);
-    out.push_str(" : pair(");
-    out.push_str(&pair.object);
-    out.push_str(") {\n");
-    for constraint in &pair.constraints {
-        out.push_str("  ");
-        out.push_str(match constraint {
-            PairConstraint::OppositeCharge => "opposite_charge",
-            PairConstraint::SameFlavor => "same_flavor",
-        });
-        out.push_str(";\n");
-    }
-    match &pair.selection {
-        PairSelection::LeadingPt => out.push_str("  selection leading_pt;\n"),
-        PairSelection::NearestMass { target } => {
-            out.push_str("  nearest_mass ");
-            out.push_str(&quantity_to_adl(target));
-            out.push_str(";\n");
+    match &object.source {
+        DerivedSource::Pair(pair) => {
+            out.push_str(" : pair(");
+            out.push_str(&pair.object);
+            out.push_str(") {\n");
+            for constraint in &pair.constraints {
+                out.push_str("  ");
+                out.push_str(match constraint {
+                    PairConstraint::OppositeCharge => "opposite_charge",
+                    PairConstraint::SameFlavor => "same_flavor",
+                });
+                out.push_str(";\n");
+            }
+            match &pair.selection {
+                PairSelection::LeadingPt => out.push_str("  selection leading_pt;\n"),
+                PairSelection::NearestMass { target } => {
+                    out.push_str("  nearest_mass ");
+                    out.push_str(&quantity_to_adl(target));
+                    out.push_str(";\n");
+                }
+                PairSelection::NearestMassTruncated { target } => {
+                    out.push_str("  nearest_mass_truncated ");
+                    out.push_str(&quantity_to_adl(target));
+                    out.push_str(";\n");
+                }
+            }
+            if !pair.exclude.is_empty() {
+                out.push_str("  exclude ");
+                out.push_str(&pair.exclude.join(", "));
+                out.push_str(";\n");
+            }
+            for filter in &pair.filters {
+                out.push_str("  filter ");
+                out.push_str(&cut_to_adl(filter));
+                out.push_str(";\n");
+            }
         }
-        PairSelection::NearestMassTruncated { target } => {
-            out.push_str("  nearest_mass_truncated ");
-            out.push_str(&quantity_to_adl(target));
-            out.push_str(";\n");
+        DerivedSource::Candidate(candidate) => {
+            out.push_str(" : combine(");
+            out.push_str(&candidate.items.join(", "));
+            out.push_str(") {\n");
+            for filter in &candidate.filters {
+                out.push_str("  filter ");
+                out.push_str(&cut_to_adl(filter));
+                out.push_str(";\n");
+            }
         }
-    }
-    if !pair.exclude.is_empty() {
-        out.push_str("  exclude ");
-        out.push_str(&pair.exclude.join(", "));
-        out.push_str(";\n");
-    }
-    for filter in &pair.filters {
-        out.push_str("  filter ");
-        out.push_str(&cut_to_adl(filter));
-        out.push_str(";\n");
     }
     out.push_str("}\n");
 }
@@ -508,8 +511,13 @@ impl Parser {
         }
         let body = self.parse_block()?;
 
-        if let Some(object) = parse_pair_source(&source)? {
-            let raw = self.parse_pair_object(&name, object, &body)?;
+        if let Some(source) = parse_derived_source(&source)? {
+            let raw = match source {
+                AdlDerivedSource::Pair(object) => self.parse_pair_object(&name, object, &body)?,
+                AdlDerivedSource::Candidate { kind, items } => {
+                    self.parse_candidate_object(&name, kind, items, &body)?
+                }
+            };
             self.insert_derived(name, raw)
         } else {
             validate_identifier(&source, "object source")?;
@@ -587,6 +595,42 @@ impl Parser {
             selection,
             target,
             exclude,
+        })
+    }
+
+    fn parse_candidate_object(
+        &self,
+        name: &str,
+        kind: String,
+        items: Vec<String>,
+        body: &str,
+    ) -> Result<RawDerivedObject, ParseError> {
+        let mut filters = Vec::new();
+
+        for stmt in block_statements(body) {
+            let stmt = stmt.trim();
+            if let Some(value) = stmt
+                .strip_prefix("filter ")
+                .or_else(|| stmt.strip_prefix("select "))
+            {
+                filters.push(self.expand_aliases(value.trim()));
+            } else if stmt.is_empty() {
+            } else {
+                return Err(ParseError::InvalidSpec(format!(
+                    "failed to parse ADL derived candidate `{name}`: unsupported statement `{stmt}`"
+                )));
+            }
+        }
+
+        Ok(RawDerivedObject {
+            kind,
+            object: None,
+            items,
+            constraints: Vec::new(),
+            filters,
+            selection: None,
+            target: None,
+            exclude: Vec::new(),
         })
     }
 
@@ -697,10 +741,14 @@ impl Parser {
             return self.err("duplicate `weight` declaration");
         }
         self.expect_keyword("nominal")?;
-        self.expect_char(';')?;
-        self.weight = Some(RawWeight {
-            nominal: Vec::new(),
-        });
+        let nominal = if self.consume_char(';') {
+            Vec::new()
+        } else {
+            let value = self.read_until_semicolon()?.trim().to_string();
+            self.expect_char(';')?;
+            parse_weight_vector(&value)?
+        };
+        self.weight = Some(RawWeight { nominal });
         Ok(())
     }
 
@@ -962,14 +1010,19 @@ fn strip_comments(input: &str) -> String {
     stripped
 }
 
-fn parse_pair_source(source: &str) -> Result<Option<String>, ParseError> {
+enum AdlDerivedSource {
+    Pair(String),
+    Candidate { kind: String, items: Vec<String> },
+}
+
+fn parse_derived_source(source: &str) -> Result<Option<AdlDerivedSource>, ParseError> {
     if let Some(inner) = source
         .strip_prefix("pair(")
         .and_then(|value| value.strip_suffix(')'))
     {
         let object = inner.trim();
         validate_identifier(object, source)?;
-        return Ok(Some(object.to_string()));
+        return Ok(Some(AdlDerivedSource::Pair(object.to_string())));
     }
 
     if let Some(inner) = source
@@ -984,7 +1037,28 @@ fn parse_pair_source(source: &str) -> Result<Option<String>, ParseError> {
         }
         let object = args[0].trim();
         validate_identifier(object, source)?;
-        return Ok(Some(object.to_string()));
+        return Ok(Some(AdlDerivedSource::Pair(object.to_string())));
+    }
+
+    for kind in ["combine", "candidate"] {
+        if let Some(inner) = source
+            .strip_prefix(&format!("{kind}("))
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let items = split_args(inner)
+                .into_iter()
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(|item| {
+                    validate_identifier(item, source)?;
+                    Ok(item.to_string())
+                })
+                .collect::<Result<Vec<_>, ParseError>>()?;
+            return Ok(Some(AdlDerivedSource::Candidate {
+                kind: kind.to_string(),
+                items,
+            }));
+        }
     }
 
     Ok(None)
@@ -1095,6 +1169,31 @@ fn parse_range(input: &str, name: &str) -> Result<[f64; 2], ParseError> {
             ))
         })?,
     ])
+}
+
+fn parse_weight_vector(input: &str) -> Result<Vec<f64>, ParseError> {
+    let inner = input
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| {
+            ParseError::InvalidSpec(format!(
+                "failed to parse ADL weight nominal `{input}`: expected [factor, ...]"
+            ))
+        })?;
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    split_args(inner)
+        .into_iter()
+        .map(|value| {
+            value.trim().parse::<f64>().map_err(|_| {
+                ParseError::InvalidSpec(format!(
+                    "failed to parse ADL weight nominal `{input}`: invalid factor `{}`",
+                    value.trim()
+                ))
+            })
+        })
+        .collect()
 }
 
 fn expand_aliases(expr: &str, aliases: &BTreeMap<String, String>) -> String {

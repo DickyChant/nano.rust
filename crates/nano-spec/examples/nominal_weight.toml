@@ -1,0 +1,17 @@
+[analysis]
+name = "nominal_weight_demo"
+year = "Run2018"
+
+[weight]
+nominal = [1.0, 0.95]
+
+[objects.good_muon]
+source = "Muon"
+cuts = ["pt > 30 GeV"]
+
+[regions.signal]
+require = ["count(good_muon) >= 1"]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"

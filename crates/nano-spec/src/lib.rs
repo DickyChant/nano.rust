@@ -3897,6 +3897,10 @@ mod tests {
     const MUON_TAGGER_SPEC_TOML: &str = include_str!("../examples/muon_tagger.toml");
     const DIMUON_SPEC_TOML: &str = include_str!("../examples/dimuon.toml");
     const DIMUON_SPEC_ADL: &str = include_str!("../examples/dimuon.adl");
+    const HIGGS4L_SPEC_TOML: &str = include_str!("../examples/higgs4l.toml");
+    const HIGGS4L_SPEC_ADL: &str = include_str!("../examples/higgs4l.adl");
+    const NOMINAL_WEIGHT_SPEC_TOML: &str = include_str!("../examples/nominal_weight.toml");
+    const NOMINAL_WEIGHT_SPEC_ADL: &str = include_str!("../examples/nominal_weight.adl");
     const MUON_WEIGHT_SYSTEMATIC_SPEC_TOML: &str =
         include_str!("../examples/muon_hist_weight_systematic.toml");
     const MUON_WEIGHT_SYSTEMATIC_SPEC_ADL: &str =
@@ -3931,6 +3935,10 @@ mod tests {
             include_str!("../examples/higgs4mu_minimal.toml"),
         ),
         ("muon.toml", include_str!("../examples/muon.toml")),
+        (
+            "nominal_weight.toml",
+            include_str!("../examples/nominal_weight.toml"),
+        ),
         (
             "muon_hist_nominal.toml",
             include_str!("../examples/muon_hist_nominal.toml"),
@@ -4190,6 +4198,12 @@ mod tests {
                 "muon weight systematic",
                 MUON_WEIGHT_SYSTEMATIC_SPEC_TOML,
                 MUON_WEIGHT_SYSTEMATIC_SPEC_ADL,
+            ),
+            ("higgs4l", HIGGS4L_SPEC_TOML, HIGGS4L_SPEC_ADL),
+            (
+                "nominal weight vector",
+                NOMINAL_WEIGHT_SPEC_TOML,
+                NOMINAL_WEIGHT_SPEC_ADL,
             ),
             (
                 "muon shape correction",
