@@ -17,7 +17,8 @@
 //! the build-time compiled generated producer for every generated spec over a
 //! deterministic synthetic event batch. Rows are normalized to one stable shape;
 //! histogram contents are compared for Nominal on nominal-only histograms and
-//! Nominal/JesUp/JesDown when a weight or shape systematic is present.
+//! the per-spec generated Nominal/<declared>Up/<declared>Down variants when a
+//! weight or shape systematic is present.
 //! Random mock-model specs are included in the same build-time compiled corpus
 //! and are compared interpreter == compiled producer using the shared mock score
 //! routine through the interpreter and `MockPredictor` through generated code.
@@ -35,6 +36,7 @@ use nano_spec::interpret::{
     OutputRow, Value,
 };
 use nano_spec::{validate, Catalogue};
+use nano_spec::{ShapeCorrectionDef, SystematicDef};
 
 #[path = "../fuzz_specs.rs"]
 mod fuzz_specs;
@@ -199,18 +201,17 @@ fn interpret_case(
         .enumerate()
         .map(|(entry, event)| {
             if case.has_shape_correction && !case.has_weight_systematic && case.has_histogram {
-                let row = interpret_systematic(plan, event, nano_analysis::Systematic::Nominal)
+                let row = interpret_systematic(plan, event, "Nominal")
                     .unwrap_or_else(|error| panic!("entry {entry} interpret failed: {error}"))
                     .map(normalize_interpreted_row);
-                for systematic in [
-                    nano_analysis::Systematic::Nominal,
-                    nano_analysis::Systematic::JesUp,
-                    nano_analysis::Systematic::JesDown,
-                ] {
-                    let _ = interpret_and_fill_systematic(plan, event, &mut histograms, systematic)
-                        .unwrap_or_else(|error| {
-                            panic!("entry {entry} interpret fill {systematic:?} failed: {error}")
-                        });
+                for systematic in systematic_variants(case) {
+                    let _ =
+                        interpret_and_fill_systematic(plan, event, &mut histograms, &systematic)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "entry {entry} interpret fill {systematic:?} failed: {error}"
+                                )
+                            });
                 }
                 row
             } else {
@@ -225,15 +226,14 @@ fn interpret_case(
             .get(&histogram.name)
             .unwrap_or_else(|| panic!("missing interpreted histogram `{}`", histogram.name));
         if case.has_weight_systematic || case.has_shape_correction {
-            vec![
-                hist_variation("Nominal", hist.get(nano_analysis::Systematic::Nominal)),
-                hist_variation("JesUp", hist.get(nano_analysis::Systematic::JesUp)),
-                hist_variation("JesDown", hist.get(nano_analysis::Systematic::JesDown)),
-            ]
+            systematic_variants(case)
+                .into_iter()
+                .map(|systematic| hist_variation(systematic.clone(), hist.get(systematic)))
+                .collect()
         } else {
             vec![hist_variation(
-                "Nominal",
-                hist.get(nano_analysis::Systematic::Nominal),
+                "Nominal".to_string(),
+                hist.get("Nominal".to_string()),
             )]
         }
     });
@@ -259,7 +259,38 @@ fn has_leading_region_requirement(case: &fuzz_specs::GeneratedSpec) -> bool {
     })
 }
 
-fn hist_variation(systematic: &'static str, hist: &nano_analysis::Hist1D) -> FuzzHistVariation {
+fn systematic_variants(case: &fuzz_specs::GeneratedSpec) -> Vec<String> {
+    let mut variants = vec!["Nominal".to_string()];
+    for systematic in &case.spec.systematics {
+        if let SystematicDef::Weight(systematic) = systematic {
+            variants.push(systematic_variant_name(&systematic.name, "Up"));
+            variants.push(systematic_variant_name(&systematic.name, "Down"));
+        }
+    }
+    for ShapeCorrectionDef { name, .. } in &case.spec.shape_corrections {
+        variants.push(systematic_variant_name(name, "Up"));
+        variants.push(systematic_variant_name(name, "Down"));
+    }
+    variants
+}
+
+fn systematic_variant_name(name: &str, direction: &str) -> String {
+    format!("{}{direction}", upper_camel(name))
+}
+
+fn upper_camel(value: &str) -> String {
+    let mut ident = String::new();
+    for part in value.split('_') {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            ident.push(first.to_ascii_uppercase());
+            ident.extend(chars);
+        }
+    }
+    ident
+}
+
+fn hist_variation(systematic: String, hist: &nano_analysis::Hist1D) -> FuzzHistVariation {
     FuzzHistVariation {
         systematic,
         hist: FuzzHist1D {

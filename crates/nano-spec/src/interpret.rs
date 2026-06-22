@@ -8,14 +8,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 
-use nano_analysis::{EventWeight, HistSet1D, Systematic};
+use nano_analysis::{EventWeight, HistSet1D};
 use nano_core::{BranchType, Event, ObjectView};
 use nano_inference::{mock_scores, InferRequest, Tensor, TensorData};
 
-use crate::kir::{Block, ForEachAxis, KirObject, KirProgram, Rvalue, Stmt, ValueId};
+use crate::kir::{
+    Block, ForEachAxis, KirObject, KirProgram, KirShapeCorrection, Rvalue, Stmt, ValueId,
+};
 use crate::{
     ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef, ModelProviderKind,
-    ObjectCandidateDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
+    ObjectCandidateDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan, SystematicDef,
 };
 
 /// One typed output cell produced by the interpreter.
@@ -56,7 +58,7 @@ pub struct ChannelOutputRow {
 /// Interpreter-owned histogram outputs keyed by histogram name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InterpretedHistograms {
-    histograms: BTreeMap<String, HistSet1D>,
+    histograms: BTreeMap<String, HistSet1D<String>>,
 }
 
 impl InterpretedHistograms {
@@ -68,14 +70,19 @@ impl InterpretedHistograms {
             .map(|histogram| {
                 (
                     histogram.name.clone(),
-                    HistSet1D::new(histogram.bins, histogram.range[0], histogram.range[1]),
+                    HistSet1D::new(
+                        interpreted_systematic_variants(plan),
+                        histogram.bins,
+                        histogram.range[0],
+                        histogram.range[1],
+                    ),
                 )
             })
             .collect();
         Self { histograms }
     }
 
-    pub fn get(&self, name: &str) -> Option<&HistSet1D> {
+    pub fn get(&self, name: &str) -> Option<&HistSet1D<String>> {
         self.histograms.get(name)
     }
 }
@@ -178,7 +185,7 @@ enum RuntimeValue {
     Bool(bool),
     Output(Option<Value>),
     Histogram(String),
-    Systematic(Systematic),
+    Systematic(String),
     Weight(EventWeight),
     Numeric(f64),
 }
@@ -214,14 +221,14 @@ impl NumericValue {
 /// model specs are interpreted; real inference providers stay on the compiled
 /// path for now.
 pub fn interpret(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>> {
-    interpret_systematic(plan, event, Systematic::Nominal)
+    interpret_systematic(plan, event, "Nominal")
 }
 
 /// Interpret one event for a concrete systematic variation.
 pub fn interpret_systematic(
     plan: &ResolvedPlan,
     event: &Event,
-    systematic: Systematic,
+    systematic: &str,
 ) -> Result<Option<OutputRow>> {
     if !plan.spec.channels.is_empty() {
         return Err(InterpretError::Unsupported(
@@ -233,7 +240,7 @@ pub fn interpret_systematic(
     let kir = crate::kir::lower_plan_to_kir(plan)?;
     crate::kir::verify(&kir)?;
     let model_outputs = evaluate_mock_models(&plan.spec.models, &kir, event)?;
-    execute_verified_kir(&kir, event, systematic, model_outputs)
+    execute_verified_kir(&kir, event, systematic.to_string(), model_outputs)
 }
 
 /// Interpret one event and execute KIR histogram fills into `histograms`.
@@ -242,7 +249,7 @@ pub fn interpret_and_fill(
     event: &Event,
     histograms: &mut InterpretedHistograms,
 ) -> Result<Option<OutputRow>> {
-    interpret_and_fill_systematic(plan, event, histograms, Systematic::Nominal)
+    interpret_and_fill_systematic(plan, event, histograms, "Nominal")
 }
 
 /// Interpret one event for a concrete systematic variation and fill histograms.
@@ -250,7 +257,7 @@ pub fn interpret_and_fill_systematic(
     plan: &ResolvedPlan,
     event: &Event,
     histograms: &mut InterpretedHistograms,
-    systematic: Systematic,
+    systematic: &str,
 ) -> Result<Option<OutputRow>> {
     if !plan.spec.channels.is_empty() {
         return Err(InterpretError::Unsupported(
@@ -262,7 +269,7 @@ pub fn interpret_and_fill_systematic(
     let kir = crate::kir::lower_plan_to_kir(plan)?;
     crate::kir::verify(&kir)?;
     let model_outputs = evaluate_mock_models(&plan.spec.models, &kir, event)?;
-    let mut evaluator = KirEvaluator::new(&kir, event, systematic, model_outputs);
+    let mut evaluator = KirEvaluator::new(&kir, event, systematic.to_string(), model_outputs);
     evaluator.histograms = Some(&mut histograms.histograms);
     match evaluator.execute_block(&kir.block)? {
         BlockOutcome::Continue => Err(InterpretError::InvalidExpression(
@@ -283,7 +290,7 @@ pub fn interpret_and_fill_systematic(
 fn execute_verified_kir(
     program: &KirProgram,
     event: &Event,
-    systematic: Systematic,
+    systematic: String,
     model_outputs: ModelOutputs,
 ) -> Result<Option<OutputRow>> {
     let mut evaluator = KirEvaluator::new(program, event, systematic, model_outputs);
@@ -458,22 +465,76 @@ fn provider_kind_name(kind: &ModelProviderKind) -> &str {
     }
 }
 
+fn interpreted_systematic_variants(plan: &ResolvedPlan) -> Vec<String> {
+    interpreted_systematic_variants_from_parts(&plan.spec.systematics, &plan.spec.shape_corrections)
+}
+
+fn interpreted_systematic_variants_from_parts(
+    systematics: &[SystematicDef],
+    shape_corrections: &[impl NamedSystematicCorrection],
+) -> Vec<String> {
+    let mut variants = vec!["Nominal".to_string()];
+    for systematic in systematics {
+        if let SystematicDef::Weight(systematic) = systematic {
+            variants.push(interpreted_variant_name(&systematic.name, "Up"));
+            variants.push(interpreted_variant_name(&systematic.name, "Down"));
+        }
+    }
+    for correction in shape_corrections {
+        variants.push(interpreted_variant_name(correction.name(), "Up"));
+        variants.push(interpreted_variant_name(correction.name(), "Down"));
+    }
+    variants
+}
+
+trait NamedSystematicCorrection {
+    fn name(&self) -> &str;
+}
+
+impl NamedSystematicCorrection for crate::ShapeCorrectionDef {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl NamedSystematicCorrection for KirShapeCorrection {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+fn interpreted_variant_name(name: &str, direction: &str) -> String {
+    format!("{}{direction}", interpreted_upper_camel(name))
+}
+
+fn interpreted_upper_camel(name: &str) -> String {
+    let mut ident = String::new();
+    for part in name.split('_') {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            ident.push(first.to_ascii_uppercase());
+            ident.extend(chars);
+        }
+    }
+    ident
+}
+
 struct KirEvaluator<'a> {
     program: &'a KirProgram,
     event: &'a Event,
-    systematic: Systematic,
+    systematic: String,
     values: RuntimeValues,
     selected: SelectedObjects,
     derived: DerivedObjects,
     model_outputs: ModelOutputs,
-    histograms: Option<&'a mut BTreeMap<String, HistSet1D>>,
+    histograms: Option<&'a mut BTreeMap<String, HistSet1D<String>>>,
 }
 
 impl<'a> KirEvaluator<'a> {
     fn new(
         program: &'a KirProgram,
         event: &'a Event,
-        systematic: Systematic,
+        systematic: String,
         model_outputs: ModelOutputs,
     ) -> Self {
         Self {
@@ -549,7 +610,7 @@ impl<'a> KirEvaluator<'a> {
             ForEachAxis::Systematic => {
                 for systematic in self.active_systematics() {
                     self.values
-                        .insert(item, RuntimeValue::Systematic(systematic));
+                        .insert(item, RuntimeValue::Systematic(systematic.clone()));
                     match self.execute_block(body)? {
                         BlockOutcome::Continue => {}
                         BlockOutcome::Return(_) => {
@@ -607,8 +668,8 @@ impl<'a> KirEvaluator<'a> {
     }
 
     fn fill_current_histograms(&mut self) -> Result<bool> {
-        let systematic = self.systematic;
-        let weight = self.weight_for(systematic);
+        let systematic = self.systematic.clone();
+        let weight = self.weight_for(&systematic);
         for histogram in &self.program.histograms {
             if expr_has_missing_value(&histogram.def.expr, &self.selected, &self.derived)? {
                 return Ok(false);
@@ -626,7 +687,7 @@ impl<'a> KirEvaluator<'a> {
                 )));
             };
             output
-                .get_mut(systematic)
+                .get_mut(systematic.clone())
                 .fill_weighted(value, weight.value());
         }
         Ok(true)
@@ -639,7 +700,7 @@ impl<'a> KirEvaluator<'a> {
                     self.program,
                     self.event,
                     object,
-                    self.systematic,
+                    &self.systematic,
                     &self.model_outputs,
                 )?;
                 self.selected.insert(object.name.clone(), selected);
@@ -681,7 +742,7 @@ impl<'a> KirEvaluator<'a> {
                         "KIR weight expected systematic value {systematic:?}"
                     )));
                 };
-                Ok(RuntimeValue::Weight(self.weight_for(systematic)))
+                Ok(RuntimeValue::Weight(self.weight_for(&systematic)))
             }
             Rvalue::Literal(_)
             | Rvalue::Quantity(_)
@@ -696,32 +757,25 @@ impl<'a> KirEvaluator<'a> {
         }
     }
 
-    fn active_systematics(&self) -> Vec<Systematic> {
-        if self
-            .program
-            .systematics
-            .iter()
-            .any(|systematic| matches!(systematic, crate::SystematicDef::Weight(_)))
-            || !self.program.shape_corrections.is_empty()
-        {
-            vec![Systematic::Nominal, Systematic::JesUp, Systematic::JesDown]
-        } else {
-            vec![Systematic::Nominal]
-        }
+    fn active_systematics(&self) -> Vec<String> {
+        interpreted_systematic_variants_from_parts(
+            &self.program.systematics,
+            &self.program.shape_corrections,
+        )
     }
 
-    fn current_systematic(&self) -> Result<Systematic> {
+    fn current_systematic(&self) -> Result<String> {
         Ok(self
             .values
             .values()
             .find_map(|value| match value {
-                RuntimeValue::Systematic(systematic) => Some(*systematic),
+                RuntimeValue::Systematic(systematic) => Some(systematic.clone()),
                 _ => None,
             })
-            .unwrap_or(self.systematic))
+            .unwrap_or_else(|| self.systematic.clone()))
     }
 
-    fn weight_for(&self, systematic: Systematic) -> EventWeight {
+    fn weight_for(&self, systematic: &str) -> EventWeight {
         let mut weight = self
             .program
             .systematics
@@ -731,8 +785,12 @@ impl<'a> KirEvaluator<'a> {
                 _ => None,
             })
             .map(|declared| match systematic {
-                Systematic::JesUp => EventWeight::nominal().times(declared.up),
-                Systematic::JesDown => EventWeight::nominal().times(declared.down),
+                value if value == interpreted_variant_name(&declared.name, "Up") => {
+                    EventWeight::nominal().times(declared.up)
+                }
+                value if value == interpreted_variant_name(&declared.name, "Down") => {
+                    EventWeight::nominal().times(declared.down)
+                }
                 _ => EventWeight::nominal(),
             })
             .unwrap_or_else(EventWeight::nominal);
@@ -785,7 +843,7 @@ fn passes_object_cuts(
     program: &KirProgram,
     object: &KirObject,
     item: &ObjectView<'_>,
-    systematic: Systematic,
+    systematic: &str,
     model_outputs: &ModelOutputs,
 ) -> Result<bool> {
     for cut in &object.cuts {
@@ -809,7 +867,7 @@ fn select_object(
     program: &KirProgram,
     event: &Event,
     object: &KirObject,
-    systematic: Systematic,
+    systematic: &str,
     model_outputs: &ModelOutputs,
 ) -> Result<Vec<SelectedObject>> {
     let collection = event.collection(&object.source)?;
@@ -1336,7 +1394,7 @@ fn eval_object_numeric_expr(
     source: &str,
     expr: &Expr,
     item: &ObjectView<'_>,
-    systematic: Systematic,
+    systematic: &str,
     model_outputs: &ModelOutputs,
 ) -> Result<NumericValue> {
     match expr {
@@ -1415,7 +1473,7 @@ fn read_object_attr(
     source: &str,
     item: &ObjectView<'_>,
     attr: &str,
-    systematic: Systematic,
+    systematic: &str,
     model_outputs: &ModelOutputs,
 ) -> Result<NumericValue> {
     let branch = format!("{source}_{attr}");
@@ -1462,14 +1520,14 @@ fn read_object_attr(
     }
 }
 
-fn shape_factor(program: &KirProgram, collection: &str, attr: &str, systematic: Systematic) -> f64 {
+fn shape_factor(program: &KirProgram, collection: &str, attr: &str, systematic: &str) -> f64 {
     program
         .shape_corrections
         .iter()
         .find(|correction| correction.collection == collection && correction.attr == attr)
         .map(|correction| match systematic {
-            Systematic::JesUp => correction.up,
-            Systematic::JesDown => correction.down,
+            value if value == interpreted_variant_name(&correction.name, "Up") => correction.up,
+            value if value == interpreted_variant_name(&correction.name, "Down") => correction.down,
             _ => 1.0,
         })
         .unwrap_or(1.0)

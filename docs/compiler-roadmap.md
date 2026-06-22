@@ -74,10 +74,10 @@ not hand-branched in codegen; ADL/TOML/YAML desugar onto the registry.
    from KIR (`nano-spec::kir`). Both back-ends share one semantics → no drift.
 3. **PARTIAL** — codegen emits *from KIR* (structural goal met). Still string-based;
    the syn/quote typed emitter + `trybuild` preservation tests remain deferred polish.
-4. **DONE** — `Weighted<R,S>` + closed exhaustive `SystematicVisitor` (compile_fail
-   proof); weight + shape systematic histogram fan-out **executes** (interpret==codegen).
-   Remaining: per-analysis *generated* systematic variants (currently mapped onto a
-   fixed closed enum); table fan-out.
+4. **DONE** — `Weighted<R,S>` + per-analysis generated closed `Systematic`
+   enums and exhaustive `SystematicVisitor` (compile_fail proof); weight +
+   shape systematic histogram fan-out **executes** (interpret==codegen) with
+   declaration-derived variant names. Remaining: table fan-out.
 5. **PARTIAL** — shape-variation corrections (`[[correction]]` kind="scale", pt-shift
    that recomputes dependent selections). Full correctionlib-payload JES/JER deferred.
 6. **DEFERRED** — inference over scopes / ONNX provider (a `nano-inference` boundary

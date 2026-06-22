@@ -65,9 +65,10 @@ fn fill<R: Region>(h: &mut Hist, e: &Weighted<R>, value: f64);
   cross-section × luminosity product typechecks to a dimensionless event yield.
 - **Weights**: `EventWeight` accumulates typed factors (pileup, SF, ...). A
   `Weighted<R>` is the proof that weighting happened before filling.
-- **Systematics**: an exhaustive `enum Systematic`; the event loop is
-  parameterized by it, so adding a variation forces every consumer to handle it
-  (compile error otherwise). Shape vs. normalization carried in the type.
+- **Systematics**: generated analyses own an exhaustive per-analysis
+  `enum Systematic`; the event loop is parameterized by it, so adding a
+  declared variation forces every generated consumer to handle it (compile
+  error otherwise). Shape vs. normalization carried through the typed fill path.
 
 ## How `nano-spec` (semantic IR) drives this
 

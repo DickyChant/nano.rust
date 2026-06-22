@@ -1,5 +1,4 @@
 use nano_analysis::Hist1D;
-use nano_analysis::Systematic;
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
 use nano_gen_mutagger_demo::reference::{
     ReferenceHistograms, ReferenceProducer, ReferenceRow, MODEL_NAME,
@@ -95,7 +94,7 @@ fn generated_mutagger_cr_matches_reference_on_synthetic_events() {
     let interpreted_histogram = interpreted_histograms
         .get("leading_muon_pt")
         .expect("interpreted leading_muon_pt histogram")
-        .get(Systematic::Nominal);
+        .get("Nominal".to_string());
     assert_eq!(
         interpreted_histogram, &generated_histogram,
         "interpreted leading-pt histogram differs from generated"

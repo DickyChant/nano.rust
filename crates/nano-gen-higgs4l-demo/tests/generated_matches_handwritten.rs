@@ -133,7 +133,7 @@ fn generated_union_fills_histogram_through_weighted_terminal() {
     assert!(GENERATED_HIGGS4L_ALL.contains(".weight(weight)"));
     assert!(GENERATED_HIGGS4L_ALL
         .contains("nano_analysis::fill::<SignalRegion, nano_analysis::Nominal>"));
-    assert!(GENERATED_HIGGS4L_ALL.contains("impl nano_analysis::SystematicVisitor"));
+    assert!(GENERATED_HIGGS4L_ALL.contains("impl SystematicVisitor"));
     assert!(GENERATED_HIGGS4L_ALL.contains("systematic.visit(GenWeightVisitor)"));
 
     let mut histograms = higgs4l_all::GenHistograms::new();
@@ -143,7 +143,7 @@ fn generated_union_fills_histogram_through_weighted_terminal() {
         let rows = higgs4l_all::GeneratedProducer::analyze_and_fill(
             &event,
             &mut histograms,
-            nano_analysis::Systematic::Nominal,
+            higgs4l_all::Systematic::Nominal,
         )
         .unwrap();
         selected += rows.len();

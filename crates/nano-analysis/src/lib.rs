@@ -6,6 +6,7 @@
 //! weighted for a concrete systematic variation before histogram filling, and
 //! region-specific fill APIs can demand the exact region token they need.
 
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::ops::Mul;
 
@@ -337,11 +338,6 @@ impl<'e, R: Region, S: SystematicVariation> Weighted<'e, R, S> {
         R::NAME
     }
 
-    /// Systematic variation associated with this weighted token.
-    pub fn systematic(&self) -> Systematic {
-        S::SYSTEMATIC
-    }
-
     /// Stable systematic variation name associated with this weighted token.
     pub fn systematic_name(&self) -> &'static str {
         S::NAME
@@ -423,97 +419,50 @@ impl Hist1D {
     }
 }
 
-/// One fixed-bin histogram for each member of the closed systematic axis.
+/// One fixed-bin histogram for each member of an analysis-specific systematic axis.
 #[derive(Debug, Clone, PartialEq)]
-pub struct HistSet1D {
-    nominal: Hist1D,
-    jes_up: Hist1D,
-    jes_down: Hist1D,
-    jer_up: Hist1D,
-    jer_down: Hist1D,
+pub struct HistSet1D<S> {
+    histograms: BTreeMap<S, Hist1D>,
 }
 
-impl HistSet1D {
+impl<S: Ord> HistSet1D<S> {
     /// Create identical fixed-bin histograms for every systematic variation.
-    pub fn new(bins: usize, low: f64, high: f64) -> Self {
-        Self {
-            nominal: Hist1D::new(bins, low, high),
-            jes_up: Hist1D::new(bins, low, high),
-            jes_down: Hist1D::new(bins, low, high),
-            jer_up: Hist1D::new(bins, low, high),
-            jer_down: Hist1D::new(bins, low, high),
-        }
+    pub fn new(variations: impl IntoIterator<Item = S>, bins: usize, low: f64, high: f64) -> Self {
+        let histograms = variations
+            .into_iter()
+            .map(|variation| (variation, Hist1D::new(bins, low, high)))
+            .collect();
+        Self { histograms }
     }
 
     /// Read one variation histogram.
-    pub fn get(&self, systematic: Systematic) -> &Hist1D {
-        struct Getter<'a>(&'a HistSet1D);
-
-        impl<'a> SystematicVisitor for Getter<'a> {
-            type Output = &'a Hist1D;
-
-            fn nominal(self) -> Self::Output {
-                &self.0.nominal
-            }
-
-            fn jes_up(self) -> Self::Output {
-                &self.0.jes_up
-            }
-
-            fn jes_down(self) -> Self::Output {
-                &self.0.jes_down
-            }
-
-            fn jer_up(self) -> Self::Output {
-                &self.0.jer_up
-            }
-
-            fn jer_down(self) -> Self::Output {
-                &self.0.jer_down
-            }
-        }
-
-        systematic.visit(Getter(self))
+    pub fn get(&self, systematic: S) -> &Hist1D {
+        self.histograms
+            .get(&systematic)
+            .expect("systematic histogram was not initialized")
     }
 
     /// Mutably read one variation histogram.
-    pub fn get_mut(&mut self, systematic: Systematic) -> &mut Hist1D {
-        struct Getter<'a>(&'a mut HistSet1D);
-
-        impl<'a> SystematicVisitor for Getter<'a> {
-            type Output = &'a mut Hist1D;
-
-            fn nominal(self) -> Self::Output {
-                &mut self.0.nominal
-            }
-
-            fn jes_up(self) -> Self::Output {
-                &mut self.0.jes_up
-            }
-
-            fn jes_down(self) -> Self::Output {
-                &mut self.0.jes_down
-            }
-
-            fn jer_up(self) -> Self::Output {
-                &mut self.0.jer_up
-            }
-
-            fn jer_down(self) -> Self::Output {
-                &mut self.0.jer_down
-            }
-        }
-
-        systematic.visit(Getter(self))
+    pub fn get_mut(&mut self, systematic: S) -> &mut Hist1D {
+        self.histograms
+            .get_mut(&systematic)
+            .expect("systematic histogram was not initialized")
     }
 
     /// Add another histogram set with identical binning into this one.
     pub fn add(&mut self, other: &Self) {
-        self.nominal.add(&other.nominal);
-        self.jes_up.add(&other.jes_up);
-        self.jes_down.add(&other.jes_down);
-        self.jer_up.add(&other.jer_up);
-        self.jer_down.add(&other.jer_down);
+        assert_eq!(
+            self.histograms.len(),
+            other.histograms.len(),
+            "systematic histogram count mismatch"
+        );
+        for (systematic, hist) in &mut self.histograms {
+            let other = other
+                .histograms
+                .get(systematic)
+                .expect("systematic histogram key mismatch");
+            hist.add(other);
+        }
     }
 }
 
@@ -594,13 +543,14 @@ pub fn fill<R: Region, S: SystematicVariation>(
 }
 
 /// Fill the histogram corresponding to the weighted event's systematic variation.
-pub fn fill_set<R: Region, S: SystematicVariation>(
-    histograms: &mut HistSet1D,
+pub fn fill_set<R: Region, S: SystematicVariation, A: Ord>(
+    histograms: &mut HistSet1D<A>,
+    systematic: A,
     event: &Weighted<'_, R, S>,
     value: f64,
 ) {
     histograms
-        .get_mut(event.systematic())
+        .get_mut(systematic)
         .fill_weighted(value, event.weight.value());
 }
 
@@ -689,39 +639,8 @@ impl Mul<PbInv> for Pb {
     }
 }
 
-/// Exhaustive list of systematic variations handled by this first slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Systematic {
-    Nominal,
-    JesUp,
-    JesDown,
-    JerUp,
-    JerDown,
-}
-
-impl Systematic {
-    pub const ALL: [Self; 5] = [
-        Self::Nominal,
-        Self::JesUp,
-        Self::JesDown,
-        Self::JerUp,
-        Self::JerDown,
-    ];
-
-    /// Iterate over every systematic variation.
-    pub fn all() -> impl Iterator<Item = Self> {
-        Self::ALL.into_iter()
-    }
-}
-
-mod sealed {
-    pub trait Sealed {}
-}
-
-/// Type-level marker for one member of the closed systematic-variation set.
-pub trait SystematicVariation: sealed::Sealed {
-    /// Dynamic enum value corresponding to this type-level marker.
-    const SYSTEMATIC: Systematic;
+/// Type-level marker for one member of an analysis-specific systematic set.
+pub trait SystematicVariation {
     /// Stable variation name for labels, diagnostics, and generated code.
     const NAME: &'static str;
 }
@@ -730,100 +649,94 @@ pub trait SystematicVariation: sealed::Sealed {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Nominal;
 
-/// JES-up systematic-variation marker.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct JesUp;
-
-/// JES-down systematic-variation marker.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct JesDown;
-
-/// JER-up systematic-variation marker.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct JerUp;
-
-/// JER-down systematic-variation marker.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct JerDown;
-
-macro_rules! impl_systematic_variation {
-    ($marker:ident, $variant:ident, $name:literal) => {
-        impl sealed::Sealed for $marker {}
-
-        impl SystematicVariation for $marker {
-            const SYSTEMATIC: Systematic = Systematic::$variant;
-            const NAME: &'static str = $name;
-        }
-    };
+impl SystematicVariation for Nominal {
+    const NAME: &'static str = "nominal";
 }
 
-impl_systematic_variation!(Nominal, Nominal, "nominal");
-impl_systematic_variation!(JesUp, JesUp, "jes_up");
-impl_systematic_variation!(JesDown, JesDown, "jes_down");
-impl_systematic_variation!(JerUp, JerUp, "jer_up");
-impl_systematic_variation!(JerDown, JerDown, "jer_down");
+/// Minimal nominal-only dynamic axis for hand-written nominal consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NominalSystematic {
+    Nominal,
+}
 
-/// Exhaustive visitor over the closed [`Systematic`] variation set.
+impl NominalSystematic {
+    pub const ALL: [Self; 1] = [Self::Nominal];
+
+    /// Iterate over the nominal-only systematic axis.
+    pub fn all() -> impl Iterator<Item = Self> {
+        Self::ALL.into_iter()
+    }
+}
+
+/// Exhaustive visitor pattern used by generated closed systematic sets.
 ///
-/// Each variation is a required trait method. Adding a variation to this closed
-/// set means adding a method here, which makes every incomplete consumer fail to
-/// compile until it handles the new arm.
+/// `nano-analysis` keeps the generic typestate marker trait, while generated
+/// analysis modules own their concrete enum and visitor trait. Adding a
+/// generated variation means adding one required visitor method in that module,
+/// making incomplete consumers fail to compile.
 ///
 /// ```
-/// use nano_analysis::{Systematic, SystematicVisitor};
+/// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// enum Systematic {
+///     Nominal,
+///     MuonWeightUp,
+///     MuonWeightDown,
+/// }
+///
+/// trait SystematicVisitor {
+///     type Output;
+///     fn nominal(self) -> Self::Output;
+///     fn muon_weight_up(self) -> Self::Output;
+///     fn muon_weight_down(self) -> Self::Output;
+/// }
+///
+/// impl Systematic {
+///     fn visit<V: SystematicVisitor>(self, visitor: V) -> V::Output {
+///         match self {
+///             Self::Nominal => visitor.nominal(),
+///             Self::MuonWeightUp => visitor.muon_weight_up(),
+///             Self::MuonWeightDown => visitor.muon_weight_down(),
+///         }
+///     }
+/// }
 ///
 /// struct Complete;
 ///
 /// impl SystematicVisitor for Complete {
 ///     type Output = &'static str;
-///
 ///     fn nominal(self) -> Self::Output { "nominal" }
-///     fn jes_up(self) -> Self::Output { "jes_up" }
-///     fn jes_down(self) -> Self::Output { "jes_down" }
-///     fn jer_up(self) -> Self::Output { "jer_up" }
-///     fn jer_down(self) -> Self::Output { "jer_down" }
+///     fn muon_weight_up(self) -> Self::Output { "muon_weight_up" }
+///     fn muon_weight_down(self) -> Self::Output { "muon_weight_down" }
 /// }
 ///
-/// assert_eq!(Systematic::JerDown.visit(Complete), "jer_down");
+/// assert_eq!(Systematic::MuonWeightDown.visit(Complete), "muon_weight_down");
 /// ```
 ///
 /// ```compile_fail
-/// use nano_analysis::SystematicVisitor;
+/// enum Systematic {
+///     Nominal,
+///     MuonWeightUp,
+///     MuonWeightDown,
+/// }
+///
+/// trait SystematicVisitor {
+///     type Output;
+///     fn nominal(self) -> Self::Output;
+///     fn muon_weight_up(self) -> Self::Output;
+///     fn muon_weight_down(self) -> Self::Output;
+/// }
 ///
 /// struct Incomplete;
 ///
 /// impl SystematicVisitor for Incomplete {
 ///     type Output = ();
-///
 ///     fn nominal(self) -> Self::Output {}
-///     fn jes_up(self) -> Self::Output {}
-///     fn jes_down(self) -> Self::Output {}
-///     fn jer_up(self) -> Self::Output {}
-///     // Missing `jer_down`: incomplete systematic consumers do not compile.
+///     fn muon_weight_up(self) -> Self::Output {}
+///     // Missing `muon_weight_down`: incomplete generated systematic consumers
+///     // do not compile.
 /// }
 /// ```
-pub trait SystematicVisitor {
-    type Output;
-
-    fn nominal(self) -> Self::Output;
-    fn jes_up(self) -> Self::Output;
-    fn jes_down(self) -> Self::Output;
-    fn jer_up(self) -> Self::Output;
-    fn jer_down(self) -> Self::Output;
-}
-
-impl Systematic {
-    /// Dispatch to a visitor method for this systematic variation.
-    pub fn visit<V: SystematicVisitor>(self, visitor: V) -> V::Output {
-        match self {
-            Self::Nominal => visitor.nominal(),
-            Self::JesUp => visitor.jes_up(),
-            Self::JesDown => visitor.jes_down(),
-            Self::JerUp => visitor.jer_up(),
-            Self::JerDown => visitor.jer_down(),
-        }
-    }
-}
+pub mod generated_systematic_visitor_pattern {}
 
 /// Whether the dynamic event passes the existing muon producer's signal cut.
 ///

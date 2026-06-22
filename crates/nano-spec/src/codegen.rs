@@ -15,7 +15,6 @@ use crate::kir::{ForEachAxis, KirProgram, Rvalue, Stmt, ValueId};
 use crate::{
     AnalysisSpec, ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef,
     ObjectCandidateDef, ObjectDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
-    SystematicDef,
 };
 
 /// Generate compilable Rust producer source from a validated plan.
@@ -50,6 +49,24 @@ struct Generator<'a> {
     plan: &'a ResolvedPlan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedSystematic {
+    variant: String,
+    method: String,
+    marker: String,
+    name: String,
+    source: GeneratedSystematicSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeneratedSystematicSource {
+    Nominal,
+    WeightUp,
+    WeightDown,
+    ShapeUp,
+    ShapeDown,
+}
+
 impl<'a> Generator<'a> {
     fn generate(&self) -> Result<String, CodegenError> {
         if !self.spec().channels.is_empty() {
@@ -69,6 +86,8 @@ impl<'a> Generator<'a> {
             self.spec().name
         )
         .unwrap();
+
+        self.emit_systematic_axis(&mut source)?;
 
         let first_channel =
             self.spec().channels.first().ok_or_else(|| {
@@ -138,7 +157,7 @@ impl<'a> Generator<'a> {
         if !self.spec().histograms.is_empty() {
             writeln!(
                 source,
-                "    pub fn analyze_and_fill(event: &nano_core::Event, histograms: &mut GenHistograms, systematic: nano_analysis::Systematic) -> nano_core::Result<Vec<GenRow>> {{"
+                "    pub fn analyze_and_fill(event: &nano_core::Event, histograms: &mut GenHistograms, systematic: Systematic) -> nano_core::Result<Vec<GenRow>> {{"
             )
             .unwrap();
             writeln!(source, "        let mut rows = Vec::new();").unwrap();
@@ -166,8 +185,22 @@ impl<'a> Generator<'a> {
                 "        let mut {module_ident}_histograms = {module_ident}::GenHistograms::new();"
             )
             .unwrap();
+            writeln!(
+                source,
+                "        let {module_ident}_systematic = match systematic {{"
+            )
+            .unwrap();
+            for systematic in self.generated_systematics()? {
+                writeln!(
+                    source,
+                    "            Systematic::{} => {module_ident}::Systematic::{},",
+                    systematic.variant, systematic.variant
+                )
+                .unwrap();
+            }
+            writeln!(source, "        }};").unwrap();
             format!(
-                "{module_ident}::GeneratedProducer::analyze_and_fill(event, &mut {module_ident}_histograms, systematic)?"
+                "{module_ident}::GeneratedProducer::analyze_and_fill(event, &mut {module_ident}_histograms, {module_ident}_systematic)?"
             )
         } else {
             format!("{module_ident}::GeneratedProducer::analyze(event)?")
@@ -217,6 +250,7 @@ impl<'a> Generator<'a> {
         )
         .unwrap();
         self.emit_region_markers(&mut source)?;
+        self.emit_systematic_axis(&mut source)?;
         writeln!(source).unwrap();
         writeln!(source, "#[derive(Debug, Clone, Copy, PartialEq)]").unwrap();
         writeln!(source, "pub struct GenRow {{").unwrap();
@@ -250,13 +284,13 @@ impl<'a> Generator<'a> {
         } else {
             writeln!(
                 source,
-                "        Self::analyze_impl(event, None, nano_analysis::Systematic::Nominal)"
+                "        Self::analyze_impl(event, None, Systematic::Nominal)"
             )
             .unwrap();
             writeln!(source, "    }}").unwrap();
             writeln!(
                 source,
-                "    pub fn analyze_and_fill(event: &nano_core::Event, histograms: &mut GenHistograms, systematic: nano_analysis::Systematic) -> nano_core::Result<Option<GenRow>> {{"
+                "    pub fn analyze_and_fill(event: &nano_core::Event, histograms: &mut GenHistograms, systematic: Systematic) -> nano_core::Result<Option<GenRow>> {{"
             )
             .unwrap();
             writeln!(
@@ -273,7 +307,7 @@ impl<'a> Generator<'a> {
                 };
             writeln!(
                 source,
-                "    fn analyze_impl(event: &nano_core::Event, histograms: Option<&mut GenHistograms>, {systematic_param}: nano_analysis::Systematic) -> nano_core::Result<Option<GenRow>> {{"
+                "    fn analyze_impl(event: &nano_core::Event, histograms: Option<&mut GenHistograms>, {systematic_param}: Systematic) -> nano_core::Result<Option<GenRow>> {{"
             )
             .unwrap();
             self.emit_analyze_body_from_kir(&mut source, true, &kir)?;
@@ -571,6 +605,7 @@ impl<'a> Generator<'a> {
         )
         .unwrap();
         self.emit_region_markers(&mut source)?;
+        self.emit_systematic_axis(&mut source)?;
         writeln!(source).unwrap();
         writeln!(
             source,
@@ -683,6 +718,53 @@ impl<'a> Generator<'a> {
 
     fn spec(&self) -> &AnalysisSpec {
         &self.plan.spec
+    }
+
+    fn generated_systematics(&self) -> Result<Vec<GeneratedSystematic>, CodegenError> {
+        let mut systematics = vec![GeneratedSystematic {
+            variant: "Nominal".to_string(),
+            method: "nominal".to_string(),
+            marker: "nano_analysis::Nominal".to_string(),
+            name: "nominal".to_string(),
+            source: GeneratedSystematicSource::Nominal,
+        }];
+
+        if let Some(systematic) = self.spec().weight_systematic() {
+            systematics.push(generated_systematic_variation(
+                &systematic.name,
+                "Up",
+                GeneratedSystematicSource::WeightUp,
+            )?);
+            systematics.push(generated_systematic_variation(
+                &systematic.name,
+                "Down",
+                GeneratedSystematicSource::WeightDown,
+            )?);
+        }
+
+        for correction in self.spec().shape_corrections() {
+            systematics.push(generated_systematic_variation(
+                &correction.name,
+                "Up",
+                GeneratedSystematicSource::ShapeUp,
+            )?);
+            systematics.push(generated_systematic_variation(
+                &correction.name,
+                "Down",
+                GeneratedSystematicSource::ShapeDown,
+            )?);
+        }
+
+        let mut variants = BTreeSet::new();
+        for systematic in &systematics {
+            if !variants.insert(systematic.variant.as_str()) {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "duplicate generated systematic variant `{}`",
+                    systematic.variant
+                )));
+            }
+        }
+        Ok(systematics)
     }
 
     fn validate_supported_spec(&self) -> Result<(), CodegenError> {
@@ -823,12 +905,104 @@ impl<'a> Generator<'a> {
         Ok(())
     }
 
+    fn emit_systematic_axis(&self, source: &mut String) -> Result<(), CodegenError> {
+        let systematics = self.generated_systematics()?;
+        writeln!(source).unwrap();
+        writeln!(
+            source,
+            "#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]"
+        )
+        .unwrap();
+        writeln!(source, "pub enum Systematic {{").unwrap();
+        for systematic in &systematics {
+            writeln!(source, "    {},", systematic.variant).unwrap();
+        }
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
+        writeln!(source, "impl Systematic {{").unwrap();
+        writeln!(
+            source,
+            "    pub const ALL: [Self; {}] = [",
+            systematics.len()
+        )
+        .unwrap();
+        for systematic in &systematics {
+            writeln!(source, "        Self::{},", systematic.variant).unwrap();
+        }
+        writeln!(source, "    ];").unwrap();
+        writeln!(source).unwrap();
+        writeln!(source, "    pub fn all() -> impl Iterator<Item = Self> {{").unwrap();
+        writeln!(source, "        Self::ALL.into_iter()").unwrap();
+        writeln!(source, "    }}").unwrap();
+        writeln!(source).unwrap();
+        writeln!(
+            source,
+            "    pub fn visit<V: SystematicVisitor>(self, visitor: V) -> V::Output {{"
+        )
+        .unwrap();
+        writeln!(source, "        match self {{").unwrap();
+        for systematic in &systematics {
+            writeln!(
+                source,
+                "            Self::{} => visitor.{}(),",
+                systematic.variant, systematic.method
+            )
+            .unwrap();
+        }
+        writeln!(source, "        }}").unwrap();
+        writeln!(source, "    }}").unwrap();
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
+        writeln!(source, "pub trait SystematicVisitor {{").unwrap();
+        writeln!(source, "    type Output;").unwrap();
+        for systematic in &systematics {
+            writeln!(
+                source,
+                "    fn {}(self) -> Self::Output;",
+                systematic.method
+            )
+            .unwrap();
+        }
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
+        writeln!(source, "pub mod systematic_markers {{").unwrap();
+        for systematic in systematics
+            .iter()
+            .filter(|systematic| !matches!(systematic.source, GeneratedSystematicSource::Nominal))
+        {
+            writeln!(
+                source,
+                "    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]"
+            )
+            .unwrap();
+            writeln!(source, "    pub struct {};", systematic.variant).unwrap();
+            writeln!(source).unwrap();
+            writeln!(
+                source,
+                "    impl nano_analysis::SystematicVariation for {} {{",
+                systematic.variant
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "        const NAME: &'static str = {};",
+                rust_string(&systematic.name)
+            )
+            .unwrap();
+            writeln!(source, "    }}").unwrap();
+            writeln!(source).unwrap();
+        }
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
+        Ok(())
+    }
+
     fn emit_histogram_struct(&self, source: &mut String) -> Result<(), CodegenError> {
         writeln!(source, "#[derive(Debug, Clone, PartialEq)]").unwrap();
         writeln!(source, "pub struct GenHistograms {{").unwrap();
         for histogram in &self.spec().histograms {
             let hist_type = if self.spec().has_histogram_systematic() {
-                "nano_analysis::HistSet1D"
+                "nano_analysis::HistSet1D<Systematic>"
             } else {
                 "nano_analysis::Hist1D"
             };
@@ -846,13 +1020,13 @@ impl<'a> Generator<'a> {
         writeln!(source, "        Self {{").unwrap();
         for histogram in &self.spec().histograms {
             let constructor = if self.spec().has_histogram_systematic() {
-                "nano_analysis::HistSet1D::new"
+                "nano_analysis::HistSet1D::new(Systematic::all(), "
             } else {
-                "nano_analysis::Hist1D::new"
+                "nano_analysis::Hist1D::new("
             };
             writeln!(
                 source,
-                "            {}: {constructor}({}, {}, {}),",
+                "            {}: {constructor}{}, {}, {}),",
                 checked_ident(&histogram.name, "histogram field")?,
                 histogram.bins,
                 f64_literal(histogram.range[0]),
@@ -921,7 +1095,7 @@ impl<'a> Generator<'a> {
         writeln!(
             source,
             "            for systematic in [{}] {{",
-            self.active_systematic_exprs().join(", ")
+            self.active_systematic_exprs()?.join(", ")
         )
         .unwrap();
         for stmt in &body.stmts {
@@ -964,58 +1138,35 @@ impl<'a> Generator<'a> {
                         )));
                     }
                     writeln!(source, "                match systematic {{").unwrap();
-                    writeln!(
-                        source,
-                        "                    nano_analysis::Systematic::Nominal => {{"
-                    )
-                    .unwrap();
-                    writeln!(
-                        source,
-                        "                        let weighted = {region_event}_event.weight(weight_{});",
-                        weight.0
-                    )
-                    .unwrap();
-                    writeln!(
-                        source,
-                        "                        nano_analysis::fill_set::<{region_type}, nano_analysis::Nominal>(&mut histograms.{field}, &weighted, {value_expr});"
-                    )
-                    .unwrap();
-                    writeln!(source, "                    }}").unwrap();
-                    writeln!(
-                        source,
-                        "                    nano_analysis::Systematic::JesUp => {{"
-                    )
-                    .unwrap();
-                    writeln!(
-                        source,
-                        "                        let weighted = {region_event}_event.weight_for::<nano_analysis::JesUp>(weight_{});",
-                        weight.0
-                    )
-                    .unwrap();
-                    writeln!(
-                        source,
-                        "                        nano_analysis::fill_set::<{region_type}, nano_analysis::JesUp>(&mut histograms.{field}, &weighted, {value_expr});"
-                    )
-                    .unwrap();
-                    writeln!(source, "                    }}").unwrap();
-                    writeln!(
-                        source,
-                        "                    nano_analysis::Systematic::JesDown => {{"
-                    )
-                    .unwrap();
-                    writeln!(
-                        source,
-                        "                        let weighted = {region_event}_event.weight_for::<nano_analysis::JesDown>(weight_{});",
-                        weight.0
-                    )
-                    .unwrap();
-                    writeln!(
-                        source,
-                        "                        nano_analysis::fill_set::<{region_type}, nano_analysis::JesDown>(&mut histograms.{field}, &weighted, {value_expr});"
-                    )
-                    .unwrap();
-                    writeln!(source, "                    }}").unwrap();
-                    writeln!(source, "                    _ => {{}}").unwrap();
+                    for systematic in self.generated_systematics()? {
+                        writeln!(
+                            source,
+                            "                    Systematic::{} => {{",
+                            systematic.variant
+                        )
+                        .unwrap();
+                        if matches!(systematic.source, GeneratedSystematicSource::Nominal) {
+                            writeln!(
+                                source,
+                                "                        let weighted = {region_event}_event.weight(weight_{});",
+                                weight.0
+                            )
+                            .unwrap();
+                        } else {
+                            writeln!(
+                                source,
+                                "                        let weighted = {region_event}_event.weight_for::<{}>(weight_{});",
+                                systematic.marker, weight.0
+                            )
+                            .unwrap();
+                        }
+                        writeln!(
+                            source,
+                            "                        nano_analysis::fill_set::<{region_type}, _, _>(&mut histograms.{field}, systematic, &weighted, {value_expr});"
+                        )
+                        .unwrap();
+                        writeln!(source, "                    }}").unwrap();
+                    }
                     writeln!(source, "                }}").unwrap();
                 }
                 other => {
@@ -1045,17 +1196,14 @@ impl<'a> Generator<'a> {
         self.emit_weight_match(source)?;
         if self.spec().has_shape_correction() {
             writeln!(source, "            match systematic {{").unwrap();
-            for (variant, marker) in [
-                ("Nominal", "Nominal"),
-                ("JesUp", "JesUp"),
-                ("JesDown", "JesDown"),
-            ] {
+            for systematic in self.generated_systematics()? {
                 writeln!(
                     source,
-                    "                nano_analysis::Systematic::{variant} => {{"
+                    "                Systematic::{} => {{",
+                    systematic.variant
                 )
                 .unwrap();
-                if marker == "Nominal" {
+                if matches!(systematic.source, GeneratedSystematicSource::Nominal) {
                     writeln!(
                         source,
                         "                    let weighted = {region_event}_event.weight(weight);"
@@ -1064,7 +1212,8 @@ impl<'a> Generator<'a> {
                 } else {
                     writeln!(
                         source,
-                        "                    let weighted = {region_event}_event.weight_for::<nano_analysis::{marker}>(weight);"
+                        "                    let weighted = {region_event}_event.weight_for::<{}>(weight);",
+                        systematic.marker
                     )
                     .unwrap();
                 }
@@ -1076,13 +1225,12 @@ impl<'a> Generator<'a> {
                     )?;
                     writeln!(
                         source,
-                        "                    nano_analysis::fill_set::<{region_type}, nano_analysis::{marker}>(&mut histograms.{field}, &weighted, {value});"
+                        "                    nano_analysis::fill_set::<{region_type}, _, _>(&mut histograms.{field}, systematic, &weighted, {value});"
                     )
                     .unwrap();
                 }
                 writeln!(source, "                }}").unwrap();
             }
-            writeln!(source, "                _ => {{}}").unwrap();
             writeln!(source, "            }}").unwrap();
         } else {
             writeln!(
@@ -1118,11 +1266,11 @@ impl<'a> Generator<'a> {
     }
 
     fn emit_weight_visitor(&self, source: &mut String) -> Result<(), CodegenError> {
-        let weight_exprs = self.weight_exprs_by_systematic();
+        let weight_exprs = self.weight_exprs_by_systematic()?;
         writeln!(source, "            struct GenWeightVisitor;").unwrap();
         writeln!(
             source,
-            "            impl nano_analysis::SystematicVisitor for GenWeightVisitor {{"
+            "            impl SystematicVisitor for GenWeightVisitor {{"
         )
         .unwrap();
         writeln!(
@@ -1130,20 +1278,15 @@ impl<'a> Generator<'a> {
             "                type Output = nano_analysis::EventWeight;"
         )
         .unwrap();
-        for systematic in [
-            SystematicDef::Nominal,
-            SystematicDef::JesUp,
-            SystematicDef::JesDown,
-            SystematicDef::JerUp,
-            SystematicDef::JerDown,
-        ] {
+        for systematic in self.generated_systematics()? {
+            let method = systematic.method;
             writeln!(
                 source,
                 "                fn {}(self) -> Self::Output {{ {} }}",
-                systematic_method(&systematic),
+                method,
                 weight_exprs
-                    .get(&systematic_key(&systematic))
-                    .expect("closed systematic weight expression exists")
+                    .get(&method)
+                    .expect("generated systematic weight expression exists")
             )
             .unwrap();
         }
@@ -1154,16 +1297,28 @@ impl<'a> Generator<'a> {
     fn emit_shape_factor_bindings(&self, source: &mut String) -> Result<(), CodegenError> {
         for correction in self.spec().shape_corrections() {
             let factor = shape_factor_ident(&correction.collection, &correction.attr)?;
+            let up = generated_systematic_variation(
+                &correction.name,
+                "Up",
+                GeneratedSystematicSource::ShapeUp,
+            )?;
+            let down = generated_systematic_variation(
+                &correction.name,
+                "Down",
+                GeneratedSystematicSource::ShapeDown,
+            )?;
             writeln!(source, "        let {factor} = match systematic {{").unwrap();
             writeln!(
                 source,
-                "            nano_analysis::Systematic::JesUp => {},",
+                "            Systematic::{} => {},",
+                up.variant,
                 f64_literal(correction.up)
             )
             .unwrap();
             writeln!(
                 source,
-                "            nano_analysis::Systematic::JesDown => {},",
+                "            Systematic::{} => {},",
+                down.variant,
                 f64_literal(correction.down)
             )
             .unwrap();
@@ -1194,38 +1349,31 @@ impl<'a> Generator<'a> {
         )
     }
 
-    fn weight_exprs_by_systematic(&self) -> BTreeMap<&'static str, String> {
+    fn weight_exprs_by_systematic(&self) -> Result<BTreeMap<String, String>, CodegenError> {
         let nominal = self.nominal_weight_expr();
-        let mut weights = BTreeMap::from([
-            ("nominal", nominal.clone()),
-            ("jes_up", nominal.clone()),
-            ("jes_down", nominal.clone()),
-            ("jer_up", nominal.clone()),
-            ("jer_down", nominal.clone()),
-        ]);
-        if let Some(systematic) = self.spec().weight_systematic() {
-            weights.insert(
-                "jes_up",
-                format!("{nominal}.times({})", f64_literal(systematic.up)),
-            );
-            weights.insert(
-                "jes_down",
-                format!("{nominal}.times({})", f64_literal(systematic.down)),
-            );
+        let weight_systematic = self.spec().weight_systematic();
+        let mut weights = BTreeMap::new();
+        for systematic in self.generated_systematics()? {
+            let expr = match (systematic.source, weight_systematic) {
+                (GeneratedSystematicSource::WeightUp, Some(weight)) => {
+                    format!("{nominal}.times({})", f64_literal(weight.up))
+                }
+                (GeneratedSystematicSource::WeightDown, Some(weight)) => {
+                    format!("{nominal}.times({})", f64_literal(weight.down))
+                }
+                _ => nominal.clone(),
+            };
+            weights.insert(systematic.method, expr);
         }
-        weights
+        Ok(weights)
     }
 
-    fn active_systematic_exprs(&self) -> Vec<&'static str> {
-        if self.spec().has_weight_systematic() || self.spec().has_shape_correction() {
-            vec![
-                "nano_analysis::Systematic::Nominal",
-                "nano_analysis::Systematic::JesUp",
-                "nano_analysis::Systematic::JesDown",
-            ]
-        } else {
-            vec!["nano_analysis::Systematic::Nominal"]
-        }
+    fn active_systematic_exprs(&self) -> Result<Vec<String>, CodegenError> {
+        Ok(self
+            .generated_systematics()?
+            .into_iter()
+            .map(|systematic| format!("Systematic::{}", systematic.variant))
+            .collect())
     }
 
     fn emit_required_output_unwrap(
@@ -3430,6 +3578,29 @@ fn upper_camel_ident(value: &str, context: &str) -> Result<String, CodegenError>
     checked_ident(&ident, context)
 }
 
+fn generated_systematic_variation(
+    name: &str,
+    direction: &str,
+    source: GeneratedSystematicSource,
+) -> Result<GeneratedSystematic, CodegenError> {
+    let base = upper_camel_ident(name, "systematic name")?;
+    let variant = format!("{base}{direction}");
+    checked_ident(&variant, "systematic variant")?;
+    let method = format!(
+        "{}_{}",
+        checked_ident(name, "systematic visitor method")?,
+        direction.to_ascii_lowercase()
+    );
+    checked_ident(&method, "systematic visitor method")?;
+    Ok(GeneratedSystematic {
+        marker: format!("systematic_markers::{variant}"),
+        name: method.clone(),
+        variant,
+        method,
+        source,
+    })
+}
+
 fn split_model_output(output: &str) -> Result<(&str, &str), CodegenError> {
     let Some((source, attr)) = output.split_once('_') else {
         return Err(CodegenError::UnsupportedFeature(format!(
@@ -3543,28 +3714,6 @@ fn checked_count_rhs(value: f64, context: &str) -> Result<u32, CodegenError> {
 
 fn rust_string(value: &str) -> String {
     format!("{value:?}")
-}
-
-fn systematic_method(systematic: &SystematicDef) -> &'static str {
-    match systematic {
-        SystematicDef::Nominal => "nominal",
-        SystematicDef::JesUp => "jes_up",
-        SystematicDef::JesDown => "jes_down",
-        SystematicDef::JerUp => "jer_up",
-        SystematicDef::JerDown => "jer_down",
-        SystematicDef::Weight(_) => "nominal",
-    }
-}
-
-fn systematic_key(systematic: &SystematicDef) -> &'static str {
-    match systematic {
-        SystematicDef::Nominal => "nominal",
-        SystematicDef::JesUp => "jes_up",
-        SystematicDef::JesDown => "jes_down",
-        SystematicDef::JerUp => "jer_up",
-        SystematicDef::JerDown => "jer_down",
-        SystematicDef::Weight(_) => "nominal",
-    }
 }
 
 fn collect_derived_objects_in_expr(

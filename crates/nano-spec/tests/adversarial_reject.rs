@@ -9,7 +9,7 @@
 //! | 5. Region/object referenced but not defined | `count(good_muon)` validates | `count(ghost_muon)` names no object | validator | `SpecError::UndefinedObject` |
 //! | 6. Score-before-inference | `Muon_topscore` validates when produced by `[[model]]` | `Muon_topscore` is read with no producing model | validator | `SpecError::MissingBranch` |
 //! | 7. Fill-before-weight | `fill` accepts `Weighted<R, S>`; see `nano-analysis` doctests | `fill` with `Ev<Raw>` | rustc | `compile_fail` doctest |
-//! | 8. Missing systematic arm | complete `SystematicVisitor` impl; see `nano-analysis` doctests | visitor impl missing `jer_down` | rustc | `compile_fail` doctest |
+//! | 8. Missing systematic arm | complete generated `SystematicVisitor` impl; see `nano-analysis` doctests | visitor impl missing `muon_weight_down` | rustc | `compile_fail` doctest |
 //! | 9. Duplicate output name | distinct `[[outputs]]` names validate | duplicate ordinary output names | validator | `SpecError::InvalidExpression` |
 //!
 //! Branch existence, era catalogue membership, unit requirements, branch type,

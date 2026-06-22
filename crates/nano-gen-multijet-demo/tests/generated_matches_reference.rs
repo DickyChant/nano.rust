@@ -1,7 +1,6 @@
-use nano_analysis::Systematic;
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
 use nano_gen_multijet_demo::reference::{ReferenceHistograms, ReferenceProducer, ReferenceRow};
-use nano_gen_multijet_demo::{GenHistograms, GenRow, GeneratedProducer};
+use nano_gen_multijet_demo::{GenHistograms, GenRow, GeneratedProducer, Systematic};
 use nano_spec::interpret::{interpret_and_fill, InterpretedHistograms, Value};
 use nano_spec::{validate, AnalysisSpec, Catalogue};
 
@@ -83,7 +82,7 @@ fn generated_multijet_ht_matches_reference_and_interpreter_on_synthetic_events()
         interpreted_histograms
             .get("ht")
             .expect("interpreted ht histogram")
-            .get(Systematic::Nominal),
+            .get("Nominal".to_string()),
         &reference_histograms.ht,
         "interpreted histogram differs from reference"
     );

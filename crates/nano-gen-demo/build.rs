@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use nano_spec::codegen::generate_producer_source;
-use nano_spec::{validate, AnalysisSpec, Catalogue, Expr};
+use nano_spec::{validate, AnalysisSpec, Catalogue, Expr, SystematicDef};
 
 #[path = "fuzz_specs.rs"]
 mod fuzz_specs;
@@ -114,7 +114,7 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     writeln!(modules)?;
     writeln!(modules, "#[derive(Debug, Clone, PartialEq)]")?;
     writeln!(modules, "pub struct FuzzHistVariation {{")?;
-    writeln!(modules, "    pub systematic: &'static str,")?;
+    writeln!(modules, "    pub systematic: String,")?;
     writeln!(modules, "    pub hist: FuzzHist1D,")?;
     writeln!(modules, "}}")?;
     writeln!(modules)?;
@@ -221,10 +221,10 @@ fn emit_run_case(
                 modules,
                 "        rows.push({module_name}::GeneratedProducer::analyze(event)?.map(normalize_{module_name}));"
             )?;
-            for variant in ["Nominal", "JesUp", "JesDown"] {
+            for (_, variant) in systematic_variants(&generated.spec) {
                 writeln!(
                     modules,
-                    "        let _ = {module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, nano_analysis::Systematic::{variant})?;"
+                    "        let _ = {module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, {module_name}::Systematic::{variant})?;"
                 )?;
             }
             writeln!(modules, "    }}")?;
@@ -232,21 +232,17 @@ fn emit_run_case(
             writeln!(modules, "    for event in events {{")?;
             writeln!(
                 modules,
-                "        rows.push({module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, nano_analysis::Systematic::Nominal)?.map(normalize_{module_name}));"
+                "        rows.push({module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, {module_name}::Systematic::Nominal)?.map(normalize_{module_name}));"
             )?;
             writeln!(modules, "    }}")?;
         }
         let histogram_name = histogram_name.expect("histogram exists when flag is set");
         if has_histogram_systematic {
             writeln!(modules, "    let histogram = Some(vec![")?;
-            for (name, variant) in [
-                ("Nominal", "Nominal"),
-                ("JesUp", "JesUp"),
-                ("JesDown", "JesDown"),
-            ] {
+            for (name, variant) in systematic_variants(&generated.spec) {
                 writeln!(
                     modules,
-                    "        FuzzHistVariation {{ systematic: \"{name}\", hist: snapshot_hist(histograms.{histogram_name}.get(nano_analysis::Systematic::{variant})) }},"
+                    "        FuzzHistVariation {{ systematic: \"{name}\".to_string(), hist: snapshot_hist(histograms.{histogram_name}.get({module_name}::Systematic::{variant})) }},"
                 )?;
             }
             writeln!(modules, "    ]);")?;
@@ -254,7 +250,7 @@ fn emit_run_case(
             writeln!(modules, "    let histogram = Some(vec![")?;
             writeln!(
                 modules,
-                "        FuzzHistVariation {{ systematic: \"Nominal\", hist: snapshot_hist(&histograms.{histogram_name}) }},"
+                "        FuzzHistVariation {{ systematic: \"Nominal\".to_string(), hist: snapshot_hist(&histograms.{histogram_name}) }},"
             )?;
             writeln!(modules, "    ]);")?;
         }
@@ -319,4 +315,43 @@ fn fuzz_value_expr(expr: &Expr, field: &str) -> String {
         Expr::LeadingAttr { .. } => format!("FuzzValue::F64(f64::from(row.{field}))"),
         _ => format!("FuzzValue::F64(row.{field})"),
     }
+}
+
+fn systematic_variants(spec: &AnalysisSpec) -> Vec<(String, String)> {
+    let mut variants = vec![("Nominal".to_string(), "Nominal".to_string())];
+    for systematic in &spec.systematics {
+        if let SystematicDef::Weight(systematic) = systematic {
+            variants.push((
+                format!("{}Up", upper_camel(&systematic.name)),
+                format!("{}Up", upper_camel(&systematic.name)),
+            ));
+            variants.push((
+                format!("{}Down", upper_camel(&systematic.name)),
+                format!("{}Down", upper_camel(&systematic.name)),
+            ));
+        }
+    }
+    for correction in &spec.shape_corrections {
+        variants.push((
+            format!("{}Up", upper_camel(&correction.name)),
+            format!("{}Up", upper_camel(&correction.name)),
+        ));
+        variants.push((
+            format!("{}Down", upper_camel(&correction.name)),
+            format!("{}Down", upper_camel(&correction.name)),
+        ));
+    }
+    variants
+}
+
+fn upper_camel(value: &str) -> String {
+    let mut ident = String::new();
+    for part in value.split('_') {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            ident.push(first.to_ascii_uppercase());
+            ident.extend(chars);
+        }
+    }
+    ident
 }

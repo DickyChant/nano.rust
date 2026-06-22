@@ -1,8 +1,9 @@
-use nano_analysis::{fill, Ev, Hist1D, Systematic};
+use nano_analysis::{fill, Ev, Hist1D};
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
 use nano_producers::{
     select_muon_signal_region_with_varied_jets, select_muon_signal_region_with_weight,
-    JetCorrectionInput, JmeJetCorrections, MuonSkimRow, VariedJetSelection, WeightedMuonSkimRow,
+    JetCorrectionInput, JetSystematic, JmeJetCorrections, MuonSkimRow, VariedJetSelection,
+    WeightedMuonSkimRow,
 };
 use std::path::Path;
 
@@ -54,15 +55,19 @@ fn real_jme_variation_changes_jet_four_vector_across_systematics() {
     let event = event_with_jets(vec![100.0], vec![0.5]);
 
     let nominal = corrections
-        .varied_jets(&event, Systematic::Nominal)
+        .varied_jets(&event, JetSystematic::Nominal)
         .unwrap();
-    let jes_up = corrections.varied_jets(&event, Systematic::JesUp).unwrap();
+    let jes_up = corrections
+        .varied_jets(&event, JetSystematic::JesUp)
+        .unwrap();
     let jes_down = corrections
-        .varied_jets(&event, Systematic::JesDown)
+        .varied_jets(&event, JetSystematic::JesDown)
         .unwrap();
-    let jer_up = corrections.varied_jets(&event, Systematic::JerUp).unwrap();
+    let jer_up = corrections
+        .varied_jets(&event, JetSystematic::JerUp)
+        .unwrap();
     let jer_down = corrections
-        .varied_jets(&event, Systematic::JerDown)
+        .varied_jets(&event, JetSystematic::JerDown)
         .unwrap();
 
     assert_close(nominal[0].pt, 100.0);
@@ -92,11 +97,11 @@ fn deterministic_expected_scales_for_fixed_real_payload_jet() {
     assert_close(corrections.jes_total_uncertainty(jet).unwrap(), 0.0108);
     assert_close(corrections.jer_scale_factor(jet).unwrap(), 1.0993);
     assert_close(
-        corrections.jet_scale(Systematic::JesUp, jet).unwrap(),
+        corrections.jet_scale(JetSystematic::JesUp, jet).unwrap(),
         1.0108,
     );
     assert_close(
-        corrections.jet_scale(Systematic::JerDown, jet).unwrap(),
+        corrections.jet_scale(JetSystematic::JerDown, jet).unwrap(),
         0.9096697898662786,
     );
 }
@@ -106,7 +111,7 @@ fn jme_weight_api_is_only_normalization_not_shape_bookkeeping() {
     let corrections = real_jme_corrections();
     let event = event_with_jets(vec![100.0], vec![0.5]);
 
-    for systematic in Systematic::all() {
+    for systematic in JetSystematic::all() {
         assert_close(
             corrections
                 .event_weight(&event, systematic)
@@ -126,7 +131,7 @@ fn varied_selection_recomputes_jet_threshold_under_shape_variation() {
     let nominal = select_muon_signal_region_with_varied_jets(
         Ev::new(&event),
         &corrections,
-        Systematic::Nominal,
+        JetSystematic::Nominal,
         jet_selection,
     )
     .unwrap()
@@ -134,7 +139,7 @@ fn varied_selection_recomputes_jet_threshold_under_shape_variation() {
     let jes_up = select_muon_signal_region_with_varied_jets(
         Ev::new(&event),
         &corrections,
-        Systematic::JesUp,
+        JetSystematic::JesUp,
         jet_selection,
     )
     .unwrap()
@@ -142,7 +147,7 @@ fn varied_selection_recomputes_jet_threshold_under_shape_variation() {
     let jes_down = select_muon_signal_region_with_varied_jets(
         Ev::new(&event),
         &corrections,
-        Systematic::JesDown,
+        JetSystematic::JesDown,
         jet_selection,
     )
     .unwrap()
@@ -161,7 +166,7 @@ fn selected_event_normalization_weight_fills_histograms_for_all_systematics() {
     let corrections = real_jme_corrections();
     let event = event_with_jets(vec![100.0], vec![0.5]);
 
-    for systematic in Systematic::all() {
+    for systematic in JetSystematic::all() {
         let weighted =
             select_muon_signal_region_with_weight(Ev::new(&event), &corrections, systematic)
                 .unwrap()

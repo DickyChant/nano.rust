@@ -7,7 +7,7 @@
 //! trigger weights can still be carried as separate normalization weights.
 
 use nano_analysis::{
-    passes_muon_signal_selection, Ev, EventWeight, Nominal, Raw, SignalRegion, Systematic, Weighted,
+    passes_muon_signal_selection, Ev, EventWeight, Nominal, Raw, SignalRegion, Weighted,
 };
 use nano_core::Event;
 use nano_corrections::{Correction, CorrectionError, CorrectionSet, Value};
@@ -20,6 +20,30 @@ use crate::MuonSkimRow;
 pub const RUN2_2016POSTVFP_AK4PFPUPPI_JES_TOTAL: &str = "Summer19UL16_V7_MC_Total_AK4PFPuppi";
 pub const RUN2_2016POSTVFP_AK4PFPUPPI_JER_SCALE_FACTOR: &str =
     "Summer20UL16_JRV3_MC_ScaleFactor_AK4PFPuppi";
+
+/// Closed JME shape-variation axis used by the hand-written producer module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JetSystematic {
+    Nominal,
+    JesUp,
+    JesDown,
+    JerUp,
+    JerDown,
+}
+
+impl JetSystematic {
+    pub const ALL: [Self; 5] = [
+        Self::Nominal,
+        Self::JesUp,
+        Self::JesDown,
+        Self::JerUp,
+        Self::JerDown,
+    ];
+
+    pub fn all() -> impl Iterator<Item = Self> {
+        Self::ALL.into_iter()
+    }
+}
 
 /// Typed per-jet inputs consumed by the JME correctionlib payload.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -100,7 +124,7 @@ impl Default for VariedJetSelection {
 #[derive(Clone)]
 pub struct VariedMuonSignalRegion<'e> {
     ev: Ev<'e, SignalRegion>,
-    systematic: Systematic,
+    systematic: JetSystematic,
     jets: Vec<VariedJet>,
     selected_jet_indices: Vec<usize>,
     normalization_weight: EventWeight,
@@ -115,7 +139,7 @@ impl<'e> VariedMuonSignalRegion<'e> {
         self.ev.event()
     }
 
-    pub fn systematic(&self) -> Systematic {
+    pub fn systematic(&self) -> JetSystematic {
         self.systematic
     }
 
@@ -158,7 +182,7 @@ pub enum WeightError {
     Core(nano_core::NanoError),
     Correction(CorrectionError),
     NonFiniteFactor {
-        systematic: Systematic,
+        systematic: JetSystematic,
         jet: JetCorrectionInput,
         factor: f64,
     },
@@ -259,21 +283,21 @@ impl JmeJetCorrections {
     /// event normalization weight.
     pub fn jet_scale(
         &self,
-        systematic: Systematic,
+        systematic: JetSystematic,
         jet: JetCorrectionInput,
     ) -> Result<f64, WeightError> {
         let factor = match systematic {
-            Systematic::Nominal => 1.0,
-            Systematic::JesUp => 1.0 + self.jes_total_uncertainty(jet)?,
-            Systematic::JesDown => {
+            JetSystematic::Nominal => 1.0,
+            JetSystematic::JesUp => 1.0 + self.jes_total_uncertainty(jet)?,
+            JetSystematic::JesDown => {
                 let uncertainty = self.jes_total_uncertainty(jet)?;
                 if uncertainty > 1.0 {
                     return Err(WeightError::NegativeJesDown { uncertainty, jet });
                 }
                 1.0 - uncertainty
             }
-            Systematic::JerUp => self.jer_scale_factor(jet)?,
-            Systematic::JerDown => 1.0 / self.jer_scale_factor(jet)?,
+            JetSystematic::JerUp => self.jer_scale_factor(jet)?,
+            JetSystematic::JerDown => 1.0 / self.jer_scale_factor(jet)?,
         };
 
         if !factor.is_finite() {
@@ -291,7 +315,7 @@ impl JmeJetCorrections {
     /// The returned value is now explicitly a four-vector scale, not a weight.
     pub fn jet_factor(
         &self,
-        systematic: Systematic,
+        systematic: JetSystematic,
         jet: JetCorrectionInput,
     ) -> Result<f64, WeightError> {
         self.jet_scale(systematic, jet)
@@ -306,7 +330,7 @@ impl JmeJetCorrections {
     pub fn varied_jets(
         &self,
         event: &Event,
-        systematic: Systematic,
+        systematic: JetSystematic,
     ) -> Result<Vec<VariedJet>, WeightError> {
         let mut jets = Vec::new();
         for jet in event.collection("Jet")?.iter() {
@@ -347,7 +371,7 @@ impl JmeJetCorrections {
     pub fn event_weight(
         &self,
         event: &Event,
-        _systematic: Systematic,
+        _systematic: JetSystematic,
     ) -> Result<EventWeight, WeightError> {
         self.normalization_weight(event)
     }
@@ -379,7 +403,7 @@ impl JmeJetCorrections {
 pub fn select_muon_signal_region_with_varied_jets<'e>(
     event: Ev<'e, Raw>,
     corrections: &JmeJetCorrections,
-    systematic: Systematic,
+    systematic: JetSystematic,
     jet_selection: VariedJetSelection,
 ) -> Result<Option<VariedMuonSignalRegion<'e>>, WeightError> {
     let Some(selected) = event.preselect(|_| true).and_then(|event| {
@@ -415,7 +439,7 @@ pub fn select_muon_signal_region_with_varied_jets<'e>(
 pub fn select_muon_signal_region_with_weight<'e>(
     event: Ev<'e, Raw>,
     corrections: &JmeJetCorrections,
-    systematic: Systematic,
+    systematic: JetSystematic,
 ) -> Result<Option<Weighted<'e, SignalRegion, Nominal>>, WeightError> {
     let Some(selected) = event.preselect(|_| true).and_then(|event| {
         event.select::<SignalRegion>(|event| passes_muon_signal_selection(event).unwrap_or(false))

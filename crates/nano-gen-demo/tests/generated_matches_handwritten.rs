@@ -15,6 +15,11 @@ use nano_workflow::{
     KernelRegistry, RunChunkRequest,
 };
 
+use nano_gen_demo::muon_hist_nominal::Systematic as MuonHistNominalSystematic;
+use nano_gen_demo::muon_hist_shape_correction::Systematic as ShapeSystematic;
+use nano_gen_demo::muon_hist_shape_nominal::Systematic as ShapeNominalSystematic;
+use nano_gen_demo::muon_hist_weight_systematic::Systematic as WeightSystematic;
+
 const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 const SELECTION_ALL_SPEC: &str = include_str!("../../nano-spec/examples/selection_all.toml");
 const MUON_HIST_NOMINAL_SPEC: &str =
@@ -128,7 +133,7 @@ fn weight_systematic_histogram_fanout_matches_interpreter_and_preserves_nominal(
         let nominal_row = nano_gen_demo::muon_hist_nominal::GeneratedProducer::analyze_and_fill(
             &event,
             &mut generated_nominal,
-            nano_analysis::Systematic::Nominal,
+            MuonHistNominalSystematic::Nominal,
         )
         .unwrap()
         .map(|row| row.n_good_muon);
@@ -136,7 +141,7 @@ fn weight_systematic_histogram_fanout_matches_interpreter_and_preserves_nominal(
             nano_gen_demo::muon_hist_weight_systematic::GeneratedProducer::analyze_and_fill(
                 &event,
                 &mut generated_systematic,
-                nano_analysis::Systematic::Nominal,
+                WeightSystematic::Nominal,
             )
             .unwrap()
             .map(|row| row.n_good_muon);
@@ -164,30 +169,25 @@ fn weight_systematic_histogram_fanout_matches_interpreter_and_preserves_nominal(
         .expect("interpreted histogram");
     let generated = &generated_systematic.n_good_muon_hist;
     for systematic in [
-        nano_analysis::Systematic::Nominal,
-        nano_analysis::Systematic::JesUp,
-        nano_analysis::Systematic::JesDown,
+        WeightSystematic::Nominal,
+        WeightSystematic::MuonWeightUp,
+        WeightSystematic::MuonWeightDown,
     ] {
+        let interpreted_key = format!("{systematic:?}");
         assert_eq!(
             generated.get(systematic),
-            interpreted.get(systematic),
+            interpreted.get(interpreted_key),
             "{systematic:?}"
         );
     }
 
     assert_eq!(
         generated_nominal.n_good_muon_hist,
-        *generated.get(nano_analysis::Systematic::Nominal)
+        *generated.get(WeightSystematic::Nominal)
     );
-    assert_eq!(
-        generated.get(nano_analysis::Systematic::Nominal).sumw(),
-        3.0
-    );
-    assert_eq!(generated.get(nano_analysis::Systematic::JesUp).sumw(), 6.0);
-    assert_eq!(
-        generated.get(nano_analysis::Systematic::JesDown).sumw(),
-        1.5
-    );
+    assert_eq!(generated.get(WeightSystematic::Nominal).sumw(), 3.0);
+    assert_eq!(generated.get(WeightSystematic::MuonWeightUp).sumw(), 6.0);
+    assert_eq!(generated.get(WeightSystematic::MuonWeightDown).sumw(), 1.5);
 }
 
 #[test]
@@ -210,16 +210,16 @@ fn shape_correction_recomputes_rows_and_histograms_per_variation() {
             nano_gen_demo::muon_hist_shape_nominal::GeneratedProducer::analyze_and_fill(
                 &event,
                 &mut generated_nominal,
-                nano_analysis::Systematic::Nominal,
+                ShapeNominalSystematic::Nominal,
             )
             .unwrap()
             .map(|row| (row.n_good_muon, row.lead_muon_pt.to_bits()));
         nominal_rows.push(nominal_row);
 
         for systematic in [
-            nano_analysis::Systematic::Nominal,
-            nano_analysis::Systematic::JesUp,
-            nano_analysis::Systematic::JesDown,
+            ShapeSystematic::Nominal,
+            ShapeSystematic::JesUp,
+            ShapeSystematic::JesDown,
         ] {
             let generated =
                 nano_gen_demo::muon_hist_shape_correction::GeneratedProducer::analyze_and_fill(
@@ -233,7 +233,7 @@ fn shape_correction_recomputes_rows_and_histograms_per_variation() {
                 &shape_plan,
                 &event,
                 &mut interpreted_shape,
-                systematic,
+                &format!("{systematic:?}"),
             )
             .unwrap()
             .map(|row| {
@@ -254,16 +254,17 @@ fn shape_correction_recomputes_rows_and_histograms_per_variation() {
     }
 
     for systematic in [
-        nano_analysis::Systematic::Nominal,
-        nano_analysis::Systematic::JesUp,
-        nano_analysis::Systematic::JesDown,
+        ShapeSystematic::Nominal,
+        ShapeSystematic::JesUp,
+        ShapeSystematic::JesDown,
     ] {
+        let interpreted_key = format!("{systematic:?}");
         assert_eq!(
             generated_shape.n_good_muon_hist.get(systematic),
             interpreted_shape
                 .get("n_good_muon_hist")
                 .expect("interpreted histogram")
-                .get(systematic),
+                .get(interpreted_key),
             "{systematic:?}"
         );
     }
@@ -271,7 +272,7 @@ fn shape_correction_recomputes_rows_and_histograms_per_variation() {
     let shape_nominal_rows = generated_rows
         .iter()
         .filter_map(|(entry, systematic, row)| {
-            (*systematic == nano_analysis::Systematic::Nominal).then_some((*entry, *row))
+            (*systematic == ShapeSystematic::Nominal).then_some((*entry, *row))
         })
         .collect::<Vec<_>>();
     for (entry, row) in shape_nominal_rows {
@@ -280,33 +281,25 @@ fn shape_correction_recomputes_rows_and_histograms_per_variation() {
     assert_eq!(
         generated_shape
             .n_good_muon_hist
-            .get(nano_analysis::Systematic::Nominal),
+            .get(ShapeSystematic::Nominal),
         &generated_nominal.n_good_muon_hist
     );
 
     let entry_one_nominal = generated_rows
         .iter()
-        .find(|(entry, systematic, _)| {
-            *entry == 1 && *systematic == nano_analysis::Systematic::Nominal
-        })
+        .find(|(entry, systematic, _)| *entry == 1 && *systematic == ShapeSystematic::Nominal)
         .and_then(|(_, _, row)| *row);
     let entry_one_up = generated_rows
         .iter()
-        .find(|(entry, systematic, _)| {
-            *entry == 1 && *systematic == nano_analysis::Systematic::JesUp
-        })
+        .find(|(entry, systematic, _)| *entry == 1 && *systematic == ShapeSystematic::JesUp)
         .and_then(|(_, _, row)| *row);
     let entry_zero_nominal = generated_rows
         .iter()
-        .find(|(entry, systematic, _)| {
-            *entry == 0 && *systematic == nano_analysis::Systematic::Nominal
-        })
+        .find(|(entry, systematic, _)| *entry == 0 && *systematic == ShapeSystematic::Nominal)
         .and_then(|(_, _, row)| *row);
     let entry_zero_down = generated_rows
         .iter()
-        .find(|(entry, systematic, _)| {
-            *entry == 0 && *systematic == nano_analysis::Systematic::JesDown
-        })
+        .find(|(entry, systematic, _)| *entry == 0 && *systematic == ShapeSystematic::JesDown)
         .and_then(|(_, _, row)| *row);
 
     assert_eq!(entry_one_nominal, None);
@@ -320,20 +313,18 @@ fn shape_correction_recomputes_rows_and_histograms_per_variation() {
         "JesDown should migrate entry 0 below threshold"
     );
     assert_ne!(
+        generated_shape.n_good_muon_hist.get(ShapeSystematic::JesUp),
         generated_shape
             .n_good_muon_hist
-            .get(nano_analysis::Systematic::JesUp),
-        generated_shape
-            .n_good_muon_hist
-            .get(nano_analysis::Systematic::Nominal)
+            .get(ShapeSystematic::Nominal)
     );
     assert_ne!(
         generated_shape
             .n_good_muon_hist
-            .get(nano_analysis::Systematic::JesDown),
+            .get(ShapeSystematic::JesDown),
         generated_shape
             .n_good_muon_hist
-            .get(nano_analysis::Systematic::Nominal)
+            .get(ShapeSystematic::Nominal)
     );
     assert_eq!(generated_rows, interpreted_rows);
 }

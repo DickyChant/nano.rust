@@ -37,9 +37,10 @@ Correctness is enforced by **two** verifiers, each owning what it can actually k
 2. **rustc**, via the codegen target being the `nano-analysis` **typestate**
    (`Raw → Baseline → Scored<M> → Region → Weighted<R,S> → fill`), checks the
    *structure* of the generated kernel: stage order, region typing,
-   score-before-use, weight-before-fill, and **exhaustive systematics** (a closed
-   `Systematic` axis + `SystematicVisitor` — a missing variation arm is a compile
-   error). A kernel with no shared mutable state is safe to parallelize.
+   score-before-use, weight-before-fill, and **exhaustive systematics** (a
+   per-analysis generated `Systematic` axis + `SystematicVisitor` — a missing
+   variation arm is a compile error). A kernel with no shared mutable state is
+   safe to parallelize.
 
 Do **not** conflate them: branch existence is the *validator's* job, not rustc's. For
 the compiled/JIT back-ends the second verifier *is the compiler that also produces the
@@ -111,9 +112,10 @@ a prose description and proven against an *independent* imperative reference
 - **String codegen.** Codegen emits *from KIR* but is still string-based; the typed
   `syn`/`quote` emitter (and `trybuild` preservation tests) is deferred. The
   differential fuzzer substantially hardens the string path (it found the 3 bugs).
-- **Scaffolded breadth.** Systematics currently map onto a fixed closed `Systematic`
-  enum (per-analysis *generated* variants are future work); units are GeV/dimensionless
-  (no full `Quantity<Dim>` lattice yet); corrections are pt-scale shapes (full
+- **Scaffolded breadth.** Systematics now use a per-analysis generated closed
+  `Systematic` enum, so a declared `muon_weight` emits `MuonWeightUp/Down`
+  instead of borrowing JME names; units are GeV/dimensionless (no full
+  `Quantity<Dim>` lattice yet); corrections are pt-scale shapes (full
   correctionlib-payload JES/JER deferred); ONNX inference is a boundary, not wired.
 
 ## One-line claim

@@ -77,15 +77,17 @@ Baseline → Scored<M> → Region → Weighted<R, S> → fill`. The typestate *m
 invalid states unrepresentable* for code written in it (stage order, region
 typing, score-before-use, weight-before-fill, units, exhaustive systematics).
 The weighted state carries **both** a region marker `R` and a systematic-axis
-marker `S` (`Weighted<R, S>`): the variation axis is a closed set with a
-`SystematicVisitor`, so adding a variation forces every consumer to handle it
-or fail to compile (a `compile_fail` doctest proves an incomplete visitor is
-rejected). Generated row-only kernels exercise region gating and, for
+marker `S` (`Weighted<R, S>`): each generated analysis owns a closed
+`Systematic` enum and `SystematicVisitor`, so adding a declared variation
+forces every generated consumer to handle it or fail to compile (a
+`compile_fail` doctest proves an incomplete generated visitor is rejected).
+Generated row-only kernels exercise region gating and, for
 `[[model]]` specs, `Ev::infer`/`score`; generated histogram kernels emit
 `EventWeight -> Weighted<R, Nominal> -> fill` and route the weight through an
 emitted `impl SystematicVisitor` (`systematic.visit(...)`). Multi-variation
-histogram fan-out (KIR `ForEach`/`Fill`) and a `Quantity<Dim>` unit lattice are
-in-progress sub-moves; `Unit` is currently `GeV`/dimensionless. The interpreter
+histogram fan-out (KIR `ForEach`/`Fill`) uses those per-analysis enum variants;
+a `Quantity<Dim>` unit lattice is still an in-progress sub-move. `Unit` is
+currently `GeV`/dimensionless. The interpreter
 trades the compiler guarantee for not needing a toolchain.
 
 ### 2. Workflow DAG IR — how the kernel runs across files
