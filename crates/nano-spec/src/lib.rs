@@ -546,6 +546,12 @@ pub fn parse_analysis_spec_with_format(
     }
 }
 
+/// Emit an [`AnalysisSpec`] as ADL surface syntax for the subset represented by
+/// the current hand-written ADL grammar.
+pub fn to_adl_string(spec: &AnalysisSpec) -> String {
+    adl::to_adl_string(spec)
+}
+
 fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseError> {
     validate_raw_analysis_spec(&raw)?;
     let objects = object_defs_from_raw(raw.objects)?;
@@ -4442,6 +4448,52 @@ output n_good_muon;
             error,
             SpecError::UndefinedObject { object, .. } if object == "ghost_muon"
         )));
+    }
+
+    #[test]
+    fn adl_preserves_declaration_order_for_exact_round_trips() {
+        let spec = AnalysisSpec::from_adl_str(
+            r#"
+analysis ordered_adl year Run2018;
+object z_object : Muon {}
+object a_object : Electron {}
+object z_pair : pair(z_object) {
+  selection leading_pt;
+}
+object a_pair : pair(a_object) {
+  selection leading_pt;
+}
+region z_region {
+  count(z_object) >= 1;
+}
+region a_region {
+  count(a_object) >= 1;
+}
+"#,
+        )
+        .expect("parse ordered ADL");
+
+        assert_eq!(
+            spec.objects
+                .iter()
+                .map(|object| object.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z_object", "a_object"]
+        );
+        assert_eq!(
+            spec.derived_objects
+                .iter()
+                .map(|object| object.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z_pair", "a_pair"]
+        );
+        assert_eq!(
+            spec.regions
+                .iter()
+                .map(|region| region.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z_region", "a_region"]
+        );
     }
 
     #[test]

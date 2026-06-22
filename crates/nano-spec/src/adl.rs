@@ -24,17 +24,375 @@
 //! `exclude <pair>[, ...]`, and `filter <comparison>`. Expressions, cuts,
 //! requirements, and units are then parsed by the same helpers used by the
 //! TOML/YAML/JSON path.
+//!
+//! [`to_adl_string`] emits the same surface for specs that fit this grammar.
+//! The current ADL grammar has no surface for model bindings, multi-channel
+//! unions, candidate/combine derived objects, non-empty nominal weight factors,
+//! or built-in JES/JER systematic enum declarations. Those constructs must be
+//! skipped by callers that need exact `AnalysisSpec` round trips.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    analysis_spec_from_raw, validate_identifier, AnalysisSpec, ParseError, RawAnalysis,
-    RawAnalysisSpec, RawCorrection, RawDerivedObject, RawHistogram, RawObject, RawOutput,
-    RawRegion, RawSystematic, RawWeight,
+    analysis_spec_from_raw, validate_identifier, AnalysisSpec, ArithOp, CmpOp, Cut,
+    DerivedObjectDef, DerivedSource, Expr, HistogramDef, ObjectDef, PairConstraint, PairSelection,
+    ParseError, Quantity, RawAnalysis, RawAnalysisSpec, RawCorrection, RawDerivedObject,
+    RawHistogram, RawObject, RawOutput, RawRegion, RawSystematic, RawWeight, RegionDef,
+    ShapeCorrectionDef, SystematicDef, Unit, Year,
 };
 
 pub fn parse_adl(input: &str) -> Result<AnalysisSpec, ParseError> {
     Parser::new(input).parse()
+}
+
+pub fn to_adl_string(spec: &AnalysisSpec) -> String {
+    assert_adl_representable(spec);
+
+    let mut out = String::new();
+    out.push_str("analysis ");
+    out.push_str(&spec.name);
+    out.push_str(" year ");
+    out.push_str(&year_to_string(&spec.year));
+    out.push_str(";\n\n");
+
+    if spec.weight.nominal.is_empty() {
+        out.push_str("weight nominal;\n");
+    }
+    for systematic in &spec.systematics {
+        if let SystematicDef::Weight(systematic) = systematic {
+            out.push_str("systematic ");
+            out.push_str(&systematic.name);
+            out.push_str(" kind weight up ");
+            out.push_str(&format_f64(systematic.up));
+            out.push_str(" down ");
+            out.push_str(&format_f64(systematic.down));
+            out.push_str(";\n");
+        }
+    }
+    for correction in &spec.shape_corrections {
+        write_correction(&mut out, correction);
+    }
+    if spec.weight.nominal.is_empty()
+        || spec
+            .systematics
+            .iter()
+            .any(|systematic| matches!(systematic, SystematicDef::Weight(_)))
+        || !spec.shape_corrections.is_empty()
+    {
+        out.push('\n');
+    }
+
+    for object in &spec.objects {
+        write_object(&mut out, object);
+        out.push('\n');
+    }
+    for derived in &spec.derived_objects {
+        write_derived_object(&mut out, derived);
+        out.push('\n');
+    }
+    for region in &spec.regions {
+        write_region(&mut out, region);
+        out.push('\n');
+    }
+    for output in &spec.outputs {
+        out.push_str("output ");
+        out.push_str(&output.name);
+        out.push_str(" = ");
+        out.push_str(&expr_to_adl(&output.expr));
+        out.push_str(";\n");
+    }
+    if !spec.outputs.is_empty() && !spec.histograms.is_empty() {
+        out.push('\n');
+    }
+    for histogram in &spec.histograms {
+        write_histogram(&mut out, histogram);
+        out.push('\n');
+    }
+
+    out
+}
+
+fn assert_adl_representable(spec: &AnalysisSpec) {
+    assert!(
+        spec.models.is_empty(),
+        "ADL emitter cannot render model bindings"
+    );
+    assert!(
+        spec.channels.is_empty(),
+        "ADL emitter cannot render multi-channel unions"
+    );
+    assert!(
+        spec.weight.nominal.is_empty(),
+        "ADL emitter cannot render non-empty nominal weight factors"
+    );
+    assert!(
+        spec.derived_objects
+            .iter()
+            .all(|object| matches!(object.source, DerivedSource::Pair(_))),
+        "ADL emitter cannot render derived candidate objects"
+    );
+    assert!(
+        spec.shape_corrections
+            .iter()
+            .all(|correction| correction.attr == "pt"),
+        "ADL emitter cannot render non-pt shape corrections"
+    );
+
+    let weight_systematics = spec
+        .systematics
+        .iter()
+        .filter(|systematic| matches!(systematic, SystematicDef::Weight(_)))
+        .count();
+    assert!(
+        weight_systematics <= 1,
+        "ADL emitter cannot render multiple weight systematics"
+    );
+    assert!(
+        spec.systematics.iter().all(|systematic| matches!(
+            systematic,
+            SystematicDef::Nominal | SystematicDef::Weight(_)
+        )),
+        "ADL emitter cannot render built-in JES/JER systematic declarations"
+    );
+    assert!(
+        spec.systematics
+            .iter()
+            .any(|systematic| matches!(systematic, SystematicDef::Nominal)),
+        "ADL emitter requires an explicit nominal systematic for exact round trips"
+    );
+}
+
+fn write_object(out: &mut String, object: &ObjectDef) {
+    out.push_str("object ");
+    out.push_str(&object.name);
+    out.push_str(" : ");
+    out.push_str(&object.source);
+    out.push_str(" {\n");
+    for cut in &object.cuts {
+        out.push_str("  ");
+        out.push_str(&cut_to_adl(cut));
+        out.push_str(";\n");
+    }
+    out.push_str("}\n");
+}
+
+fn write_derived_object(out: &mut String, object: &DerivedObjectDef) {
+    let DerivedSource::Pair(pair) = &object.source else {
+        panic!(
+            "ADL emitter cannot render derived candidate object `{}`",
+            object.name
+        );
+    };
+
+    out.push_str("object ");
+    out.push_str(&object.name);
+    out.push_str(" : pair(");
+    out.push_str(&pair.object);
+    out.push_str(") {\n");
+    for constraint in &pair.constraints {
+        out.push_str("  ");
+        out.push_str(match constraint {
+            PairConstraint::OppositeCharge => "opposite_charge",
+            PairConstraint::SameFlavor => "same_flavor",
+        });
+        out.push_str(";\n");
+    }
+    match &pair.selection {
+        PairSelection::LeadingPt => out.push_str("  selection leading_pt;\n"),
+        PairSelection::NearestMass { target } => {
+            out.push_str("  nearest_mass ");
+            out.push_str(&quantity_to_adl(target));
+            out.push_str(";\n");
+        }
+        PairSelection::NearestMassTruncated { target } => {
+            out.push_str("  nearest_mass_truncated ");
+            out.push_str(&quantity_to_adl(target));
+            out.push_str(";\n");
+        }
+    }
+    if !pair.exclude.is_empty() {
+        out.push_str("  exclude ");
+        out.push_str(&pair.exclude.join(", "));
+        out.push_str(";\n");
+    }
+    for filter in &pair.filters {
+        out.push_str("  filter ");
+        out.push_str(&cut_to_adl(filter));
+        out.push_str(";\n");
+    }
+    out.push_str("}\n");
+}
+
+fn write_region(out: &mut String, region: &RegionDef) {
+    out.push_str("region ");
+    out.push_str(&region.name);
+    out.push_str(" {\n");
+    for requirement in &region.require {
+        out.push_str("  ");
+        out.push_str(&expr_to_adl(&requirement.lhs));
+        out.push(' ');
+        out.push_str(cmp_op_to_adl(requirement.op));
+        out.push(' ');
+        out.push_str(&quantity_to_adl(&requirement.rhs));
+        out.push_str(";\n");
+    }
+    out.push_str("}\n");
+}
+
+fn write_histogram(out: &mut String, histogram: &HistogramDef) {
+    out.push_str("histogram ");
+    out.push_str(&histogram.name);
+    out.push_str(" {\n");
+    out.push_str("  expr = ");
+    out.push_str(&expr_to_adl(&histogram.expr));
+    out.push_str(";\n");
+    out.push_str("  bins = ");
+    out.push_str(&histogram.bins.to_string());
+    out.push_str(";\n");
+    out.push_str("  range = [");
+    out.push_str(&format_f64(histogram.range[0]));
+    out.push_str(", ");
+    out.push_str(&format_f64(histogram.range[1]));
+    out.push_str("];\n");
+    out.push_str("}\n");
+}
+
+fn write_correction(out: &mut String, correction: &ShapeCorrectionDef) {
+    out.push_str("correction ");
+    out.push_str(&correction.name);
+    out.push_str(" kind scale collection ");
+    out.push_str(&correction.collection);
+    out.push_str(" attr ");
+    out.push_str(&correction.attr);
+    out.push_str(" up ");
+    out.push_str(&format_f64(correction.up));
+    out.push_str(" down ");
+    out.push_str(&format_f64(correction.down));
+    out.push_str(";\n");
+}
+
+fn cut_to_adl(cut: &Cut) -> String {
+    format!(
+        "{} {} {}",
+        expr_to_adl(&cut.lhs),
+        cmp_op_to_adl(cut.op),
+        quantity_to_adl(&cut.rhs)
+    )
+}
+
+fn expr_to_adl(expr: &Expr) -> String {
+    match expr {
+        Expr::Attr { object, attr } => format!("{object}.{attr}"),
+        Expr::Literal(value) => format_f64(*value),
+        Expr::Binary { op, lhs, rhs } => format!(
+            "({} {} {})",
+            expr_to_adl(lhs),
+            arith_op_to_adl(*op),
+            expr_to_adl(rhs)
+        ),
+        Expr::Abs(inner) => format!("abs({})", expr_to_adl(inner)),
+        Expr::Sqrt(inner) => format!("sqrt({})", expr_to_adl(inner)),
+        Expr::Count(object) => format!("count({object})"),
+        Expr::CountWhere { object, predicate } => {
+            format!("count({object}, {})", cut_to_adl(predicate))
+        }
+        Expr::SumAttr { object, attr } => format!("sum({object}.{attr})"),
+        Expr::All { object, predicate } => {
+            format!("all({object}, {})", cut_to_adl(predicate))
+        }
+        Expr::Any { object, predicate } => {
+            format!("any({object}, {})", cut_to_adl(predicate))
+        }
+        Expr::EitherPairPt {
+            left,
+            right,
+            leading,
+            subleading,
+        } => format!(
+            "either_pair_pt({}, {}, {}, {})",
+            left,
+            right,
+            quantity_to_adl(leading),
+            quantity_to_adl(subleading)
+        ),
+        Expr::ClosestMass {
+            left,
+            right,
+            target,
+        } => format!(
+            "closest_mass({}, {}, {})",
+            left,
+            right,
+            quantity_to_adl(target)
+        ),
+        Expr::OtherMass {
+            left,
+            right,
+            target,
+        } => format!(
+            "other_mass({}, {}, {})",
+            left,
+            right,
+            quantity_to_adl(target)
+        ),
+        Expr::LeadingAttr { object, attr } => format!("leading({object}).{attr}"),
+        Expr::PairDeltaR => "delta_r".to_string(),
+        Expr::PairLeadingPt => "leading_pt".to_string(),
+        Expr::PairSubleadingPt => "subleading_pt".to_string(),
+        Expr::CandidateMinDeltaR => "min_delta_r".to_string(),
+        Expr::CandidateLeadingPt => "candidate_leading_pt".to_string(),
+        Expr::CandidateSubleadingPt => "candidate_subleading_pt".to_string(),
+    }
+}
+
+fn quantity_to_adl(quantity: &Quantity) -> String {
+    match quantity.unit {
+        Unit::GeV => format!("{} GeV", format_f64(quantity.value)),
+        Unit::Dimensionless => format_f64(quantity.value),
+    }
+}
+
+fn cmp_op_to_adl(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Gt => ">",
+        CmpOp::Ge => ">=",
+        CmpOp::Lt => "<",
+        CmpOp::Le => "<=",
+        CmpOp::Eq => "==",
+        CmpOp::Ne => "!=",
+    }
+}
+
+fn arith_op_to_adl(op: ArithOp) -> &'static str {
+    match op {
+        ArithOp::Add => "+",
+        ArithOp::Sub => "-",
+        ArithOp::Mul => "*",
+        ArithOp::Div => "/",
+        ArithOp::Pow => "^",
+    }
+}
+
+fn year_to_string(year: &Year) -> String {
+    match year {
+        Year::Run2016 => "Run2016".to_string(),
+        Year::Run2017 => "Run2017".to_string(),
+        Year::Run2018 => "Run2018".to_string(),
+        Year::Other(year) => year.clone(),
+    }
+}
+
+fn format_f64(value: f64) -> String {
+    value.to_string()
+}
+
+fn reorder_by_names<T>(values: &mut Vec<T>, order: &[String], name: impl Fn(&T) -> &String) {
+    let mut by_name = values
+        .drain(..)
+        .map(|value| (name(&value).clone(), value))
+        .collect::<BTreeMap<_, _>>();
+    values.extend(order.iter().filter_map(|name| by_name.remove(name)));
+    values.extend(by_name.into_values());
 }
 
 struct Parser {
@@ -42,8 +400,11 @@ struct Parser {
     pos: usize,
     analysis: Option<RawAnalysis>,
     objects: BTreeMap<String, RawObject>,
+    object_order: Vec<String>,
     derived: BTreeMap<String, RawDerivedObject>,
+    derived_order: Vec<String>,
     regions: BTreeMap<String, RawRegion>,
+    region_order: Vec<String>,
     outputs: Vec<RawOutput>,
     histograms: Vec<RawHistogram>,
     weight: Option<RawWeight>,
@@ -60,8 +421,11 @@ impl Parser {
             pos: 0,
             analysis: None,
             objects: BTreeMap::new(),
+            object_order: Vec::new(),
             derived: BTreeMap::new(),
+            derived_order: Vec::new(),
             regions: BTreeMap::new(),
+            region_order: Vec::new(),
             outputs: Vec::new(),
             histograms: Vec::new(),
             weight: None,
@@ -101,7 +465,7 @@ impl Parser {
             .analysis
             .ok_or_else(|| ParseError::InvalidSpec("ADL spec is missing `analysis`".to_string()))?;
 
-        analysis_spec_from_raw(RawAnalysisSpec {
+        let mut spec = analysis_spec_from_raw(RawAnalysisSpec {
             analysis,
             objects: self.objects,
             derived: self.derived,
@@ -114,7 +478,13 @@ impl Parser {
             systematic: self.systematic,
             corrections: self.corrections,
             channels: Vec::new(),
-        })
+        })?;
+        reorder_by_names(&mut spec.objects, &self.object_order, |object| &object.name);
+        reorder_by_names(&mut spec.derived_objects, &self.derived_order, |object| {
+            &object.name
+        });
+        reorder_by_names(&mut spec.regions, &self.region_order, |region| &region.name);
+        Ok(spec)
     }
 
     fn parse_analysis(&mut self) -> Result<(), ParseError> {
@@ -237,6 +607,7 @@ impl Parser {
                 "failed to parse ADL: duplicate region `{name}`"
             )));
         }
+        self.region_order.push(name);
         Ok(())
     }
 
@@ -381,6 +752,7 @@ impl Parser {
                 "failed to parse ADL: duplicate object `{name}`"
             )));
         }
+        self.object_order.push(name);
         Ok(())
     }
 
@@ -395,6 +767,7 @@ impl Parser {
                 "failed to parse ADL: duplicate object `{name}`"
             )));
         }
+        self.derived_order.push(name);
         Ok(())
     }
 
