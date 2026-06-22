@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use futures::executor::block_on;
 use nano_analysis::Hist1D;
-use nano_io::datacard::{Channel, FlatWeightSystematic, SingleProcessDatacard};
+use nano_io::datacard::{
+    Channel, FlatWeightSystematic, MultiProcessChannel, MultiProcessDatacard, Process,
+    SingleProcessDatacard,
+};
 use root_io::RootFile;
 
 #[test]
@@ -86,6 +89,104 @@ fn writes_single_process_combine_datacard_and_shapes() {
     assert_th1_matches(read.get("cr/signal_JESUp").unwrap(), &cr_jes_up);
     assert_th1_matches(read.get("cr/signal_JESDown").unwrap(), &cr_jes_down);
     assert_th1_matches(read.get("cr/data_obs").unwrap(), &cr_data);
+
+    std::fs::remove_dir_all(output_dir).unwrap();
+}
+
+#[test]
+fn writes_multi_process_combine_datacard_and_shapes() {
+    // This slice covers emitting per-process histograms that are already
+    // provided by the caller. Building those histograms from multiple samples
+    // with per-sample xsec*lumi/sumw normalization belongs in the
+    // sample/normalization layer. Running `combine` is still the external
+    // validation step.
+    let output_dir = temp_output_dir("multi_process");
+
+    let signal = hist(&[(0.25, 8.0), (1.25, 4.0), (-1.0, 1.0), (3.0, 2.0)]);
+    let signal_jes_up = hist(&[(0.25, 8.8), (1.25, 4.4)]);
+    let signal_jes_down = hist(&[(0.25, 7.2), (1.25, 3.6)]);
+    let ttbar = hist(&[(0.25, 5.0), (1.25, 3.0)]);
+    let ttbar_jes_up = hist(&[(0.25, 5.5), (1.25, 3.3)]);
+    let ttbar_jes_down = hist(&[(0.25, 4.5), (1.25, 2.7)]);
+    let qcd = hist(&[(0.25, 2.0), (1.25, 1.0)]);
+    let qcd_jes_up = hist(&[(0.25, 2.2), (1.25, 1.1)]);
+    let qcd_jes_down = hist(&[(0.25, 1.8), (1.25, 0.9)]);
+    let data = hist(&[(0.25, 15.0), (1.25, 8.0)]);
+
+    let request = MultiProcessDatacard::new().with_channel(
+        MultiProcessChannel::new("sr", &data)
+            .with_process(Process::new("signal", 0, &signal).with_shape_systematic(
+                "JES",
+                &signal_jes_up,
+                &signal_jes_down,
+            ))
+            .with_process(Process::new("ttbar", 1, &ttbar).with_shape_systematic(
+                "JES",
+                &ttbar_jes_up,
+                &ttbar_jes_down,
+            ))
+            .with_process(
+                Process::new("qcd", 2, &qcd)
+                    .with_shape_systematic("JES", &qcd_jes_up, &qcd_jes_down)
+                    .with_flat_weight_systematic(FlatWeightSystematic::new("qcd_norm", 1.20, 0.80)),
+            ),
+    );
+
+    let output = request.write(&output_dir).unwrap();
+    assert!(output.datacard_path.exists());
+    assert!(output.shapes_path.exists());
+
+    let text = std::fs::read_to_string(&output.datacard_path).unwrap();
+    let parsed = ParsedDatacard::parse(&text);
+
+    assert_eq!(parsed.imax, 1);
+    assert_eq!(parsed.jmax, 2);
+    assert_eq!(parsed.kmax, 2);
+    assert_eq!(parsed.shapes_file, "shapes.root");
+    assert_eq!(parsed.processes, ["signal", "ttbar", "qcd"]);
+    assert_eq!(parsed.process_indices, [0, 1, 2]);
+    assert_eq!(
+        parsed
+            .process_indices
+            .iter()
+            .filter(|index| **index <= 0)
+            .count(),
+        1
+    );
+    assert_values_close(&parsed.observations, &[23.0]);
+    assert_values_close(&parsed.rates, &[12.0, 8.0, 3.0]);
+    assert_eq!(parsed.rates.len(), parsed.processes.len());
+
+    for systematic in parsed.systematics.values() {
+        assert_eq!(systematic.entries.len(), parsed.rates.len());
+    }
+    assert_eq!(
+        parsed.systematic("JES"),
+        Some(&SystematicLine {
+            kind: "shape".to_string(),
+            entries: vec!["1".to_string(), "1".to_string(), "1".to_string()],
+        })
+    );
+    assert_eq!(
+        parsed.systematic("qcd_norm"),
+        Some(&SystematicLine {
+            kind: "lnN".to_string(),
+            entries: vec!["-".to_string(), "-".to_string(), "0.8/1.2".to_string()],
+        })
+    );
+
+    let read = read_shapes(&output.shapes_path);
+    assert_eq!(read.len(), 10);
+    assert_th1_matches(read.get("sr/signal").unwrap(), &signal);
+    assert_th1_matches(read.get("sr/signal_JESUp").unwrap(), &signal_jes_up);
+    assert_th1_matches(read.get("sr/signal_JESDown").unwrap(), &signal_jes_down);
+    assert_th1_matches(read.get("sr/ttbar").unwrap(), &ttbar);
+    assert_th1_matches(read.get("sr/ttbar_JESUp").unwrap(), &ttbar_jes_up);
+    assert_th1_matches(read.get("sr/ttbar_JESDown").unwrap(), &ttbar_jes_down);
+    assert_th1_matches(read.get("sr/qcd").unwrap(), &qcd);
+    assert_th1_matches(read.get("sr/qcd_JESUp").unwrap(), &qcd_jes_up);
+    assert_th1_matches(read.get("sr/qcd_JESDown").unwrap(), &qcd_jes_down);
+    assert_th1_matches(read.get("sr/data_obs").unwrap(), &data);
 
     std::fs::remove_dir_all(output_dir).unwrap();
 }
