@@ -1202,6 +1202,7 @@ version = "0.0.0"
 dependencies = [
  "nano-analysis",
  "nano-core",
+ "nano-inference",
  "nano-producers",
  "serde",
  "serde_json",

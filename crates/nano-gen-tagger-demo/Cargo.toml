@@ -15,5 +15,8 @@ nano-inference = { workspace = true }
 [build-dependencies]
 nano-spec = { workspace = true }
 
+[dev-dependencies]
+nano-spec = { workspace = true }
+
 [features]
 default = []

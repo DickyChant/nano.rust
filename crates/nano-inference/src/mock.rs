@@ -66,6 +66,20 @@ impl MockPredictor {
     }
 }
 
+/// Compute the deterministic mock score for each request row.
+///
+/// This is the single scoring routine used by the in-process mock predictor and
+/// any local caller that needs bit-identical mock inference without transport.
+pub fn mock_scores(req: &InferRequest) -> Result<Vec<f32>, InferError> {
+    let rows = MockPredictor::row_count(req)?;
+    Ok((0..rows)
+        .map(|row| {
+            let hash = MockPredictor::hash_row(req, row);
+            (hash % 1_000_000) as f32 / 1_000_000.0
+        })
+        .collect())
+}
+
 impl Default for MockPredictor {
     fn default() -> Self {
         Self::new("mock")
@@ -74,18 +88,13 @@ impl Default for MockPredictor {
 
 impl Predictor for MockPredictor {
     fn predict(&self, req: &InferRequest) -> Result<InferResponse, InferError> {
-        let rows = Self::row_count(req)?;
         let model = if req.model.is_empty() {
             self.model.clone()
         } else {
             req.model.clone()
         };
-        let values = (0..rows)
-            .map(|row| {
-                let hash = Self::hash_row(req, row);
-                (hash % 1_000_000) as f32 / 1_000_000.0
-            })
-            .collect::<Vec<_>>();
+        let values = mock_scores(req)?;
+        let rows = values.len();
         Ok(InferResponse {
             model,
             outputs: vec![Tensor {

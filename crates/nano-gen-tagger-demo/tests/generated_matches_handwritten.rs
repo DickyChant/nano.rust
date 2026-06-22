@@ -2,6 +2,11 @@ use nano_analysis::{Ev, Features, ModelTag};
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
 use nano_gen_tagger_demo::GeneratedProducer;
 use nano_inference::{MockPredictor, Tensor, TensorData};
+use nano_spec::interpret::{interpret, OutputRow, Value};
+use nano_spec::{validate, AnalysisSpec, Catalogue};
+
+const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
+const MUON_TAGGER_TOML: &str = include_str!("../../nano-spec/examples/muon_tagger.toml");
 
 struct MuonTagger;
 
@@ -19,6 +24,10 @@ struct RefRow {
 
 #[test]
 fn generated_muon_tagger_producer_matches_handwritten_reference_on_synthetic_events() {
+    let spec = AnalysisSpec::from_toml_str(MUON_TAGGER_TOML).expect("parse spec");
+    let catalogue =
+        Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+    let plan = validate(&spec, &catalogue).expect("validate spec");
     let predictor = MockPredictor::new(MuonTagger::NAME);
 
     for entry in 0..6 {
@@ -31,7 +40,11 @@ fn generated_muon_tagger_producer_matches_handwritten_reference_on_synthetic_eve
                 lead_muon_topscore: row.lead_muon_topscore,
             });
         let handwritten = handwritten_reference(&event, &predictor).unwrap();
+        let interpreted = interpret(&plan, &event)
+            .unwrap_or_else(|error| panic!("entry {entry}: interpret failed: {error}"))
+            .map(interpreted_row);
 
+        assert_eq!(interpreted, generated, "entry {entry}: interpreted");
         assert_eq!(generated, handwritten, "entry {entry}");
     }
 }
@@ -145,4 +158,31 @@ fn columns() -> Vec<(String, BranchColumn)> {
             ]),
         ),
     ]
+}
+
+fn interpreted_row(row: OutputRow) -> RefRow {
+    RefRow {
+        n_good_muon: output_u32(&row, "n_good_muon"),
+        lead_muon_topscore: output_f32(&row, "lead_muon_topscore"),
+    }
+}
+
+fn output_u32(row: &OutputRow, name: &str) -> u32 {
+    match row
+        .get(name)
+        .unwrap_or_else(|| panic!("missing output `{name}`"))
+    {
+        Value::U32(value) => value,
+        other => panic!("output `{name}` has unexpected value {other:?}"),
+    }
+}
+
+fn output_f32(row: &OutputRow, name: &str) -> f32 {
+    match row
+        .get(name)
+        .unwrap_or_else(|| panic!("missing output `{name}`"))
+    {
+        Value::F64(value) => value as f32,
+        other => panic!("output `{name}` has unexpected value {other:?}"),
+    }
 }

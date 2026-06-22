@@ -35,6 +35,7 @@ pub struct KirProgram {
     pub name: String,
     pub block: Block,
     pub read_branches: Vec<BranchSpec>,
+    pub model_outputs: Vec<String>,
     pub objects: Vec<KirObject>,
     pub derived_objects: Vec<KirDerivedObject>,
     pub regions: Vec<KirRegion>,
@@ -299,6 +300,7 @@ pub fn lower_to_kir(core: &CoreIr) -> Result<KirProgram, KirError> {
         name: core.name.clone(),
         block,
         read_branches: Vec::new(),
+        model_outputs: Vec::new(),
         objects: core
             .objects
             .iter()
@@ -423,6 +425,12 @@ pub fn lower_plan_to_kir(plan: &ResolvedPlan) -> Result<KirProgram, KirError> {
         .collect();
     program.weight = plan.spec.weight.clone();
     program.read_branches = plan.read_branches.specs().to_vec();
+    program.model_outputs = plan
+        .spec
+        .models
+        .iter()
+        .map(|model| model.output.clone())
+        .collect();
     program.block = executable_block(&program)?;
     verify(&program)?;
     Ok(program)
@@ -805,6 +813,9 @@ fn require_object_attr(
 ) -> Result<crate::Dimension, KirError> {
     let object = require_object(program, object, context)?;
     let branch = format!("{}_{}", object.source, attr);
+    if program.model_outputs.iter().any(|output| output == &branch) {
+        return Ok(crate::Dimension::Dimensionless);
+    }
     let branch_type = program
         .read_branches
         .iter()

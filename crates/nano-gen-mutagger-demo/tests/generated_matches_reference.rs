@@ -1,11 +1,12 @@
 use nano_analysis::Hist1D;
+use nano_analysis::Systematic;
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
 use nano_gen_mutagger_demo::reference::{
     ReferenceHistograms, ReferenceProducer, ReferenceRow, MODEL_NAME,
 };
 use nano_gen_mutagger_demo::{GenRow, GeneratedProducer};
 use nano_inference::MockPredictor;
-use nano_spec::interpret::{interpret_and_fill, InterpretError, InterpretedHistograms};
+use nano_spec::interpret::{interpret_and_fill, InterpretedHistograms, OutputRow, Value};
 use nano_spec::{lower, to_adl_string, validate, AnalysisSpec, Catalogue};
 
 const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
@@ -69,13 +70,12 @@ fn generated_mutagger_cr_matches_reference_on_synthetic_events() {
                 .unwrap_or_else(|error| panic!("entry {entry}: reference failed: {error}"))
                 .map(reference_row_bits);
         let interpreted = interpret_and_fill(&plan, &event, &mut interpreted_histograms)
-            .expect_err("interpreter should report the current model interpretation gap");
+            .unwrap_or_else(|error| panic!("entry {entry}: interpret failed: {error}"))
+            .map(interpreted_row_bits);
 
         assert_eq!(
-            interpreted,
-            InterpretError::Unsupported(
-                "models not yet interpreted; use the compiled path".to_string()
-            )
+            interpreted, generated,
+            "entry {entry}: interpreted != generated"
         );
         assert_eq!(
             generated, reference,
@@ -91,6 +91,14 @@ fn generated_mutagger_cr_matches_reference_on_synthetic_events() {
     assert_eq!(
         generated_histogram, reference_histograms.leading_muon_pt,
         "generated leading-pt histogram differs from reference"
+    );
+    let interpreted_histogram = interpreted_histograms
+        .get("leading_muon_pt")
+        .expect("interpreted leading_muon_pt histogram")
+        .get(Systematic::Nominal);
+    assert_eq!(
+        interpreted_histogram, &generated_histogram,
+        "interpreted leading-pt histogram differs from generated"
     );
     assert_eq!(reference_histograms.leading_muon_pt.sumw(), 3.0);
     assert_eq!(
@@ -178,4 +186,32 @@ fn reference_row_bits(row: ReferenceRow) -> (u32, u32, u64) {
         row.n_tagged_muons,
         row.leading_muon_pt.to_bits(),
     )
+}
+
+fn interpreted_row_bits(row: OutputRow) -> (u32, u32, u64) {
+    (
+        output_u32(&row, "n_selected_muons"),
+        output_u32(&row, "n_tagged_muons"),
+        output_f64(&row, "leading_muon_pt").to_bits(),
+    )
+}
+
+fn output_u32(row: &OutputRow, name: &str) -> u32 {
+    match row
+        .get(name)
+        .unwrap_or_else(|| panic!("missing output `{name}`"))
+    {
+        Value::U32(value) => value,
+        other => panic!("output `{name}` has unexpected value {other:?}"),
+    }
+}
+
+fn output_f64(row: &OutputRow, name: &str) -> f64 {
+    match row
+        .get(name)
+        .unwrap_or_else(|| panic!("missing output `{name}`"))
+    {
+        Value::F64(value) => value,
+        other => panic!("output `{name}` has unexpected value {other:?}"),
+    }
 }

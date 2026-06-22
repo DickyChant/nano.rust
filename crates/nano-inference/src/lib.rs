@@ -18,7 +18,7 @@ mod remote;
 pub use features::{events_to_infer_request, FeatureScope};
 #[cfg(feature = "http")]
 pub use managed::{BuiltInMockServer, LaunchRecipe, ManagedPredictor};
-pub use mock::MockPredictor;
+pub use mock::{mock_scores, MockPredictor};
 pub use provider::{InProcessPredictor, ProviderSpec};
 #[cfg(feature = "http")]
 pub use remote::{RemotePredictor, WireApi};

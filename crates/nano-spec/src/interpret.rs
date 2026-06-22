@@ -10,11 +10,12 @@ use std::fmt;
 
 use nano_analysis::{EventWeight, HistSet1D, Systematic};
 use nano_core::{BranchType, Event, ObjectView};
+use nano_inference::{mock_scores, InferRequest, Tensor, TensorData};
 
 use crate::kir::{Block, ForEachAxis, KirObject, KirProgram, Rvalue, Stmt, ValueId};
 use crate::{
-    ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ObjectCandidateDef, ObjectPairDef,
-    PairConstraint, PairSelection, ResolvedPlan,
+    ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef, ModelProviderKind,
+    ObjectCandidateDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
 };
 
 /// One typed output cell produced by the interpreter.
@@ -133,6 +134,7 @@ impl From<crate::kir::KirError> for InterpretError {
 type Result<T> = std::result::Result<T, InterpretError>;
 type SelectedObjects = HashMap<String, Vec<SelectedObject>>;
 type DerivedObjects = HashMap<String, Option<DerivedObject>>;
+type ModelOutputs = HashMap<String, Vec<f32>>;
 type RuntimeValues = HashMap<ValueId, RuntimeValue>;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -208,8 +210,9 @@ impl NumericValue {
 /// Interpret one event with a validated semantic plan.
 ///
 /// `Ok(None)` means the event failed a region requirement or a required
-/// `leading(...)` output had no selected object. Model specs are deliberately
-/// unsupported in this runtime until inference is implemented for this path.
+/// `leading(...)` output had no selected object. Only `provider = "mock"`
+/// model specs are interpreted; real inference providers stay on the compiled
+/// path for now.
 pub fn interpret(plan: &ResolvedPlan, event: &Event) -> Result<Option<OutputRow>> {
     interpret_systematic(plan, event, Systematic::Nominal)
 }
@@ -225,15 +228,12 @@ pub fn interpret_systematic(
             "use interpret_union for multi-channel union specs".to_string(),
         ));
     }
-    if !plan.spec.models.is_empty() {
-        return Err(InterpretError::Unsupported(
-            "models not yet interpreted; use the compiled path".to_string(),
-        ));
-    }
+    ensure_interpretable_models(&plan.spec.models)?;
 
     let kir = crate::kir::lower_plan_to_kir(plan)?;
     crate::kir::verify(&kir)?;
-    execute_verified_kir(&kir, event, systematic)
+    let model_outputs = evaluate_mock_models(&plan.spec.models, &kir, event)?;
+    execute_verified_kir(&kir, event, systematic, model_outputs)
 }
 
 /// Interpret one event and execute KIR histogram fills into `histograms`.
@@ -257,15 +257,12 @@ pub fn interpret_and_fill_systematic(
             "interpret_and_fill currently supports flat specs".to_string(),
         ));
     }
-    if !plan.spec.models.is_empty() {
-        return Err(InterpretError::Unsupported(
-            "models not yet interpreted; use the compiled path".to_string(),
-        ));
-    }
+    ensure_interpretable_models(&plan.spec.models)?;
 
     let kir = crate::kir::lower_plan_to_kir(plan)?;
     crate::kir::verify(&kir)?;
-    let mut evaluator = KirEvaluator::new(&kir, event, systematic);
+    let model_outputs = evaluate_mock_models(&plan.spec.models, &kir, event)?;
+    let mut evaluator = KirEvaluator::new(&kir, event, systematic, model_outputs);
     evaluator.histograms = Some(&mut histograms.histograms);
     match evaluator.execute_block(&kir.block)? {
         BlockOutcome::Continue => Err(InterpretError::InvalidExpression(
@@ -287,13 +284,177 @@ fn execute_verified_kir(
     program: &KirProgram,
     event: &Event,
     systematic: Systematic,
+    model_outputs: ModelOutputs,
 ) -> Result<Option<OutputRow>> {
-    let mut evaluator = KirEvaluator::new(program, event, systematic);
+    let mut evaluator = KirEvaluator::new(program, event, systematic, model_outputs);
     match evaluator.execute_block(&program.block)? {
         BlockOutcome::Continue => Err(InterpretError::InvalidExpression(
             "KIR program completed without returning outputs".to_string(),
         )),
         BlockOutcome::Return(row) => Ok(row),
+    }
+}
+
+fn ensure_interpretable_models(models: &[ModelDef]) -> Result<()> {
+    for model in models {
+        if !matches!(model.provider.kind, ModelProviderKind::Mock) {
+            return Err(InterpretError::Unsupported(format!(
+                "model `{}` provider `{}` is unsupported in interpreter; only mock provider is interpreted",
+                model.name,
+                provider_kind_name(&model.provider.kind)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn evaluate_mock_models(
+    models: &[ModelDef],
+    program: &KirProgram,
+    event: &Event,
+) -> Result<ModelOutputs> {
+    let mut outputs = ModelOutputs::with_capacity(models.len());
+    for model in models {
+        let batch = model_batch_source(model, program)?;
+        let collection = event.collection(&batch)?;
+        let mut values = Vec::with_capacity(collection.len() * model.inputs.len());
+        for item in collection.iter() {
+            for input in &model.inputs {
+                values.push(model_input_value(
+                    model, program, event, item, input, &batch,
+                )?);
+            }
+        }
+        let scores = mock_scores(&InferRequest {
+            model: model.name.clone(),
+            inputs: vec![Tensor {
+                name: "features".to_string(),
+                shape: vec![collection.len(), model.inputs.len()],
+                data: TensorData::F32(values),
+            }],
+        })
+        .map_err(|error| {
+            InterpretError::Event(format!(
+                "mock inference for model `{}` failed: {error}",
+                model.name
+            ))
+        })?;
+        if scores.len() != collection.len() {
+            return Err(InterpretError::InvalidExpression(format!(
+                "mock model `{}` returned {} scores for {} `{batch}` objects",
+                model.name,
+                scores.len(),
+                collection.len()
+            )));
+        }
+        outputs.insert(model.output.clone(), scores);
+    }
+    Ok(outputs)
+}
+
+fn model_input_value(
+    model: &ModelDef,
+    program: &KirProgram,
+    event: &Event,
+    item: &ObjectView<'_>,
+    input: &str,
+    batch: &str,
+) -> Result<f32> {
+    let branch_type = branch_type(program, input)?;
+    if branch_type.is_vector() {
+        let Some((source, attr)) = input.split_once('_') else {
+            return Err(InterpretError::Unsupported(format!(
+                "model `{}` input `{input}` is not a supported object attribute branch",
+                model.name
+            )));
+        };
+        if source != batch {
+            return Err(InterpretError::Unsupported(format!(
+                "model `{}` input `{input}` is a vector branch outside batch `{batch}`",
+                model.name
+            )));
+        }
+        object_input_value(item, attr, branch_type)
+    } else {
+        scalar_input_value(event, input, branch_type)
+    }
+}
+
+fn object_input_value(item: &ObjectView<'_>, attr: &str, branch_type: BranchType) -> Result<f32> {
+    match branch_type {
+        BranchType::VecI8 => Ok(f32::from(item.get::<i8>(attr)?)),
+        BranchType::VecU8 => Ok(f32::from(item.get::<u8>(attr)?)),
+        BranchType::VecI16 => Ok(f32::from(item.get::<i16>(attr)?)),
+        BranchType::VecU16 => Ok(f32::from(item.get::<u16>(attr)?)),
+        BranchType::VecI32 => Ok(item.get::<i32>(attr)? as f32),
+        BranchType::VecU32 => Ok(item.get::<u32>(attr)? as f32),
+        BranchType::VecI64 => Ok(item.get::<i64>(attr)? as f32),
+        BranchType::VecU64 => Ok(item.get::<u64>(attr)? as f32),
+        BranchType::VecF32 => Ok(item.get::<f32>(attr)?),
+        other => Err(InterpretError::TypeMismatch {
+            branch: attr.to_string(),
+            branch_type: other,
+            expected: "numeric vector branch",
+        }),
+    }
+}
+
+fn scalar_input_value(event: &Event, input: &str, branch_type: BranchType) -> Result<f32> {
+    match branch_type {
+        BranchType::I8 => Ok(f32::from(event.scalar::<i8>(input)?)),
+        BranchType::U8 => Ok(f32::from(event.scalar::<u8>(input)?)),
+        BranchType::I16 => Ok(f32::from(event.scalar::<i16>(input)?)),
+        BranchType::U16 => Ok(f32::from(event.scalar::<u16>(input)?)),
+        BranchType::I32 => Ok(event.scalar::<i32>(input)? as f32),
+        BranchType::U32 => Ok(event.scalar::<u32>(input)? as f32),
+        BranchType::I64 => Ok(event.scalar::<i64>(input)? as f32),
+        BranchType::U64 => Ok(event.scalar::<u64>(input)? as f32),
+        BranchType::F32 => Ok(event.scalar::<f32>(input)?),
+        other => Err(InterpretError::TypeMismatch {
+            branch: input.to_string(),
+            branch_type: other,
+            expected: "numeric scalar branch",
+        }),
+    }
+}
+
+fn model_batch_source(model: &ModelDef, program: &KirProgram) -> Result<String> {
+    if let Some(object) = program
+        .objects
+        .iter()
+        .find(|object| object.name == model.batch)
+    {
+        return Ok(object.source.clone());
+    }
+    if program
+        .objects
+        .iter()
+        .any(|object| object.source == model.batch)
+    {
+        return Ok(model.batch.clone());
+    }
+    Err(InterpretError::Unsupported(format!(
+        "model `{}` batch `{}` is not defined",
+        model.name, model.batch
+    )))
+}
+
+fn branch_type(program: &KirProgram, branch: &str) -> Result<BranchType> {
+    program
+        .read_branches
+        .iter()
+        .find(|spec| spec.name == branch)
+        .map(|spec| spec.branch_type)
+        .ok_or_else(|| InterpretError::MissingBranch(branch.to_string()))
+}
+
+fn provider_kind_name(kind: &ModelProviderKind) -> &str {
+    match kind {
+        ModelProviderKind::Mock => "mock",
+        ModelProviderKind::InProcess => "inproc",
+        ModelProviderKind::Remote => "remote",
+        ModelProviderKind::Managed => "managed",
+        ModelProviderKind::Other(kind) => kind.as_str(),
     }
 }
 
@@ -304,11 +465,17 @@ struct KirEvaluator<'a> {
     values: RuntimeValues,
     selected: SelectedObjects,
     derived: DerivedObjects,
+    model_outputs: ModelOutputs,
     histograms: Option<&'a mut BTreeMap<String, HistSet1D>>,
 }
 
 impl<'a> KirEvaluator<'a> {
-    fn new(program: &'a KirProgram, event: &'a Event, systematic: Systematic) -> Self {
+    fn new(
+        program: &'a KirProgram,
+        event: &'a Event,
+        systematic: Systematic,
+        model_outputs: ModelOutputs,
+    ) -> Self {
         Self {
             program,
             event,
@@ -316,6 +483,7 @@ impl<'a> KirEvaluator<'a> {
             values: HashMap::new(),
             selected: HashMap::with_capacity(program.objects.len()),
             derived: HashMap::with_capacity(program.derived_objects.len()),
+            model_outputs,
             histograms: None,
         }
     }
@@ -467,7 +635,13 @@ impl<'a> KirEvaluator<'a> {
     fn eval_rvalue(&mut self, expr: &Rvalue) -> Result<RuntimeValue> {
         match expr {
             Rvalue::SelectObjects { object } => {
-                let selected = select_object(self.program, self.event, object, self.systematic)?;
+                let selected = select_object(
+                    self.program,
+                    self.event,
+                    object,
+                    self.systematic,
+                    &self.model_outputs,
+                )?;
                 self.selected.insert(object.name.clone(), selected);
                 Ok(RuntimeValue::ObjectSet)
             }
@@ -612,6 +786,7 @@ fn passes_object_cuts(
     object: &KirObject,
     item: &ObjectView<'_>,
     systematic: Systematic,
+    model_outputs: &ModelOutputs,
 ) -> Result<bool> {
     for cut in &object.cuts {
         let lhs = eval_object_numeric_expr(
@@ -621,6 +796,7 @@ fn passes_object_cuts(
             &cut.lhs,
             item,
             systematic,
+            model_outputs,
         )?;
         if !compare(lhs.as_f64(), cut.op, cut.rhs.value) {
             return Ok(false);
@@ -634,13 +810,14 @@ fn select_object(
     event: &Event,
     object: &KirObject,
     systematic: Systematic,
+    model_outputs: &ModelOutputs,
 ) -> Result<Vec<SelectedObject>> {
     let collection = event.collection(&object.source)?;
     let mut objects = Vec::new();
 
     for item in collection.iter() {
         let mut leading_values = HashMap::new();
-        if passes_object_cuts(program, object, item, systematic)? {
+        if passes_object_cuts(program, object, item, systematic, model_outputs)? {
             for attr in leading_attrs_for_object(program, &object.name) {
                 let value = read_object_attr(
                     program,
@@ -649,6 +826,7 @@ fn select_object(
                     item,
                     &attr,
                     systematic,
+                    model_outputs,
                 )?;
                 leading_values.insert(attr, value);
             }
@@ -1159,10 +1337,19 @@ fn eval_object_numeric_expr(
     expr: &Expr,
     item: &ObjectView<'_>,
     systematic: Systematic,
+    model_outputs: &ModelOutputs,
 ) -> Result<NumericValue> {
     match expr {
         Expr::Attr { object, attr } if object == current_object => {
-            read_object_attr(program, current_object, source, item, attr, systematic)
+            read_object_attr(
+                program,
+                current_object,
+                source,
+                item,
+                attr,
+                systematic,
+                model_outputs,
+            )
         }
         Expr::Attr { object, .. } => Err(InterpretError::Unsupported(format!(
             "object `{current_object}` cut references `{object}`; this slice only supports cuts on the object being selected"
@@ -1170,10 +1357,26 @@ fn eval_object_numeric_expr(
         Expr::Literal(value) => Ok(NumericValue::F64(*value)),
         Expr::Binary { op, lhs, rhs } => {
             let lhs =
-                eval_object_numeric_expr(program, current_object, source, lhs, item, systematic)?
+                eval_object_numeric_expr(
+                    program,
+                    current_object,
+                    source,
+                    lhs,
+                    item,
+                    systematic,
+                    model_outputs,
+                )?
                     .as_f64();
             let rhs =
-                eval_object_numeric_expr(program, current_object, source, rhs, item, systematic)?
+                eval_object_numeric_expr(
+                    program,
+                    current_object,
+                    source,
+                    rhs,
+                    item,
+                    systematic,
+                    model_outputs,
+                )?
                     .as_f64();
             Ok(NumericValue::F64(eval_arithmetic(*op, lhs, rhs)))
         }
@@ -1184,10 +1387,19 @@ fn eval_object_numeric_expr(
             inner,
             item,
             systematic,
+            model_outputs,
         )?
         .abs()),
         Expr::Sqrt(inner) => Ok(NumericValue::F64(
-            eval_object_numeric_expr(program, current_object, source, inner, item, systematic)?
+            eval_object_numeric_expr(
+                program,
+                current_object,
+                source,
+                inner,
+                item,
+                systematic,
+                model_outputs,
+            )?
                 .as_f64()
                 .sqrt(),
         )),
@@ -1204,8 +1416,21 @@ fn read_object_attr(
     item: &ObjectView<'_>,
     attr: &str,
     systematic: Systematic,
+    model_outputs: &ModelOutputs,
 ) -> Result<NumericValue> {
     let branch = format!("{source}_{attr}");
+    if let Some(values) = model_outputs.get(&branch) {
+        return values
+            .get(item.index())
+            .copied()
+            .map(|value| NumericValue::F64(f64::from(value)))
+            .ok_or_else(|| {
+                InterpretError::InvalidExpression(format!(
+                    "model output `{branch}` has no value for source index {}",
+                    item.index()
+                ))
+            });
+    }
     let branch_type = program
         .read_branches
         .iter()
@@ -1814,6 +2039,50 @@ range = [0.0, 100.0]
         assert_eq!(
             interpret_and_fill(&plan, &event, &mut histograms).expect("interpret and fill"),
             None
+        );
+    }
+
+    #[test]
+    fn interpret_rejects_non_mock_model_provider() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "remote_model"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = ["pt > 30 GeV"]
+
+[[model]]
+name = "muon_tagger"
+inputs = ["Muon_pt", "Muon_eta", "Muon_phi"]
+output = "Muon_topscore"
+batch = "Muon"
+
+[model.provider]
+kind = "remote"
+endpoint = "http://127.0.0.1:8000"
+
+[regions.signal]
+require = ["count(good_muon) >= 1"]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"
+"#,
+        )
+        .expect("parse remote model spec");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+        let plan = validate(&spec, &catalogue).expect("validate remote model spec");
+
+        assert_eq!(
+            interpret(&plan, &two_muon_event()).expect_err("remote provider should stay deferred"),
+            InterpretError::Unsupported(
+                "model `muon_tagger` provider `remote` is unsupported in interpreter; only mock provider is interpreted"
+                    .to_string()
+            )
         );
     }
 
