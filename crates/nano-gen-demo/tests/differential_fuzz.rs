@@ -721,6 +721,7 @@ fn channel_as_spec(channel: &ChannelDef, parent: &AnalysisSpec) -> AnalysisSpec 
         weight: parent.weight.clone(),
         systematics: parent.systematics.clone(),
         shape_corrections: parent.shape_corrections.clone(),
+        scale_factor_corrections: parent.scale_factor_corrections.clone(),
         channels: Vec::new(),
     }
 }

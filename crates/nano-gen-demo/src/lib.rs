@@ -132,6 +132,19 @@ pub mod muon_hist_shape_correction {
     dead_code,
     non_snake_case,
     unused_parens,
+    clippy::collapsible_if,
+    clippy::double_parens,
+    clippy::neg_cmp_op_on_partial_ord,
+    clippy::unnecessary_cast
+)]
+pub mod muon_sf {
+    include!(concat!(env!("OUT_DIR"), "/generated_muon_sf.rs"));
+}
+
+#[allow(
+    dead_code,
+    non_snake_case,
+    unused_parens,
     clippy::approx_constant,
     clippy::collapsible_if,
     clippy::double_parens,

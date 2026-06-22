@@ -1,0 +1,32 @@
+[analysis]
+name = "muon_sf_demo"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = ["pt > 30 GeV", "abs(eta) < 2.4"]
+
+[regions.signal]
+require = ["count(good_muon) >= 1"]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"
+
+[[histogram]]
+name = "n_good_muon_hist"
+expr = "count(good_muon)"
+bins = 5
+range = [0.0, 5.0]
+
+[[correction]]
+name = "muon_sf"
+kind = "scale_factor"
+file = "../nano-spec/tests/data/muon_sf.json"
+correction = "synthetic_muon_sf"
+collection = "good_muon"
+inputs = [
+  { name = "eta", from = "eta" },
+  { name = "pt", from = "pt" },
+]
+systematic = { name = "scale_factors", nominal = "nominal", up = "systup", down = "systdown" }

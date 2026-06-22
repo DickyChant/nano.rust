@@ -826,7 +826,17 @@ fn rvalue_name(expr: &kir::Rvalue) -> String {
         kir::Rvalue::Output { expr, ty } => format!("output:{expr}:{ty:?}"),
         kir::Rvalue::Histogram { histogram } => format!("histogram:{}", histogram.name),
         kir::Rvalue::HistogramValue { expr, ty } => format!("histogram_value:{expr}:{ty:?}"),
-        kir::Rvalue::Weight { systematic } => format!("weight:{}", systematic.0),
+        kir::Rvalue::ScaleFactor { systematic } => format!("scale_factor:{}", systematic.0),
+        kir::Rvalue::Weight {
+            systematic,
+            scale_factor,
+        } => format!(
+            "weight:{}:{}",
+            systematic.0,
+            scale_factor
+                .map(|value| value.0.to_string())
+                .unwrap_or_default()
+        ),
     }
 }
 

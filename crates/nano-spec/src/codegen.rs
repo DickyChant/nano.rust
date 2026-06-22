@@ -15,7 +15,7 @@ use crate::kir::{ForEachAxis, KirProgram, Rvalue, Stmt, ValueId};
 use crate::{
     AnalysisSpec, ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef,
     ModelProviderKind, ObjectCandidateDef, ObjectDef, ObjectPairDef, PairConstraint, PairSelection,
-    ResolvedPlan,
+    ResolvedPlan, ScaleFactorInputSource, ScaleFactorLiteral,
 };
 
 /// Generate compilable Rust producer source from a validated plan.
@@ -256,6 +256,7 @@ impl<'a> Generator<'a> {
         .unwrap();
         self.emit_region_markers(&mut source)?;
         self.emit_systematic_axis(&mut source)?;
+        self.emit_correction_error_mapper(&mut source)?;
         writeln!(source).unwrap();
         writeln!(source, "#[derive(Debug, Clone, Copy, PartialEq)]").unwrap();
         writeln!(source, "pub struct GenRow {{").unwrap();
@@ -385,7 +386,7 @@ impl<'a> Generator<'a> {
                     Rvalue::HistogramValue { expr, .. } => {
                         histogram_values.insert(value.id, expr.clone());
                     }
-                    Rvalue::Weight { .. } => {}
+                    Rvalue::ScaleFactor { .. } | Rvalue::Weight { .. } => {}
                     other => {
                         return Err(CodegenError::UnsupportedFeature(format!(
                             "KIR rvalue `{other:?}` is not supported by string codegen"
@@ -834,6 +835,19 @@ impl<'a> Generator<'a> {
             )?);
         }
 
+        for correction in self.spec().scale_factor_systematics() {
+            systematics.push(generated_systematic_variation(
+                &correction.name,
+                "Up",
+                GeneratedSystematicSource::WeightUp,
+            )?);
+            systematics.push(generated_systematic_variation(
+                &correction.name,
+                "Down",
+                GeneratedSystematicSource::WeightDown,
+            )?);
+        }
+
         for correction in self.spec().shape_corrections() {
             systematics.push(generated_systematic_variation(
                 &correction.name,
@@ -1137,6 +1151,25 @@ impl<'a> Generator<'a> {
         Ok(())
     }
 
+    fn emit_correction_error_mapper(&self, source: &mut String) -> Result<(), CodegenError> {
+        if self.spec().scale_factor_corrections.is_empty() {
+            return Ok(());
+        }
+        writeln!(source).unwrap();
+        writeln!(
+            source,
+            "fn gen_correction_error(error: impl std::fmt::Display) -> nano_core::NanoError {{"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    nano_core::NanoError::MissingAttachment {{ name: error.to_string() }}"
+        )
+        .unwrap();
+        writeln!(source, "}}").unwrap();
+        Ok(())
+    }
+
     fn emit_systematic_for_each(
         &self,
         source: &mut String,
@@ -1171,6 +1204,7 @@ impl<'a> Generator<'a> {
                     Rvalue::Weight { .. } => {
                         weight_values.insert(value.id);
                     }
+                    Rvalue::ScaleFactor { .. } => {}
                     other => {
                         return Err(CodegenError::UnsupportedFeature(format!(
                             "KIR systematic loop rvalue `{other:?}` is not supported by string codegen"
@@ -1181,7 +1215,7 @@ impl<'a> Generator<'a> {
         }
 
         writeln!(source, "        if let Some(histograms) = histograms {{").unwrap();
-        self.emit_weight_visitor(source)?;
+        self.emit_weight_visitor(source, Some("gen_correction_error"))?;
         writeln!(
             source,
             "            for systematic in [{}] {{",
@@ -1196,11 +1230,16 @@ impl<'a> Generator<'a> {
                 } => {
                     writeln!(
                         source,
-                        "                let weight_{} = systematic.visit(GenWeightVisitor);",
-                        value.id.0
+                        "                let weight_{} = systematic.visit({});",
+                        value.id.0,
+                        self.weight_visitor_expr()?
                     )
                     .unwrap();
                 }
+                Stmt::Let {
+                    expr: Rvalue::ScaleFactor { .. },
+                    ..
+                } => {}
                 Stmt::Let { .. } => {}
                 Stmt::Fill {
                     histogram,
@@ -1358,10 +1397,11 @@ impl<'a> Generator<'a> {
         let region_type = region_type_ident(&region.name)?;
         writeln!(source, "        if let Some(histograms) = histograms {{").unwrap();
         if self.spec().has_shape_correction() {
-            self.emit_weight_visitor(source)?;
+            self.emit_weight_visitor(source, Some("gen_core_error"))?;
             writeln!(
                 source,
-                "            let weight = systematic.visit(GenWeightVisitor);"
+                "            let weight = systematic.visit({});",
+                self.weight_visitor_expr()?
             )
             .unwrap();
             writeln!(source, "            match systematic {{").unwrap();
@@ -1402,7 +1442,7 @@ impl<'a> Generator<'a> {
             }
             writeln!(source, "            }}").unwrap();
         } else if self.spec().has_weight_systematic() {
-            self.emit_weight_visitor(source)?;
+            self.emit_weight_visitor(source, Some("gen_core_error"))?;
             writeln!(
                 source,
                 "            for systematic in [{}] {{",
@@ -1411,7 +1451,8 @@ impl<'a> Generator<'a> {
             .unwrap();
             writeln!(
                 source,
-                "                let weight = systematic.visit(GenWeightVisitor);"
+                "                let weight = systematic.visit({});",
+                self.weight_visitor_expr()?
             )
             .unwrap();
             writeln!(source, "                match systematic {{").unwrap();
@@ -1476,18 +1517,37 @@ impl<'a> Generator<'a> {
     }
 
     fn emit_weight_match(&self, source: &mut String) -> Result<(), CodegenError> {
-        self.emit_weight_visitor(source)?;
+        self.emit_weight_visitor(source, Some("gen_correction_error"))?;
         writeln!(
             source,
-            "            let weight = systematic.visit(GenWeightVisitor);"
+            "            let weight = systematic.visit({});",
+            self.weight_visitor_expr()?
         )
         .unwrap();
         Ok(())
     }
 
-    fn emit_weight_visitor(&self, source: &mut String) -> Result<(), CodegenError> {
+    fn emit_weight_visitor(
+        &self,
+        source: &mut String,
+        error_mapper: Option<&str>,
+    ) -> Result<(), CodegenError> {
+        self.emit_scale_factor_weight_bindings(source, error_mapper)?;
         let weight_exprs = self.weight_exprs_by_systematic()?;
-        writeln!(source, "            struct GenWeightVisitor;").unwrap();
+        if self.spec().scale_factor_corrections.is_empty() {
+            writeln!(source, "            struct GenWeightVisitor;").unwrap();
+        } else {
+            writeln!(source, "            struct GenWeightVisitor {{").unwrap();
+            for systematic in self.generated_systematics()? {
+                writeln!(
+                    source,
+                    "                {}: f64,",
+                    scale_factor_weight_ident(&systematic.method)?
+                )
+                .unwrap();
+            }
+            writeln!(source, "            }}").unwrap();
+        }
         writeln!(
             source,
             "            impl SystematicVisitor for GenWeightVisitor {{"
@@ -1500,18 +1560,239 @@ impl<'a> Generator<'a> {
         .unwrap();
         for systematic in self.generated_systematics()? {
             let method = systematic.method;
+            let mut expr = weight_exprs
+                .get(&method)
+                .expect("generated systematic weight expression exists")
+                .clone();
+            if !self.spec().scale_factor_corrections.is_empty() {
+                let factor = scale_factor_weight_ident(&method)?;
+                expr = expr.replace(&factor, &format!("self.{factor}"));
+            }
             writeln!(
                 source,
                 "                fn {}(self) -> Self::Output {{ {} }}",
-                method,
-                weight_exprs
-                    .get(&method)
-                    .expect("generated systematic weight expression exists")
+                method, expr
             )
             .unwrap();
         }
         writeln!(source, "            }}").unwrap();
         Ok(())
+    }
+
+    fn weight_visitor_expr(&self) -> Result<String, CodegenError> {
+        if self.spec().scale_factor_corrections.is_empty() {
+            return Ok("GenWeightVisitor".to_string());
+        }
+        let fields = self
+            .generated_systematics()?
+            .into_iter()
+            .map(|systematic| {
+                let ident = scale_factor_weight_ident(&systematic.method)?;
+                Ok(format!("{ident},"))
+            })
+            .collect::<Result<Vec<_>, CodegenError>>()?
+            .join(" ");
+        Ok(format!("GenWeightVisitor {{ {fields} }}"))
+    }
+
+    fn emit_scale_factor_weight_bindings(
+        &self,
+        source: &mut String,
+        error_mapper: Option<&str>,
+    ) -> Result<(), CodegenError> {
+        if self.spec().scale_factor_corrections.is_empty() {
+            return Ok(());
+        }
+        let mapper = error_mapper.unwrap_or("gen_correction_error");
+        for systematic in self.generated_systematics()? {
+            let factor_ident = scale_factor_weight_ident(&systematic.method)?;
+            writeln!(source, "            let mut {factor_ident} = 1.0_f64;").unwrap();
+            for correction in &self.spec().scale_factor_corrections {
+                self.emit_one_scale_factor_weight_binding(
+                    source,
+                    correction,
+                    &systematic,
+                    &factor_ident,
+                    mapper,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_one_scale_factor_weight_binding(
+        &self,
+        source: &mut String,
+        correction: &crate::ScaleFactorCorrectionDef,
+        systematic: &GeneratedSystematic,
+        factor_ident: &str,
+        mapper: &str,
+    ) -> Result<(), CodegenError> {
+        let prefix = checked_ident(&correction.name, "scale-factor correction")?;
+        let selected = selected_objects_ident(&correction.collection)?;
+        let set_ident = format!("{prefix}_set_{}", systematic.method);
+        let correction_ident = format!("{prefix}_correction_{}", systematic.method);
+        let values_ident = format!("{prefix}_values_{}", systematic.method);
+        let item_ident = format!("{prefix}_item_{}", systematic.method);
+        let payload = self.scale_factor_payload(correction)?;
+        writeln!(
+            source,
+            "            let {set_ident} = nano_corrections::CorrectionSet::from_path({}).map_err({mapper})?;",
+            rust_string(&correction.file)
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "            let {correction_ident} = {set_ident}.correction({}).map_err({mapper})?;",
+            rust_string(&correction.correction)
+        )
+        .unwrap();
+        writeln!(source, "            for {item_ident} in &{selected} {{").unwrap();
+        writeln!(source, "                let {values_ident} = vec![").unwrap();
+        for payload_input in &payload.inputs {
+            let value_expr = self.scale_factor_value_expr(
+                correction,
+                payload_input,
+                systematic,
+                &item_ident,
+                mapper,
+            )?;
+            writeln!(source, "                    {value_expr},").unwrap();
+        }
+        writeln!(source, "                ];").unwrap();
+        writeln!(
+            source,
+            "                {factor_ident} *= {correction_ident}.evaluate(&{values_ident}).map_err({mapper})?;"
+        )
+        .unwrap();
+        writeln!(source, "            }}").unwrap();
+        Ok(())
+    }
+
+    fn scale_factor_payload(
+        &self,
+        correction: &crate::ScaleFactorCorrectionDef,
+    ) -> Result<nano_corrections::Correction, CodegenError> {
+        let set =
+            nano_corrections::CorrectionSet::from_path(&correction.file).map_err(|error| {
+                CodegenError::UnsupportedFeature(format!(
+                    "scale-factor correction `{}` failed to load `{}`: {error}",
+                    correction.name, correction.file
+                ))
+            })?;
+        set.correction(&correction.correction)
+            .cloned()
+            .map_err(|error| {
+                CodegenError::UnsupportedFeature(format!(
+                    "scale-factor correction `{}` payload lookup failed: {error}",
+                    correction.name
+                ))
+            })
+    }
+
+    fn scale_factor_value_expr(
+        &self,
+        correction: &crate::ScaleFactorCorrectionDef,
+        payload_input: &nano_corrections::Variable,
+        systematic: &GeneratedSystematic,
+        item_ident: &str,
+        mapper: &str,
+    ) -> Result<String, CodegenError> {
+        if let Some(declared) = &correction.systematic {
+            if declared.name == payload_input.name {
+                let value = if systematic.variant
+                    == generated_systematic_variation(
+                        &correction.name,
+                        "Up",
+                        GeneratedSystematicSource::WeightUp,
+                    )?
+                    .variant
+                {
+                    &declared.up
+                } else if systematic.variant
+                    == generated_systematic_variation(
+                        &correction.name,
+                        "Down",
+                        GeneratedSystematicSource::WeightDown,
+                    )?
+                    .variant
+                {
+                    &declared.down
+                } else {
+                    &declared.nominal
+                };
+                return Ok(format!(
+                    "nano_corrections::Value::Str({}.to_string())",
+                    rust_string(value)
+                ));
+            }
+        }
+
+        let input = correction
+            .inputs
+            .iter()
+            .find(|input| input.name == payload_input.name)
+            .ok_or_else(|| {
+                CodegenError::UnsupportedFeature(format!(
+                    "scale-factor correction `{}` is missing input `{}`",
+                    correction.name, payload_input.name
+                ))
+            })?;
+        match &input.source {
+            ScaleFactorInputSource::Literal(value) => Ok(scale_factor_literal_expr(value)),
+            ScaleFactorInputSource::From(source) => {
+                let object = self.object(&correction.collection)?;
+                let object_branch = format!("{}_{}", object.source, source);
+                if self.plan.read_branches.find(&object_branch).is_some() {
+                    let field = checked_ident(source, "scale-factor selected attribute")?;
+                    return Ok(match payload_input.kind {
+                        nano_corrections::InputType::Real => {
+                            format!(
+                                "nano_corrections::Value::Real(f64::from({item_ident}.{field}))"
+                            )
+                        }
+                        nano_corrections::InputType::Int => {
+                            format!("nano_corrections::Value::Int(i64::from({item_ident}.{field}))")
+                        }
+                        nano_corrections::InputType::String => {
+                            return Err(CodegenError::UnsupportedFeature(format!(
+                                "scale-factor correction `{}` input `{}` cannot read string object attributes",
+                                correction.name, input.name
+                            )));
+                        }
+                    });
+                }
+                let branch_type = self.branch_type(source)?;
+                let rust_type = scalar_rust_type(branch_type).ok_or_else(|| {
+                    CodegenError::UnsupportedFeature(format!(
+                        "scale-factor correction `{}` input `{}` branch `{source}` has unsupported type {branch_type:?}",
+                        correction.name, input.name
+                    ))
+                })?;
+                let scalar = if mapper == "gen_core_error" {
+                    format!(
+                        "event.scalar::<{rust_type}>({}).map_err({mapper})?",
+                        rust_string(source)
+                    )
+                } else {
+                    format!("event.scalar::<{rust_type}>({})?", rust_string(source))
+                };
+                Ok(match payload_input.kind {
+                    nano_corrections::InputType::Real => {
+                        format!("nano_corrections::Value::Real(f64::from({scalar}))")
+                    }
+                    nano_corrections::InputType::Int => {
+                        format!("nano_corrections::Value::Int(i64::from({scalar}))")
+                    }
+                    nano_corrections::InputType::String => {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "scale-factor correction `{}` input `{}` cannot read string event branches",
+                            correction.name, input.name
+                        )));
+                    }
+                })
+            }
+        }
     }
 
     fn emit_shape_factor_bindings(&self, source: &mut String) -> Result<(), CodegenError> {
@@ -1574,7 +1855,7 @@ impl<'a> Generator<'a> {
         let weight_systematic = self.spec().weight_systematic();
         let mut weights = BTreeMap::new();
         for systematic in self.generated_systematics()? {
-            let expr = match (systematic.source, weight_systematic) {
+            let mut expr = match (systematic.source, weight_systematic) {
                 (GeneratedSystematicSource::WeightUp, Some(weight)) => {
                     format!("{nominal}.times({})", f64_literal(weight.up))
                 }
@@ -1583,6 +1864,12 @@ impl<'a> Generator<'a> {
                 }
                 _ => nominal.clone(),
             };
+            if !self.spec().scale_factor_corrections.is_empty() {
+                expr = format!(
+                    "{expr}.times({})",
+                    scale_factor_weight_ident(&systematic.method)?
+                );
+            }
             weights.insert(systematic.method, expr);
         }
         Ok(weights)
@@ -1925,6 +2212,19 @@ impl<'a> Generator<'a> {
         }
         for output in &self.spec().outputs {
             collect_selected_attr_names(&output.expr, object_name, &mut attrs)?;
+        }
+        let object = self.object(object_name)?;
+        for correction in &self.spec().scale_factor_corrections {
+            if correction.collection == object_name {
+                for input in &correction.inputs {
+                    if let ScaleFactorInputSource::From(source) = &input.source {
+                        let branch = format!("{}_{}", object.source, source);
+                        if self.plan.read_branches.find(&branch).is_some() {
+                            attrs.insert(source.clone());
+                        }
+                    }
+                }
+            }
         }
         for derived in &self.spec().derived_objects {
             match &derived.source {
@@ -3889,6 +4189,13 @@ fn shape_factor_ident(object_name: &str, attr: &str) -> Result<String, CodegenEr
     ))
 }
 
+fn scale_factor_weight_ident(method: &str) -> Result<String, CodegenError> {
+    Ok(format!(
+        "gen_scale_factor_weight_{}",
+        checked_ident(method, "scale-factor systematic method")?
+    ))
+}
+
 fn derived_type_ident(object_name: &str) -> Result<String, CodegenError> {
     Ok(format!(
         "{}Derived",
@@ -4075,6 +4382,35 @@ fn f32_literal(value: f64) -> String {
 
 fn f64_literal(value: f64) -> String {
     format!("{value:?}_f64")
+}
+
+fn scale_factor_literal_expr(value: &ScaleFactorLiteral) -> String {
+    match value {
+        ScaleFactorLiteral::Real(value) => {
+            format!("nano_corrections::Value::Real({})", f64_literal(*value))
+        }
+        ScaleFactorLiteral::Int(value) => format!("nano_corrections::Value::Int({value}_i64)"),
+        ScaleFactorLiteral::Str(value) => {
+            format!(
+                "nano_corrections::Value::Str({}.to_string())",
+                rust_string(value)
+            )
+        }
+    }
+}
+
+fn scalar_rust_type(branch_type: BranchType) -> Option<&'static str> {
+    match branch_type {
+        BranchType::I8 => Some("i8"),
+        BranchType::U8 => Some("u8"),
+        BranchType::I16 => Some("i16"),
+        BranchType::U16 => Some("u16"),
+        BranchType::I32 => Some("i32"),
+        BranchType::U32 => Some("u32"),
+        BranchType::I64 => Some("i64"),
+        BranchType::F32 => Some("f32"),
+        _ => None,
+    }
 }
 
 fn checked_count_rhs(value: f64, context: &str) -> Result<u32, CodegenError> {

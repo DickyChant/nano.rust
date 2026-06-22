@@ -1,0 +1,97 @@
+{
+  "schema_version": 2,
+  "corrections": [
+    {
+      "name": "synthetic_muon_sf",
+      "description": "Synthetic muon SF for nano-spec tests",
+      "version": 1,
+      "inputs": [
+        { "name": "eta", "type": "real" },
+        { "name": "pt", "type": "real" },
+        { "name": "scale_factors", "type": "string" }
+      ],
+      "output": { "name": "weight", "type": "real" },
+      "data": {
+        "nodetype": "category",
+        "input": "scale_factors",
+        "content": [
+          {
+            "key": "nominal",
+            "value": {
+              "nodetype": "binning",
+              "input": "eta",
+              "edges": [-2.5, 0.0, 2.5],
+              "flow": "clamp",
+              "content": [
+                {
+                  "nodetype": "binning",
+                  "input": "pt",
+                  "edges": [0.0, 40.0, 1000.0],
+                  "flow": "clamp",
+                  "content": [0.94, 0.97]
+                },
+                {
+                  "nodetype": "binning",
+                  "input": "pt",
+                  "edges": [0.0, 40.0, 1000.0],
+                  "flow": "clamp",
+                  "content": [1.05, 1.08]
+                }
+              ]
+            }
+          },
+          {
+            "key": "systup",
+            "value": {
+              "nodetype": "binning",
+              "input": "eta",
+              "edges": [-2.5, 0.0, 2.5],
+              "flow": "clamp",
+              "content": [
+                {
+                  "nodetype": "binning",
+                  "input": "pt",
+                  "edges": [0.0, 40.0, 1000.0],
+                  "flow": "clamp",
+                  "content": [1.04, 1.07]
+                },
+                {
+                  "nodetype": "binning",
+                  "input": "pt",
+                  "edges": [0.0, 40.0, 1000.0],
+                  "flow": "clamp",
+                  "content": [1.15, 1.18]
+                }
+              ]
+            }
+          },
+          {
+            "key": "systdown",
+            "value": {
+              "nodetype": "binning",
+              "input": "eta",
+              "edges": [-2.5, 0.0, 2.5],
+              "flow": "clamp",
+              "content": [
+                {
+                  "nodetype": "binning",
+                  "input": "pt",
+                  "edges": [0.0, 40.0, 1000.0],
+                  "flow": "clamp",
+                  "content": [0.84, 0.87]
+                },
+                {
+                  "nodetype": "binning",
+                  "input": "pt",
+                  "edges": [0.0, 40.0, 1000.0],
+                  "flow": "clamp",
+                  "content": [0.95, 0.98]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

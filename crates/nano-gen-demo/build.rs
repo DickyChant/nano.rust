@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "muon_hist_shape_correction.toml",
             "generated_muon_hist_shape_correction.rs",
         ),
+        ("muon_sf.toml", "generated_muon_sf.rs"),
     ] {
         let spec_path = repo_root.join("crates/nano-spec/examples").join(spec_file);
         println!("cargo:rerun-if-changed={}", spec_path.display());

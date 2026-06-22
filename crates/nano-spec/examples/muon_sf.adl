@@ -1,0 +1,21 @@
+analysis muon_sf_demo year Run2018;
+
+weight nominal;
+correction muon_sf kind scale_factor file ../nano-spec/tests/data/muon_sf.json correction synthetic_muon_sf collection good_muon input eta from eta input pt from pt systematic scale_factors nominal nominal up systup down systdown;
+
+object good_muon : Muon {
+  pt > 30 GeV;
+  abs(eta) < 2.4;
+}
+
+region signal {
+  count(good_muon) >= 1;
+}
+
+output n_good_muon = count(good_muon);
+
+histogram n_good_muon_hist {
+  expr = count(good_muon);
+  bins = 5;
+  range = [0, 5];
+}

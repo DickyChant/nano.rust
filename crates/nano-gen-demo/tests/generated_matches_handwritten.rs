@@ -2,7 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use nano_analysis::Hist1D;
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
+use nano_corrections::{CorrectionSet, Value as CorrectionValue};
 use nano_gen_demo::GeneratedProducer;
 use nano_io::writer::{write_events, OutputBranch};
 use nano_producers::{MuonProducer, MuonSkimRow};
@@ -19,6 +21,7 @@ use nano_gen_demo::muon_hist_nominal::Systematic as MuonHistNominalSystematic;
 use nano_gen_demo::muon_hist_shape_correction::Systematic as ShapeSystematic;
 use nano_gen_demo::muon_hist_shape_nominal::Systematic as ShapeNominalSystematic;
 use nano_gen_demo::muon_hist_weight_systematic::Systematic as WeightSystematic;
+use nano_gen_demo::muon_sf::Systematic as SfSystematic;
 
 const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 const SELECTION_ALL_SPEC: &str = include_str!("../../nano-spec/examples/selection_all.toml");
@@ -30,6 +33,7 @@ const MUON_HIST_SHAPE_NOMINAL_SPEC: &str =
     include_str!("../../nano-spec/examples/muon_hist_shape_nominal.toml");
 const MUON_HIST_SHAPE_CORRECTION_SPEC: &str =
     include_str!("../../nano-spec/examples/muon_hist_shape_correction.toml");
+const MUON_SF_SPEC: &str = include_str!("../../nano-spec/examples/muon_sf.toml");
 
 #[test]
 fn generated_muon_producer_matches_handwritten_producer_on_synthetic_events() {
@@ -330,6 +334,100 @@ fn shape_correction_recomputes_rows_and_histograms_per_variation() {
 }
 
 #[test]
+fn scale_factor_weight_uses_correctionlib_in_generated_and_interpreter() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let nominal_spec = AnalysisSpec::from_toml_str(MUON_HIST_NOMINAL_SPEC).unwrap();
+    let sf_spec = AnalysisSpec::from_toml_str(MUON_SF_SPEC).unwrap();
+    let nominal_plan = validate(&nominal_spec, &catalogue).unwrap();
+    let sf_plan = validate(&sf_spec, &catalogue).unwrap();
+
+    let mut generated_nominal = nano_gen_demo::muon_hist_nominal::GenHistograms::new();
+    let mut generated_sf = nano_gen_demo::muon_sf::GenHistograms::new();
+    let mut interpreted_sf = InterpretedHistograms::new(&sf_plan);
+    let mut reference_nominal = Hist1D::new(5, 0.0, 5.0);
+    let mut reference_up = Hist1D::new(5, 0.0, 5.0);
+    let mut reference_down = Hist1D::new(5, 0.0, 5.0);
+
+    for entry in 0..5 {
+        let event = synthetic_event(entry);
+        let nominal_row = nano_gen_demo::muon_hist_nominal::GeneratedProducer::analyze_and_fill(
+            &event,
+            &mut generated_nominal,
+            MuonHistNominalSystematic::Nominal,
+        )
+        .unwrap()
+        .map(|row| row.n_good_muon);
+        let sf_row = nano_gen_demo::muon_sf::GeneratedProducer::analyze_and_fill(
+            &event,
+            &mut generated_sf,
+            SfSystematic::Nominal,
+        )
+        .unwrap()
+        .map(|row| row.n_good_muon);
+        let interpreted_row = interpret_and_fill(&sf_plan, &event, &mut interpreted_sf)
+            .unwrap()
+            .map(|row| match row.get("n_good_muon").unwrap() {
+                Value::U32(value) => value,
+                value => panic!("unexpected interpreted value {value:?}"),
+            });
+        let nominal_interpreted = interpret(&nominal_plan, &event).unwrap().map(|row| {
+            match row.get("n_good_muon").unwrap() {
+                Value::U32(value) => value,
+                value => panic!("unexpected interpreted value {value:?}"),
+            }
+        });
+
+        assert_eq!(nominal_row, sf_row, "entry {entry}");
+        assert_eq!(sf_row, interpreted_row, "entry {entry}");
+        assert_eq!(nominal_row, nominal_interpreted, "entry {entry}");
+
+        if let Some(count) = sf_row {
+            let value = f64::from(count);
+            reference_nominal.fill_weighted(value, reference_sf_weight(&event, "nominal"));
+            reference_up.fill_weighted(value, reference_sf_weight(&event, "systup"));
+            reference_down.fill_weighted(value, reference_sf_weight(&event, "systdown"));
+        }
+    }
+
+    let interpreted = interpreted_sf
+        .get("n_good_muon_hist")
+        .expect("interpreted histogram");
+    let generated = &generated_sf.n_good_muon_hist;
+    for systematic in [
+        SfSystematic::Nominal,
+        SfSystematic::MuonSfUp,
+        SfSystematic::MuonSfDown,
+    ] {
+        let interpreted_key = format!("{systematic:?}");
+        assert_eq!(
+            generated.get(systematic),
+            interpreted.get(interpreted_key),
+            "{systematic:?}"
+        );
+    }
+
+    assert_ne!(
+        generated.get(SfSystematic::Nominal),
+        &generated_nominal.n_good_muon_hist,
+        "SF nominal should change the event weight"
+    );
+    assert_ne!(
+        generated.get(SfSystematic::MuonSfUp),
+        generated.get(SfSystematic::Nominal),
+        "SF up variation should differ from nominal"
+    );
+    assert_ne!(
+        generated.get(SfSystematic::MuonSfDown),
+        generated.get(SfSystematic::Nominal),
+        "SF down variation should differ from nominal"
+    );
+    assert_eq!(generated.get(SfSystematic::Nominal), &reference_nominal);
+    assert_eq!(generated.get(SfSystematic::MuonSfUp), &reference_up);
+    assert_eq!(generated.get(SfSystematic::MuonSfDown), &reference_down);
+    assert_eq!(generated_nominal.n_good_muon_hist.sumw(), 3.0);
+}
+
+#[test]
 fn workflow_executes_generated_muon_kernel_like_handwritten_kernel() {
     let fixture = Fixture::new("generated-workflow");
     let input = fixture.path("input.root");
@@ -408,6 +506,27 @@ fn generated_muon_as_skim(event: &Event) -> nano_core::Result<Option<MuonSkimRow
 
 fn synthetic_event(entry: usize) -> Event {
     Event::from_columns(schema(), columns(), entry).unwrap()
+}
+
+fn reference_sf_weight(event: &Event, systematic: &str) -> f64 {
+    let payload = CorrectionSet::from_path("../nano-spec/tests/data/muon_sf.json").unwrap();
+    let correction = payload.correction("synthetic_muon_sf").unwrap();
+    let collection = event.collection("Muon").unwrap();
+    let mut weight = 1.0_f64;
+    for muon in collection.iter() {
+        let pt = muon.get::<f32>("pt").unwrap();
+        let eta = muon.get::<f32>("eta").unwrap();
+        if pt > 30.0 && eta.abs() < 2.4 {
+            weight *= correction
+                .evaluate(&[
+                    CorrectionValue::Real(f64::from(eta)),
+                    CorrectionValue::Real(f64::from(pt)),
+                    CorrectionValue::Str(systematic.to_string()),
+                ])
+                .unwrap();
+        }
+    }
+    weight
 }
 
 fn schema() -> BranchSchema {

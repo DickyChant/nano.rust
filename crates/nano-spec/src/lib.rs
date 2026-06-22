@@ -33,6 +33,7 @@ pub struct AnalysisSpec {
     pub weight: WeightDef,
     pub systematics: Vec<SystematicDef>,
     pub shape_corrections: Vec<ShapeCorrectionDef>,
+    pub scale_factor_corrections: Vec<ScaleFactorCorrectionDef>,
     pub channels: Vec<ChannelDef>,
 }
 
@@ -78,9 +79,16 @@ impl AnalysisSpec {
             })
     }
 
+    /// Scale-factor corrections with nominal/up/down correctionlib variations.
+    pub fn scale_factor_systematics(&self) -> impl Iterator<Item = &ScaleFactorCorrectionDef> {
+        self.scale_factor_corrections
+            .iter()
+            .filter(|correction| correction.systematic.is_some())
+    }
+
     /// Whether histogram fills should fan out over nominal/up/down weights.
     pub fn has_weight_systematic(&self) -> bool {
-        self.weight_systematic().is_some()
+        self.weight_systematic().is_some() || self.scale_factor_systematics().next().is_some()
     }
 
     /// The declared collection-attribute shape corrections.
@@ -445,6 +453,57 @@ pub struct ShapeCorrectionDef {
     pub down: f64,
 }
 
+/// A per-object correctionlib v2 scale-factor weight.
+///
+/// TOML/YAML/JSON surface:
+/// `[[correction]] kind = "scale_factor"` with `name`, `file`, `correction`,
+/// `collection`, `inputs = [{ name, from|value }, ...]`, and optional
+/// `systematic = { name, nominal, up, down }`. `from` is resolved as a selected
+/// object attribute first and then as an event scalar branch; `value` may be a
+/// real, int, or string literal.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ScaleFactorCorrectionDef {
+    pub name: String,
+    pub file: String,
+    pub correction: String,
+    pub collection: String,
+    pub inputs: Vec<ScaleFactorInputDef>,
+    pub systematic: Option<ScaleFactorSystematicDef>,
+}
+
+/// One non-systematic correctionlib input binding.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ScaleFactorInputDef {
+    pub name: String,
+    pub source: ScaleFactorInputSource,
+}
+
+/// Source for a correctionlib input value.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleFactorInputSource {
+    From(String),
+    Literal(ScaleFactorLiteral),
+}
+
+/// Literal correctionlib input value.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ScaleFactorLiteral {
+    Real(f64),
+    Int(i64),
+    Str(String),
+}
+
+/// The categorical/string correctionlib input used for nominal/up/down SFs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ScaleFactorSystematicDef {
+    pub name: String,
+    pub nominal: String,
+    pub up: String,
+    pub down: String,
+}
+
 /// One channel inside a multi-channel union spec.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChannelDef {
@@ -469,6 +528,7 @@ impl ChannelDef {
             weight: parent.weight.clone(),
             systematics: parent.systematics.clone(),
             shape_corrections: parent.shape_corrections.clone(),
+            scale_factor_corrections: parent.scale_factor_corrections.clone(),
             channels: Vec::new(),
         }
     }
@@ -565,11 +625,7 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
     let outputs = output_defs_from_raw(&raw.outputs)?;
     let histograms = histogram_defs_from_raw(&raw.histograms)?;
     let weight = raw.weight.map(weight_def_from_raw).unwrap_or_default();
-    let shape_corrections = raw
-        .corrections
-        .into_iter()
-        .map(shape_correction_def_from_raw)
-        .collect::<Result<Vec<_>, _>>()?;
+    let (shape_corrections, scale_factor_corrections) = correction_defs_from_raw(raw.corrections)?;
     let mut systematics = raw
         .systematics
         .iter()
@@ -584,7 +640,10 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
         let needs_nominal = systematics
             .iter()
             .any(|systematic| matches!(systematic, SystematicDef::Weight(_)))
-            || !shape_corrections.is_empty();
+            || !shape_corrections.is_empty()
+            || scale_factor_corrections
+                .iter()
+                .any(|correction| correction.systematic.is_some());
         if needs_nominal
             && !systematics
                 .iter()
@@ -612,6 +671,7 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
         weight,
         systematics,
         shape_corrections,
+        scale_factor_corrections,
         channels,
     })
 }
@@ -688,6 +748,7 @@ fn validate_flat(
         }
 
         validate_shape_corrections(spec, &mut ctx);
+        validate_scale_factor_corrections(spec, &mut ctx);
 
         for derived in &spec.derived_objects {
             validate_derived_object(derived, &mut ctx);
@@ -1376,6 +1437,204 @@ fn validate_shape_corrections(spec: &AnalysisSpec, ctx: &mut ValidationContext<'
             ctx,
         );
     }
+}
+
+fn validate_scale_factor_corrections(spec: &AnalysisSpec, ctx: &mut ValidationContext<'_>) {
+    for correction in &spec.scale_factor_corrections {
+        let context = format!("scale-factor correction `{}`", correction.name);
+        let Some(source) = ctx.object_sources.get(correction.collection.as_str()) else {
+            ctx.errors.push(SpecError::UndefinedObject {
+                context,
+                object: correction.collection.clone(),
+            });
+            continue;
+        };
+        ctx.required.require_counter(source);
+
+        let set = match nano_corrections::CorrectionSet::from_path(&correction.file) {
+            Ok(set) => set,
+            Err(error) => {
+                ctx.errors.push(SpecError::InvalidExpression {
+                    context: context.clone(),
+                    detail: format!(
+                        "failed to load correctionlib payload `{}`: {error}",
+                        correction.file
+                    ),
+                });
+                continue;
+            }
+        };
+        let payload = match set.correction(&correction.correction) {
+            Ok(payload) => payload,
+            Err(error) => {
+                ctx.errors.push(SpecError::InvalidExpression {
+                    context: context.clone(),
+                    detail: error.to_string(),
+                });
+                continue;
+            }
+        };
+
+        let declared = correction
+            .inputs
+            .iter()
+            .map(|input| input.name.as_str())
+            .chain(
+                correction
+                    .systematic
+                    .iter()
+                    .map(|systematic| systematic.name.as_str()),
+            )
+            .collect::<Vec<_>>();
+        let expected = payload
+            .inputs
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<Vec<_>>();
+        if declared != expected {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.clone(),
+                detail: format!(
+                    "declared inputs [{}] do not match correctionlib inputs [{}]",
+                    declared.join(", "),
+                    expected.join(", ")
+                ),
+            });
+            continue;
+        }
+
+        for input in &correction.inputs {
+            let Some(payload_input) = payload
+                .inputs
+                .iter()
+                .find(|payload_input| payload_input.name == input.name)
+            else {
+                unreachable!("input names were checked above");
+            };
+            validate_scale_factor_input_source(&context, source, input, payload_input.kind, ctx);
+        }
+        if let Some(systematic) = &correction.systematic {
+            let Some(payload_input) = payload
+                .inputs
+                .iter()
+                .find(|payload_input| payload_input.name == systematic.name)
+            else {
+                unreachable!("input names were checked above");
+            };
+            if payload_input.kind != nano_corrections::InputType::String {
+                ctx.errors.push(SpecError::InvalidExpression {
+                    context,
+                    detail: format!(
+                        "systematic input `{}` has correctionlib type {:?}, expected string",
+                        systematic.name, payload_input.kind
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn validate_scale_factor_input_source(
+    context: &str,
+    collection_source: &str,
+    input: &ScaleFactorInputDef,
+    input_type: nano_corrections::InputType,
+    ctx: &mut ValidationContext<'_>,
+) {
+    match &input.source {
+        ScaleFactorInputSource::Literal(value) => {
+            if !literal_matches_input_type(value, input_type) {
+                ctx.errors.push(SpecError::InvalidExpression {
+                    context: context.to_string(),
+                    detail: format!(
+                        "input `{}` literal has wrong type for correctionlib input {:?}",
+                        input.name, input_type
+                    ),
+                });
+            }
+        }
+        ScaleFactorInputSource::From(name) => {
+            let attr_branch = format!("{collection_source}_{name}");
+            if let Some(entry) = ctx.catalogue.branch(&attr_branch) {
+                validate_scale_factor_branch_type(
+                    context,
+                    &attr_branch,
+                    entry.branch_type,
+                    &entry.raw_type,
+                    input_type,
+                    ctx,
+                );
+                ctx.required.require_counter(collection_source);
+                ctx.required.require_attr(collection_source, name);
+                return;
+            }
+
+            let Some(entry) = ctx.catalogue.branch(name) else {
+                ctx.errors.push(SpecError::MissingBranch {
+                    context: context.to_string(),
+                    branch: attr_branch,
+                });
+                return;
+            };
+            validate_scale_factor_branch_type(
+                context,
+                name,
+                entry.branch_type,
+                &entry.raw_type,
+                input_type,
+                ctx,
+            );
+            ctx.required.require_branch(name);
+        }
+    }
+}
+
+fn validate_scale_factor_branch_type(
+    context: &str,
+    branch: &str,
+    branch_type: Option<BranchType>,
+    raw_type: &str,
+    input_type: nano_corrections::InputType,
+    ctx: &mut ValidationContext<'_>,
+) {
+    let Some(branch_type) = branch_type else {
+        ctx.errors.push(SpecError::UnsupportedBranchType {
+            context: context.to_string(),
+            branch: branch.to_string(),
+            raw_type: raw_type.to_string(),
+        });
+        return;
+    };
+    let ok = match input_type {
+        nano_corrections::InputType::Real => is_real_branch(branch_type),
+        nano_corrections::InputType::Int => is_int_branch(branch_type),
+        nano_corrections::InputType::String => false,
+    };
+    if !ok {
+        ctx.errors.push(SpecError::WrongBranchType {
+            context: context.to_string(),
+            branch: branch.to_string(),
+            expected: format!("correctionlib {input_type:?} input branch"),
+            actual: branch_type,
+        });
+    }
+}
+
+fn literal_matches_input_type(
+    value: &ScaleFactorLiteral,
+    input_type: nano_corrections::InputType,
+) -> bool {
+    matches!(
+        (value, input_type),
+        (
+            ScaleFactorLiteral::Real(_),
+            nano_corrections::InputType::Real
+        ) | (ScaleFactorLiteral::Int(_), nano_corrections::InputType::Int)
+            | (
+                ScaleFactorLiteral::Str(_),
+                nano_corrections::InputType::String
+            )
+    )
 }
 
 struct ValidationContext<'a> {
@@ -2486,6 +2745,32 @@ fn is_numeric_branch(branch_type: BranchType) -> bool {
     )
 }
 
+fn is_real_branch(branch_type: BranchType) -> bool {
+    matches!(branch_type, BranchType::F32 | BranchType::VecF32)
+}
+
+fn is_int_branch(branch_type: BranchType) -> bool {
+    matches!(
+        branch_type,
+        BranchType::I8
+            | BranchType::U8
+            | BranchType::I16
+            | BranchType::U16
+            | BranchType::I32
+            | BranchType::U32
+            | BranchType::I64
+            | BranchType::U64
+            | BranchType::VecI8
+            | BranchType::VecU8
+            | BranchType::VecI16
+            | BranchType::VecU16
+            | BranchType::VecI32
+            | BranchType::VecU32
+            | BranchType::VecI64
+            | BranchType::VecU64
+    )
+}
+
 fn parse_catalogue_branch_type(value: &str) -> Option<BranchType> {
     match value {
         "bool" => Some(BranchType::Bool),
@@ -2557,19 +2842,31 @@ fn validate_raw_analysis_spec(raw: &RawAnalysisSpec) -> Result<(), ParseError> {
         ));
     }
 
-    let mut shape_corrections = BTreeSet::new();
+    let mut corrections = BTreeSet::new();
+    let mut shape_correction_count = 0_usize;
+    let mut scale_factor_correction_count = 0_usize;
     for correction in &raw.corrections {
         validate_identifier(&correction.name, "correction name")?;
-        if !shape_corrections.insert(correction.name.as_str()) {
+        if !corrections.insert(correction.name.as_str()) {
             return Err(ParseError::InvalidSpec(format!(
                 "duplicate correction `{}`",
                 correction.name
             )));
         }
+        match correction.kind.as_str() {
+            "scale" => shape_correction_count += 1,
+            "scale_factor" => scale_factor_correction_count += 1,
+            _ => {}
+        }
     }
-    if raw.corrections.len() > 1 {
+    if shape_correction_count > 1 {
         return Err(ParseError::InvalidSpec(
             "this compiler slice supports at most one shape correction".to_string(),
+        ));
+    }
+    if scale_factor_correction_count > 1 {
+        return Err(ParseError::InvalidSpec(
+            "this compiler slice supports at most one scale-factor correction".to_string(),
         ));
     }
 
@@ -3289,9 +3586,38 @@ struct RawCorrection {
     name: String,
     kind: String,
     collection: String,
-    attr: String,
-    up: f64,
-    down: f64,
+    #[serde(default)]
+    attr: Option<String>,
+    #[serde(default)]
+    up: Option<f64>,
+    #[serde(default)]
+    down: Option<f64>,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    correction: Option<String>,
+    #[serde(default)]
+    inputs: Vec<RawScaleFactorInput>,
+    #[serde(default)]
+    systematic: Option<RawScaleFactorSystematic>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawScaleFactorInput {
+    name: String,
+    #[serde(default, rename = "from")]
+    from: Option<String>,
+    #[serde(default)]
+    value: Option<ScaleFactorLiteral>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawScaleFactorSystematic {
+    name: String,
+    #[serde(default = "default_nominal_systematic_value")]
+    nominal: String,
+    up: String,
+    down: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3419,23 +3745,48 @@ fn weight_systematic_def_from_raw(raw: RawSystematic) -> Result<SystematicDef, P
     }))
 }
 
+fn correction_defs_from_raw(
+    raw_corrections: Vec<RawCorrection>,
+) -> Result<(Vec<ShapeCorrectionDef>, Vec<ScaleFactorCorrectionDef>), ParseError> {
+    let mut shape_corrections = Vec::new();
+    let mut scale_factor_corrections = Vec::new();
+    for raw in raw_corrections {
+        match raw.kind.as_str() {
+            "scale" => shape_corrections.push(shape_correction_def_from_raw(raw)?),
+            "scale_factor" => {
+                scale_factor_corrections.push(scale_factor_correction_def_from_raw(raw)?);
+            }
+            other => {
+                return Err(ParseError::InvalidSpec(format!(
+                    "correction `{}` has unsupported kind `{other}`; expected `scale` or `scale_factor`",
+                    raw.name
+                )));
+            }
+        }
+    }
+    Ok((shape_corrections, scale_factor_corrections))
+}
+
 fn shape_correction_def_from_raw(raw: RawCorrection) -> Result<ShapeCorrectionDef, ParseError> {
     validate_identifier(&raw.name, "correction name")?;
     validate_identifier(&raw.collection, "correction collection")?;
-    validate_identifier(&raw.attr, "correction attribute")?;
-    if raw.kind != "scale" {
-        return Err(ParseError::InvalidSpec(format!(
-            "correction `{}` has unsupported kind `{}`; expected `scale`",
-            raw.name, raw.kind
-        )));
-    }
-    if raw.attr != "pt" {
+    let attr = raw.attr.ok_or_else(|| {
+        ParseError::InvalidSpec(format!("shape correction `{}` is missing `attr`", raw.name))
+    })?;
+    let up = raw.up.ok_or_else(|| {
+        ParseError::InvalidSpec(format!("shape correction `{}` is missing `up`", raw.name))
+    })?;
+    let down = raw.down.ok_or_else(|| {
+        ParseError::InvalidSpec(format!("shape correction `{}` is missing `down`", raw.name))
+    })?;
+    validate_identifier(&attr, "correction attribute")?;
+    if attr != "pt" {
         return Err(ParseError::InvalidSpec(format!(
             "correction `{}` scales `{}`; this compiler slice only supports `pt`",
-            raw.name, raw.attr
+            raw.name, attr
         )));
     }
-    if !(raw.up.is_finite() && raw.down.is_finite()) {
+    if !(up.is_finite() && down.is_finite()) {
         return Err(ParseError::InvalidSpec(format!(
             "shape correction `{}` has non-finite up/down scale factor",
             raw.name
@@ -3444,10 +3795,88 @@ fn shape_correction_def_from_raw(raw: RawCorrection) -> Result<ShapeCorrectionDe
     Ok(ShapeCorrectionDef {
         name: raw.name,
         collection: raw.collection,
-        attr: raw.attr,
-        up: raw.up,
-        down: raw.down,
+        attr,
+        up,
+        down,
     })
+}
+
+fn scale_factor_correction_def_from_raw(
+    raw: RawCorrection,
+) -> Result<ScaleFactorCorrectionDef, ParseError> {
+    validate_identifier(&raw.name, "correction name")?;
+    validate_identifier(&raw.collection, "correction collection")?;
+    let file = required_raw_string(raw.file, &raw.name, "file")?;
+    let correction = required_raw_string(raw.correction, &raw.name, "correction")?;
+    if raw.inputs.is_empty() && raw.systematic.is_none() {
+        return Err(ParseError::InvalidSpec(format!(
+            "scale-factor correction `{}` declares no inputs",
+            raw.name
+        )));
+    }
+    let inputs = raw
+        .inputs
+        .into_iter()
+        .map(|input| {
+            validate_identifier(&input.name, "scale-factor input name")?;
+            match (input.from, input.value) {
+                (Some(from), None) => Ok(ScaleFactorInputDef {
+                    name: input.name,
+                    source: ScaleFactorInputSource::From(from),
+                }),
+                (None, Some(value)) => Ok(ScaleFactorInputDef {
+                    name: input.name,
+                    source: ScaleFactorInputSource::Literal(value),
+                }),
+                (Some(_), Some(_)) => Err(ParseError::InvalidSpec(format!(
+                    "scale-factor correction `{}` input `{}` cannot set both `from` and `value`",
+                    raw.name, input.name
+                ))),
+                (None, None) => Err(ParseError::InvalidSpec(format!(
+                    "scale-factor correction `{}` input `{}` must set `from` or `value`",
+                    raw.name, input.name
+                ))),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let systematic = raw
+        .systematic
+        .map(|systematic| {
+            validate_identifier(&systematic.name, "scale-factor systematic input name")?;
+            Ok(ScaleFactorSystematicDef {
+                name: systematic.name,
+                nominal: systematic.nominal,
+                up: systematic.up,
+                down: systematic.down,
+            })
+        })
+        .transpose()?;
+    Ok(ScaleFactorCorrectionDef {
+        name: raw.name,
+        file,
+        correction,
+        collection: raw.collection,
+        inputs,
+        systematic,
+    })
+}
+
+fn required_raw_string(
+    value: Option<String>,
+    correction: &str,
+    field: &str,
+) -> Result<String, ParseError> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ParseError::InvalidSpec(format!(
+                "scale-factor correction `{correction}` is missing `{field}`"
+            ))
+        })
+}
+
+fn default_nominal_systematic_value() -> String {
+    "nominal".to_string()
 }
 
 fn channel_def_from_raw(raw: RawChannel) -> Result<ChannelDef, ParseError> {
@@ -3909,6 +4338,8 @@ mod tests {
         include_str!("../examples/muon_hist_shape_correction.toml");
     const MUON_SHAPE_CORRECTION_SPEC_ADL: &str =
         include_str!("../examples/muon_hist_shape_correction.adl");
+    const MUON_SF_SPEC_TOML: &str = include_str!("../examples/muon_sf.toml");
+    const MUON_SF_SPEC_ADL: &str = include_str!("../examples/muon_sf.adl");
     const HIGGS4MU_MINIMAL_SPEC_TOML: &str = include_str!("../examples/higgs4mu_minimal.toml");
     const HIGGS2E2MU_MINIMAL_SPEC_TOML: &str = include_str!("../examples/higgs2e2mu_minimal.toml");
     const EXAMPLE_SPECS: &[(&str, &str)] = &[
@@ -3955,6 +4386,7 @@ mod tests {
             "muon_hist_shape_correction.toml",
             include_str!("../examples/muon_hist_shape_correction.toml"),
         ),
+        ("muon_sf.toml", include_str!("../examples/muon_sf.toml")),
         (
             "muon_tagger.toml",
             include_str!("../examples/muon_tagger.toml"),
@@ -4090,6 +4522,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_scale_factor_correction_surface() {
+        let spec = AnalysisSpec::from_toml_str(MUON_SF_SPEC_TOML)
+            .expect("parse scale-factor correction spec");
+
+        assert_eq!(spec.scale_factor_corrections.len(), 1);
+        let correction = &spec.scale_factor_corrections[0];
+        assert_eq!(correction.name, "muon_sf");
+        assert_eq!(correction.file, "../nano-spec/tests/data/muon_sf.json");
+        assert_eq!(correction.correction, "synthetic_muon_sf");
+        assert_eq!(correction.collection, "good_muon");
+        assert_eq!(correction.inputs.len(), 2);
+        assert_eq!(
+            correction.systematic.as_ref().map(|systematic| (
+                systematic.name.as_str(),
+                systematic.nominal.as_str(),
+                systematic.up.as_str(),
+                systematic.down.as_str()
+            )),
+            Some(("scale_factors", "nominal", "systup", "systdown"))
+        );
+        assert!(spec.has_weight_systematic());
+    }
+
+    #[test]
     fn lowering_all_example_specs_succeeds() {
         let catalogue = catalogue();
         for (name, input) in EXAMPLE_SPECS {
@@ -4210,6 +4666,7 @@ mod tests {
                 MUON_SHAPE_CORRECTION_SPEC_TOML,
                 MUON_SHAPE_CORRECTION_SPEC_ADL,
             ),
+            ("muon scale factor", MUON_SF_SPEC_TOML, MUON_SF_SPEC_ADL),
         ] {
             let toml_spec =
                 AnalysisSpec::from_toml_str(toml).unwrap_or_else(|_| panic!("parse {name} TOML"));
@@ -4252,6 +4709,7 @@ mod tests {
                 MUON_SHAPE_CORRECTION_SPEC_TOML,
                 MUON_SHAPE_CORRECTION_SPEC_ADL,
             ),
+            ("muon scale factor", MUON_SF_SPEC_TOML, MUON_SF_SPEC_ADL),
         ] {
             let catalogue = catalogue();
             let toml_spec =
@@ -4391,6 +4849,35 @@ object good_muon : Muon {}
         assert!(errors.iter().any(|error| matches!(
             error,
             SpecError::MissingBranch { branch, .. } if branch == "Muon_pt"
+        )));
+    }
+
+    #[test]
+    fn validation_rejects_bad_scale_factor_payload_name() {
+        let spec_text = MUON_SF_SPEC_TOML.replace(
+            "correction = \"synthetic_muon_sf\"",
+            "correction = \"missing_sf\"",
+        );
+        let spec = AnalysisSpec::from_toml_str(&spec_text).expect("parse modified SF spec");
+        let errors = validate(&spec, &catalogue()).expect_err("bad correction name should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidExpression { detail, .. }
+                if detail.contains("correction `missing_sf` was not found")
+        )));
+    }
+
+    #[test]
+    fn validation_rejects_scale_factor_missing_payload_input() {
+        let spec_text = MUON_SF_SPEC_TOML.replace("  { name = \"pt\", from = \"pt\" },\n", "");
+        let spec = AnalysisSpec::from_toml_str(&spec_text).expect("parse modified SF spec");
+        let errors = validate(&spec, &catalogue()).expect_err("missing input should fail");
+
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidExpression { detail, .. }
+                if detail.contains("declared inputs [eta, scale_factors] do not match correctionlib inputs [eta, pt, scale_factors]")
         )));
     }
 

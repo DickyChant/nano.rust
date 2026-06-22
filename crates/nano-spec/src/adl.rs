@@ -19,6 +19,9 @@
 //! weight nominal [<factor>, ...];
 //! systematic <name> kind weight up <factor> down <factor>;
 //! correction <name> kind scale collection <object> attr <attr> up <factor> down <factor>;
+//! correction <name> kind scale_factor file <path> correction <payload> collection <object>
+//!   input <payload_input> from <attr_or_branch> [input ...]
+//!   [systematic <payload_input> nominal <value> up <value> down <value>];
 //! model <name> { inputs <branch>[, ...]; output <branch>; batch <object>; provider <kind>; }
 //! ```
 //!
@@ -41,8 +44,9 @@ use crate::{
     DerivedObjectDef, DerivedSource, Expr, HistogramDef, ModelDef, ModelOutputDType,
     ModelProviderKind, ObjectDef, PairConstraint, PairSelection, ParseError, Quantity, RawAnalysis,
     RawAnalysisSpec, RawCorrection, RawDerivedObject, RawHistogram, RawModel, RawModelProvider,
-    RawObject, RawOutput, RawRegion, RawSystematic, RawWeight, RegionDef, ShapeCorrectionDef,
-    SystematicDef, Unit, Year,
+    RawObject, RawOutput, RawRegion, RawScaleFactorInput, RawScaleFactorSystematic, RawSystematic,
+    RawWeight, RegionDef, ScaleFactorCorrectionDef, ScaleFactorInputSource, ScaleFactorLiteral,
+    ShapeCorrectionDef, SystematicDef, Unit, Year,
 };
 
 pub fn parse_adl(input: &str) -> Result<AnalysisSpec, ParseError> {
@@ -86,7 +90,10 @@ pub fn to_adl_string(spec: &AnalysisSpec) -> String {
         }
     }
     for correction in &spec.shape_corrections {
-        write_correction(&mut out, correction);
+        write_shape_correction(&mut out, correction);
+    }
+    for correction in &spec.scale_factor_corrections {
+        write_scale_factor_correction(&mut out, correction);
     }
     out.push('\n');
 
@@ -290,7 +297,7 @@ fn write_histogram(out: &mut String, histogram: &HistogramDef) {
     out.push_str("}\n");
 }
 
-fn write_correction(out: &mut String, correction: &ShapeCorrectionDef) {
+fn write_shape_correction(out: &mut String, correction: &ShapeCorrectionDef) {
     out.push_str("correction ");
     out.push_str(&correction.name);
     out.push_str(" kind scale collection ");
@@ -302,6 +309,50 @@ fn write_correction(out: &mut String, correction: &ShapeCorrectionDef) {
     out.push_str(" down ");
     out.push_str(&format_f64(correction.down));
     out.push_str(";\n");
+}
+
+fn write_scale_factor_correction(out: &mut String, correction: &ScaleFactorCorrectionDef) {
+    out.push_str("correction ");
+    out.push_str(&correction.name);
+    out.push_str(" kind scale_factor file ");
+    out.push_str(&correction.file);
+    out.push_str(" correction ");
+    out.push_str(&correction.correction);
+    out.push_str(" collection ");
+    out.push_str(&correction.collection);
+    for input in &correction.inputs {
+        out.push_str(" input ");
+        out.push_str(&input.name);
+        match &input.source {
+            ScaleFactorInputSource::From(source) => {
+                out.push_str(" from ");
+                out.push_str(source);
+            }
+            ScaleFactorInputSource::Literal(value) => {
+                out.push_str(" value ");
+                out.push_str(&scale_factor_literal_to_adl(value));
+            }
+        }
+    }
+    if let Some(systematic) = &correction.systematic {
+        out.push_str(" systematic ");
+        out.push_str(&systematic.name);
+        out.push_str(" nominal ");
+        out.push_str(&systematic.nominal);
+        out.push_str(" up ");
+        out.push_str(&systematic.up);
+        out.push_str(" down ");
+        out.push_str(&systematic.down);
+    }
+    out.push_str(";\n");
+}
+
+fn scale_factor_literal_to_adl(value: &ScaleFactorLiteral) -> String {
+    match value {
+        ScaleFactorLiteral::Real(value) => format_f64(*value),
+        ScaleFactorLiteral::Int(value) => value.to_string(),
+        ScaleFactorLiteral::Str(value) => value.clone(),
+    }
 }
 
 fn cut_to_adl(cut: &Cut) -> String {
@@ -922,6 +973,14 @@ impl Parser {
         let name = self.parse_identifier("correction name")?;
         self.expect_keyword("kind")?;
         let kind = self.parse_identifier("correction kind")?;
+        if kind == "scale_factor" {
+            let rest = self.read_until_semicolon()?.trim().to_string();
+            self.expect_char(';')?;
+            let mut raw = parse_scale_factor_correction_adl(&name, &rest)?;
+            raw.name = name;
+            self.corrections.push(raw);
+            return Ok(());
+        }
         self.expect_keyword("collection")?;
         let collection = self.parse_identifier("correction collection")?;
         self.expect_keyword("attr")?;
@@ -935,9 +994,13 @@ impl Parser {
             name,
             kind,
             collection,
-            attr,
-            up,
-            down,
+            attr: Some(attr),
+            up: Some(up),
+            down: Some(down),
+            file: None,
+            correction: None,
+            inputs: Vec::new(),
+            systematic: None,
         });
         Ok(())
     }
@@ -1381,6 +1444,153 @@ fn parse_weight_vector(input: &str) -> Result<Vec<f64>, ParseError> {
             })
         })
         .collect()
+}
+
+fn parse_scale_factor_correction_adl(name: &str, input: &str) -> Result<RawCorrection, ParseError> {
+    let tokens = input.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0_usize;
+    let mut file = None;
+    let mut payload_correction = None;
+    let mut collection = None;
+    let mut inputs = Vec::new();
+    let mut systematic = None;
+
+    while index < tokens.len() {
+        match tokens[index] {
+            "file" => {
+                index += 1;
+                file = Some(parse_required_token(&tokens, index, name, "file")?.to_string());
+                index += 1;
+            }
+            "correction" => {
+                index += 1;
+                payload_correction =
+                    Some(parse_required_token(&tokens, index, name, "correction")?.to_string());
+                index += 1;
+            }
+            "collection" => {
+                index += 1;
+                let value = parse_required_token(&tokens, index, name, "collection")?;
+                validate_identifier(value, "scale-factor correction collection")?;
+                collection = Some(value.to_string());
+                index += 1;
+            }
+            "input" => {
+                index += 1;
+                let input_name = parse_required_token(&tokens, index, name, "input name")?;
+                validate_identifier(input_name, "scale-factor input name")?;
+                index += 1;
+                let mode = parse_required_token(&tokens, index, name, "input mode")?;
+                index += 1;
+                let value = parse_required_token(&tokens, index, name, "input value")?;
+                index += 1;
+                let raw = match mode {
+                    "from" => RawScaleFactorInput {
+                        name: input_name.to_string(),
+                        from: Some(value.to_string()),
+                        value: None,
+                    },
+                    "value" => RawScaleFactorInput {
+                        name: input_name.to_string(),
+                        from: None,
+                        value: Some(parse_scale_factor_literal(value)),
+                    },
+                    other => {
+                        return Err(ParseError::InvalidSpec(format!(
+                            "failed to parse ADL correction `{name}`: input `{input_name}` has unsupported mode `{other}`"
+                        )));
+                    }
+                };
+                inputs.push(raw);
+            }
+            "systematic" => {
+                index += 1;
+                let systematic_name =
+                    parse_required_token(&tokens, index, name, "systematic input name")?;
+                validate_identifier(systematic_name, "scale-factor systematic input name")?;
+                index += 1;
+                expect_token(&tokens, index, name, "nominal")?;
+                index += 1;
+                let nominal = parse_required_token(&tokens, index, name, "nominal value")?;
+                index += 1;
+                expect_token(&tokens, index, name, "up")?;
+                index += 1;
+                let up = parse_required_token(&tokens, index, name, "up value")?;
+                index += 1;
+                expect_token(&tokens, index, name, "down")?;
+                index += 1;
+                let down = parse_required_token(&tokens, index, name, "down value")?;
+                index += 1;
+                systematic = Some(RawScaleFactorSystematic {
+                    name: systematic_name.to_string(),
+                    nominal: nominal.to_string(),
+                    up: up.to_string(),
+                    down: down.to_string(),
+                });
+            }
+            other => {
+                return Err(ParseError::InvalidSpec(format!(
+                    "failed to parse ADL correction `{name}`: unsupported token `{other}`"
+                )));
+            }
+        }
+    }
+
+    Ok(RawCorrection {
+        name: name.to_string(),
+        kind: "scale_factor".to_string(),
+        collection: collection.ok_or_else(|| {
+            ParseError::InvalidSpec(format!(
+                "failed to parse ADL correction `{name}`: missing `collection`"
+            ))
+        })?,
+        attr: None,
+        up: None,
+        down: None,
+        file,
+        correction: payload_correction,
+        inputs,
+        systematic,
+    })
+}
+
+fn parse_required_token<'a>(
+    tokens: &'a [&str],
+    index: usize,
+    name: &str,
+    field: &str,
+) -> Result<&'a str, ParseError> {
+    tokens.get(index).copied().ok_or_else(|| {
+        ParseError::InvalidSpec(format!(
+            "failed to parse ADL correction `{name}`: missing {field}"
+        ))
+    })
+}
+
+fn expect_token(
+    tokens: &[&str],
+    index: usize,
+    name: &str,
+    expected: &str,
+) -> Result<(), ParseError> {
+    let actual = parse_required_token(tokens, index, name, expected)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ParseError::InvalidSpec(format!(
+            "failed to parse ADL correction `{name}`: expected `{expected}`, got `{actual}`"
+        )))
+    }
+}
+
+fn parse_scale_factor_literal(value: &str) -> ScaleFactorLiteral {
+    if let Ok(value) = value.parse::<i64>() {
+        ScaleFactorLiteral::Int(value)
+    } else if let Ok(value) = value.parse::<f64>() {
+        ScaleFactorLiteral::Real(value)
+    } else {
+        ScaleFactorLiteral::Str(value.to_string())
+    }
 }
 
 fn expand_aliases(expr: &str, aliases: &BTreeMap<String, String>) -> String {

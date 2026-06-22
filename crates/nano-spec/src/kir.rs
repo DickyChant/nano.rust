@@ -43,6 +43,7 @@ pub struct KirProgram {
     pub histograms: Vec<KirHistogram>,
     pub systematics: Vec<SystematicDef>,
     pub shape_corrections: Vec<KirShapeCorrection>,
+    pub scale_factor_corrections: Vec<KirScaleFactorCorrection>,
     pub weight: WeightDef,
 }
 
@@ -124,8 +125,12 @@ pub enum Rvalue {
         expr: crate::Expr,
         ty: Type,
     },
+    ScaleFactor {
+        systematic: ValueId,
+    },
     Weight {
         systematic: ValueId,
+        scale_factor: Option<ValueId>,
     },
 }
 
@@ -185,6 +190,16 @@ pub struct KirShapeCorrection {
     pub attr: String,
     pub up: f64,
     pub down: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KirScaleFactorCorrection {
+    pub name: String,
+    pub file: String,
+    pub correction: String,
+    pub collection: String,
+    pub inputs: Vec<crate::ScaleFactorInputDef>,
+    pub systematic: Option<crate::ScaleFactorSystematicDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +359,7 @@ pub fn lower_to_kir(core: &CoreIr) -> Result<KirProgram, KirError> {
             .collect(),
         systematics: vec![SystematicDef::Nominal],
         shape_corrections: Vec::new(),
+        scale_factor_corrections: Vec::new(),
         weight: WeightDef::default(),
     };
     verify(&program)?;
@@ -421,6 +437,19 @@ pub fn lower_plan_to_kir(plan: &ResolvedPlan) -> Result<KirProgram, KirError> {
             attr: correction.attr.clone(),
             up: correction.up,
             down: correction.down,
+        })
+        .collect();
+    program.scale_factor_corrections = plan
+        .spec
+        .scale_factor_corrections
+        .iter()
+        .map(|correction| KirScaleFactorCorrection {
+            name: correction.name.clone(),
+            file: correction.file.clone(),
+            correction: correction.correction.clone(),
+            collection: correction.collection.clone(),
+            inputs: correction.inputs.clone(),
+            systematic: correction.systematic.clone(),
         })
         .collect();
     program.weight = plan.spec.weight.clone();
@@ -512,6 +541,20 @@ fn executable_block(program: &KirProgram) -> Result<Block, KirError> {
         let systematic = ValueId(next_value);
         next_value += 1;
         let mut body = Block::default();
+        let scale_factor = if program.scale_factor_corrections.is_empty() {
+            None
+        } else {
+            let value = ValueId(next_value);
+            next_value += 1;
+            body.stmts.push(Stmt::Let {
+                value: TypedValue {
+                    id: value,
+                    ty: Type::Quantity(crate::Dimension::Dimensionless),
+                },
+                expr: Rvalue::ScaleFactor { systematic },
+            });
+            Some(value)
+        };
         let weight = ValueId(next_value);
         next_value += 1;
         body.stmts.push(Stmt::Let {
@@ -519,7 +562,10 @@ fn executable_block(program: &KirProgram) -> Result<Block, KirError> {
                 id: weight,
                 ty: Type::Weight,
             },
-            expr: Rvalue::Weight { systematic },
+            expr: Rvalue::Weight {
+                systematic,
+                scale_factor,
+            },
         });
         for histogram in &program.histograms {
             let histogram_value = ValueId(next_value);
@@ -623,6 +669,7 @@ fn output_expr_type(expr: &Expr) -> Type {
 pub fn verify(program: &KirProgram) -> Result<(), KirError> {
     verify_requirements(program)?;
     verify_shape_corrections(program)?;
+    verify_scale_factor_corrections(program)?;
     let registry = PrimitiveRegistry::standard();
     let mut values = BTreeMap::new();
     verify_block(&program.block, &registry, &mut values)
@@ -909,6 +956,59 @@ fn verify_shape_corrections(program: &KirProgram) -> Result<(), KirError> {
     Ok(())
 }
 
+fn verify_scale_factor_corrections(program: &KirProgram) -> Result<(), KirError> {
+    for correction in &program.scale_factor_corrections {
+        if !program
+            .objects
+            .iter()
+            .any(|object| object.name == correction.collection)
+        {
+            return Err(KirError::Lower(format!(
+                "scale-factor correction `{}` references unknown collection `{}`",
+                correction.name, correction.collection
+            )));
+        }
+        let set =
+            nano_corrections::CorrectionSet::from_path(&correction.file).map_err(|error| {
+                KirError::Lower(format!(
+                    "scale-factor correction `{}` failed to load `{}`: {error}",
+                    correction.name, correction.file
+                ))
+            })?;
+        let payload = set.correction(&correction.correction).map_err(|error| {
+            KirError::Lower(format!(
+                "scale-factor correction `{}` payload lookup failed: {error}",
+                correction.name
+            ))
+        })?;
+        let declared = correction
+            .inputs
+            .iter()
+            .map(|input| input.name.as_str())
+            .chain(
+                correction
+                    .systematic
+                    .iter()
+                    .map(|systematic| systematic.name.as_str()),
+            )
+            .collect::<Vec<_>>();
+        let expected = payload
+            .inputs
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<Vec<_>>();
+        if declared != expected {
+            return Err(KirError::Lower(format!(
+                "scale-factor correction `{}` declared inputs [{}] do not match payload inputs [{}]",
+                correction.name,
+                declared.join(", "),
+                expected.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn verify_block(
     block: &Block,
     registry: &PrimitiveRegistry,
@@ -1046,8 +1146,22 @@ fn verify_rvalue(
         Rvalue::Output { ty, .. } => Ok(ty.clone()),
         Rvalue::Histogram { .. } => Ok(Type::Histogram),
         Rvalue::HistogramValue { ty, .. } => Ok(ty.clone()),
-        Rvalue::Weight { systematic } => {
+        Rvalue::ScaleFactor { systematic } => {
             require_type(*systematic, Type::Systematic, values)?;
+            Ok(Type::Quantity(crate::Dimension::Dimensionless))
+        }
+        Rvalue::Weight {
+            systematic,
+            scale_factor,
+        } => {
+            require_type(*systematic, Type::Systematic, values)?;
+            if let Some(scale_factor) = scale_factor {
+                require_type(
+                    *scale_factor,
+                    Type::Quantity(crate::Dimension::Dimensionless),
+                    values,
+                )?;
+            }
             Ok(Type::Weight)
         }
     }
@@ -1058,6 +1172,10 @@ fn has_weight_systematic(program: &KirProgram) -> bool {
         .systematics
         .iter()
         .any(|systematic| matches!(systematic, SystematicDef::Weight(_)))
+        || program
+            .scale_factor_corrections
+            .iter()
+            .any(|correction| correction.systematic.is_some())
 }
 
 fn require_type(
@@ -1139,6 +1257,7 @@ mod tests {
         include_str!("../examples/muon_hist_weight_systematic.toml");
     const MUON_SHAPE_CORRECTION_SPEC: &str =
         include_str!("../examples/muon_hist_shape_correction.toml");
+    const MUON_SF_SPEC: &str = include_str!("../examples/muon_sf.toml");
     const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
 
     #[test]
@@ -1190,5 +1309,41 @@ mod tests {
         assert_eq!(kir.shape_corrections.len(), 1);
         assert_eq!(kir.shape_corrections[0].collection, "good_muon");
         assert_eq!(kir.shape_corrections[0].attr, "pt");
+    }
+
+    #[test]
+    fn lowers_scale_factor_weight_metadata_and_node_to_kir() {
+        let spec = AnalysisSpec::from_toml_str(MUON_SF_SPEC).expect("parse muon SF spec");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+        let plan = crate::validate(&spec, &catalogue).expect("validate spec");
+        let kir = lower_plan_to_kir(&plan).expect("lower executable kir");
+
+        verify(&kir).expect("verify kir");
+        assert_eq!(kir.scale_factor_corrections.len(), 1);
+        assert_eq!(kir.scale_factor_corrections[0].collection, "good_muon");
+        assert!(kir.block.stmts.iter().any(|stmt| matches!(
+            stmt,
+            Stmt::ForEach {
+                axis: ForEachAxis::Systematic,
+                body,
+                ..
+            } if body.stmts.iter().any(|stmt| matches!(
+                stmt,
+                Stmt::Let {
+                    expr: Rvalue::ScaleFactor { .. },
+                    ..
+                }
+            )) && body.stmts.iter().any(|stmt| matches!(
+                stmt,
+                Stmt::Let {
+                    expr: Rvalue::Weight {
+                        scale_factor: Some(_),
+                        ..
+                    },
+                    ..
+                }
+            ))
+        )));
     }
 }

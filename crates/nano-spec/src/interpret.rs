@@ -10,6 +10,7 @@ use std::fmt;
 
 use nano_analysis::{EventWeight, HistSet1D};
 use nano_core::{BranchType, Event, ObjectView};
+use nano_corrections::Value as CorrectionValue;
 use nano_inference::{mock_scores, InferRequest, Tensor, TensorData};
 
 use crate::kir::{
@@ -101,6 +102,7 @@ pub enum InterpretError {
         expected: &'static str,
     },
     NumericConversion(String),
+    Correction(String),
 }
 
 impl fmt::Display for InterpretError {
@@ -120,6 +122,7 @@ impl fmt::Display for InterpretError {
                 "branch `{branch}` has type {branch_type:?}, expected {expected}"
             ),
             Self::NumericConversion(detail) => f.write_str(detail),
+            Self::Correction(detail) => f.write_str(detail),
         }
     }
 }
@@ -470,12 +473,17 @@ fn provider_kind_name(kind: &ModelProviderKind) -> &str {
 }
 
 fn interpreted_systematic_variants(plan: &ResolvedPlan) -> Vec<String> {
-    interpreted_systematic_variants_from_parts(&plan.spec.systematics, &plan.spec.shape_corrections)
+    interpreted_systematic_variants_from_parts(
+        &plan.spec.systematics,
+        &plan.spec.shape_corrections,
+        &plan.spec.scale_factor_corrections,
+    )
 }
 
 fn interpreted_systematic_variants_from_parts(
     systematics: &[SystematicDef],
     shape_corrections: &[impl NamedSystematicCorrection],
+    scale_factor_corrections: &[impl NamedSystematicCorrection],
 ) -> Vec<String> {
     let mut variants = vec!["Nominal".to_string()];
     for systematic in systematics {
@@ -488,11 +496,21 @@ fn interpreted_systematic_variants_from_parts(
         variants.push(interpreted_variant_name(correction.name(), "Up"));
         variants.push(interpreted_variant_name(correction.name(), "Down"));
     }
+    for correction in scale_factor_corrections
+        .iter()
+        .filter(|correction| correction.has_systematic())
+    {
+        variants.push(interpreted_variant_name(correction.name(), "Up"));
+        variants.push(interpreted_variant_name(correction.name(), "Down"));
+    }
     variants
 }
 
 trait NamedSystematicCorrection {
     fn name(&self) -> &str;
+    fn has_systematic(&self) -> bool {
+        true
+    }
 }
 
 impl NamedSystematicCorrection for crate::ShapeCorrectionDef {
@@ -504,6 +522,26 @@ impl NamedSystematicCorrection for crate::ShapeCorrectionDef {
 impl NamedSystematicCorrection for KirShapeCorrection {
     fn name(&self) -> &str {
         &self.name
+    }
+}
+
+impl NamedSystematicCorrection for crate::ScaleFactorCorrectionDef {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn has_systematic(&self) -> bool {
+        self.systematic.is_some()
+    }
+}
+
+impl NamedSystematicCorrection for crate::kir::KirScaleFactorCorrection {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn has_systematic(&self) -> bool {
+        self.systematic.is_some()
     }
 }
 
@@ -673,7 +711,7 @@ impl<'a> KirEvaluator<'a> {
 
     fn fill_current_histograms(&mut self) -> Result<bool> {
         let systematic = self.systematic.clone();
-        let weight = self.weight_for(&systematic);
+        let weight = self.weight_for(&systematic)?;
         for histogram in &self.program.histograms {
             if expr_has_missing_value(&histogram.def.expr, &self.selected, &self.derived)? {
                 return Ok(false);
@@ -740,13 +778,26 @@ impl<'a> KirEvaluator<'a> {
                     eval_numeric_expr(expr, &self.selected, &self.derived, None)?.as_f64(),
                 ))
             }
-            Rvalue::Weight { systematic } => {
+            Rvalue::ScaleFactor { systematic } => {
+                let RuntimeValue::Systematic(systematic) = self.value(*systematic)? else {
+                    return Err(InterpretError::InvalidExpression(format!(
+                        "KIR scale factor expected systematic value {systematic:?}"
+                    )));
+                };
+                Ok(RuntimeValue::Numeric(
+                    self.scale_factor_weight_for(&systematic)?,
+                ))
+            }
+            Rvalue::Weight {
+                systematic,
+                scale_factor: _,
+            } => {
                 let RuntimeValue::Systematic(systematic) = self.value(*systematic)? else {
                     return Err(InterpretError::InvalidExpression(format!(
                         "KIR weight expected systematic value {systematic:?}"
                     )));
                 };
-                Ok(RuntimeValue::Weight(self.weight_for(&systematic)))
+                Ok(RuntimeValue::Weight(self.weight_for(&systematic)?))
             }
             Rvalue::Literal(_)
             | Rvalue::Quantity(_)
@@ -765,6 +816,7 @@ impl<'a> KirEvaluator<'a> {
         interpreted_systematic_variants_from_parts(
             &self.program.systematics,
             &self.program.shape_corrections,
+            &self.program.scale_factor_corrections,
         )
     }
 
@@ -779,7 +831,7 @@ impl<'a> KirEvaluator<'a> {
             .unwrap_or_else(|| self.systematic.clone()))
     }
 
-    fn weight_for(&self, systematic: &str) -> EventWeight {
+    fn weight_for(&self, systematic: &str) -> Result<EventWeight> {
         let mut weight = self
             .program
             .systematics
@@ -801,7 +853,21 @@ impl<'a> KirEvaluator<'a> {
         for factor in &self.program.weight.nominal {
             weight = weight.times(*factor);
         }
-        weight
+        Ok(weight.times(self.scale_factor_weight_for(systematic)?))
+    }
+
+    fn scale_factor_weight_for(&self, systematic: &str) -> Result<f64> {
+        let mut weight = 1.0_f64;
+        for correction in &self.program.scale_factor_corrections {
+            weight *= evaluate_scale_factor_correction(
+                self.program,
+                self.event,
+                correction,
+                &self.selected,
+                systematic,
+            )?;
+        }
+        Ok(weight)
     }
 
     fn value(&self, id: ValueId) -> Result<RuntimeValue> {
@@ -1298,6 +1364,23 @@ fn leading_attrs_for_object(program: &KirProgram, object_name: &str) -> Vec<Stri
     for output in &program.outputs {
         collect_selected_attrs(&output.expr, object_name, &mut attrs);
     }
+    for correction in &program.scale_factor_corrections {
+        if correction.collection == object_name {
+            for input in &correction.inputs {
+                if let crate::ScaleFactorInputSource::From(source) = &input.source {
+                    let object = program
+                        .objects
+                        .iter()
+                        .find(|object| object.name == object_name)
+                        .expect("object exists");
+                    let branch = format!("{}_{}", object.source, source);
+                    if program.read_branches.iter().any(|spec| spec.name == branch) {
+                        push_attr(&mut attrs, source);
+                    }
+                }
+            }
+        }
+    }
     for derived in &program.derived_objects {
         match &derived.def.source {
             DerivedSource::Pair(pair) if pair.object == object_name => {
@@ -1535,6 +1618,181 @@ fn shape_factor(program: &KirProgram, collection: &str, attr: &str, systematic: 
             _ => 1.0,
         })
         .unwrap_or(1.0)
+}
+
+fn evaluate_scale_factor_correction(
+    program: &KirProgram,
+    event: &Event,
+    correction: &crate::kir::KirScaleFactorCorrection,
+    selected: &SelectedObjects,
+    systematic: &str,
+) -> Result<f64> {
+    let set = nano_corrections::CorrectionSet::from_path(&correction.file).map_err(|error| {
+        InterpretError::Correction(format!(
+            "scale-factor correction `{}` failed to load `{}`: {error}",
+            correction.name, correction.file
+        ))
+    })?;
+    let payload = set.correction(&correction.correction).map_err(|error| {
+        InterpretError::Correction(format!(
+            "scale-factor correction `{}` payload lookup failed: {error}",
+            correction.name
+        ))
+    })?;
+    let objects = selected
+        .get(&correction.collection)
+        .ok_or_else(|| InterpretError::MissingObject(correction.collection.clone()))?;
+    let mut weight = 1.0_f64;
+    for object in objects {
+        let mut values = Vec::with_capacity(payload.inputs.len());
+        for payload_input in &payload.inputs {
+            if correction
+                .systematic
+                .as_ref()
+                .is_some_and(|declared| declared.name == payload_input.name)
+            {
+                values.push(CorrectionValue::Str(scale_factor_systematic_value(
+                    correction, systematic,
+                )));
+                continue;
+            }
+            let input = correction
+                .inputs
+                .iter()
+                .find(|input| input.name == payload_input.name)
+                .ok_or_else(|| {
+                    InterpretError::Correction(format!(
+                        "scale-factor correction `{}` is missing input `{}`",
+                        correction.name, payload_input.name
+                    ))
+                })?;
+            values.push(scale_factor_input_value(
+                program, event, correction, object, input,
+            )?);
+        }
+        weight *= payload.evaluate(&values).map_err(|error| {
+            InterpretError::Correction(format!(
+                "scale-factor correction `{}` evaluation failed: {error}",
+                correction.name
+            ))
+        })?;
+    }
+    Ok(weight)
+}
+
+fn scale_factor_systematic_value(
+    correction: &crate::kir::KirScaleFactorCorrection,
+    systematic: &str,
+) -> String {
+    let Some(declared) = &correction.systematic else {
+        return String::new();
+    };
+    if systematic == interpreted_variant_name(&correction.name, "Up") {
+        declared.up.clone()
+    } else if systematic == interpreted_variant_name(&correction.name, "Down") {
+        declared.down.clone()
+    } else {
+        declared.nominal.clone()
+    }
+}
+
+fn scale_factor_input_value(
+    program: &KirProgram,
+    event: &Event,
+    correction: &crate::kir::KirScaleFactorCorrection,
+    object: &SelectedObject,
+    input: &crate::ScaleFactorInputDef,
+) -> Result<CorrectionValue> {
+    match &input.source {
+        crate::ScaleFactorInputSource::Literal(value) => Ok(scale_factor_literal_value(value)),
+        crate::ScaleFactorInputSource::From(source) => {
+            let collection_source = program
+                .objects
+                .iter()
+                .find(|object| object.name == correction.collection)
+                .map(|object| object.source.as_str())
+                .ok_or_else(|| InterpretError::MissingObject(correction.collection.clone()))?;
+            let object_branch = format!("{collection_source}_{source}");
+            if program
+                .read_branches
+                .iter()
+                .any(|branch| branch.name == object_branch)
+            {
+                let value = object.leading_values.get(source).copied().ok_or_else(|| {
+                    InterpretError::InvalidExpression(format!(
+                        "selected `{}` object is missing scale-factor input `{source}`",
+                        correction.collection
+                    ))
+                })?;
+                return numeric_value_to_correction_value(value);
+            }
+            let branch_type = branch_type(program, source)?;
+            scalar_correction_value(event, source, branch_type)
+        }
+    }
+}
+
+fn scale_factor_literal_value(value: &crate::ScaleFactorLiteral) -> CorrectionValue {
+    match value {
+        crate::ScaleFactorLiteral::Real(value) => CorrectionValue::Real(*value),
+        crate::ScaleFactorLiteral::Int(value) => CorrectionValue::Int(*value),
+        crate::ScaleFactorLiteral::Str(value) => CorrectionValue::Str(value.clone()),
+    }
+}
+
+fn numeric_value_to_correction_value(value: NumericValue) -> Result<CorrectionValue> {
+    match value {
+        NumericValue::F64(value) => Ok(CorrectionValue::Real(value)),
+        NumericValue::I64(value) => Ok(CorrectionValue::Int(value)),
+        NumericValue::U64(value) => {
+            i64::try_from(value)
+                .map(CorrectionValue::Int)
+                .map_err(|error| {
+                    InterpretError::NumericConversion(format!(
+                        "unsigned scale-factor input cannot fit into i64: {error}"
+                    ))
+                })
+        }
+    }
+}
+
+fn scalar_correction_value(
+    event: &Event,
+    branch: &str,
+    branch_type: BranchType,
+) -> Result<CorrectionValue> {
+    match branch_type {
+        BranchType::I8 => Ok(CorrectionValue::Int(i64::from(event.scalar::<i8>(branch)?))),
+        BranchType::U8 => Ok(CorrectionValue::Int(i64::from(event.scalar::<u8>(branch)?))),
+        BranchType::I16 => Ok(CorrectionValue::Int(i64::from(
+            event.scalar::<i16>(branch)?,
+        ))),
+        BranchType::U16 => Ok(CorrectionValue::Int(i64::from(
+            event.scalar::<u16>(branch)?,
+        ))),
+        BranchType::I32 => Ok(CorrectionValue::Int(i64::from(
+            event.scalar::<i32>(branch)?,
+        ))),
+        BranchType::U32 => Ok(CorrectionValue::Int(i64::from(
+            event.scalar::<u32>(branch)?,
+        ))),
+        BranchType::I64 => Ok(CorrectionValue::Int(event.scalar::<i64>(branch)?)),
+        BranchType::U64 => i64::try_from(event.scalar::<u64>(branch)?)
+            .map(CorrectionValue::Int)
+            .map_err(|error| {
+                InterpretError::NumericConversion(format!(
+                    "scalar branch `{branch}` cannot fit into i64: {error}"
+                ))
+            }),
+        BranchType::F32 => Ok(CorrectionValue::Real(f64::from(
+            event.scalar::<f32>(branch)?,
+        ))),
+        other => Err(InterpretError::TypeMismatch {
+            branch: branch.to_string(),
+            branch_type: other,
+            expected: "numeric scalar branch",
+        }),
+    }
 }
 
 fn shape_factor_for_source(
