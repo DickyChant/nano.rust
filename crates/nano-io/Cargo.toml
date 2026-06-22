@@ -11,6 +11,7 @@ kuva = { version = "0.1", optional = true, default-features = false }
 nano-analysis = { workspace = true }
 nano-core = { workspace = true }
 nano-rootio = { workspace = true }
+nano-spec = { workspace = true }
 serde = { workspace = true }
 toml = "0.8"
 

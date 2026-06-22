@@ -467,6 +467,24 @@ impl Hist1D {
         }
     }
 
+    /// Scale all accumulated weights by `factor`, preserving the raw entry count.
+    pub fn scale(&mut self, factor: f64) {
+        assert!(factor.is_finite(), "histogram scale factor must be finite");
+        let factor2 = factor * factor;
+        self.underflow *= factor;
+        self.overflow *= factor;
+        self.underflow_sumw2 *= factor2;
+        self.overflow_sumw2 *= factor2;
+        self.sumwx *= factor;
+        self.sumwx2 *= factor;
+        for value in &mut self.bins {
+            *value *= factor;
+        }
+        for value in &mut self.bin_sumw2 {
+            *value *= factor2;
+        }
+    }
+
     /// Fill one value with an explicit numeric weight.
     pub fn fill_weighted(&mut self, value: f64, weight: f64) {
         self.entries += 1.0;
@@ -536,6 +554,13 @@ impl<S: Ord> HistSet1D<S> {
                 .get(systematic)
                 .expect("systematic histogram key mismatch");
             hist.add(other);
+        }
+    }
+
+    /// Scale every systematic histogram by `factor`.
+    pub fn scale(&mut self, factor: f64) {
+        for hist in self.histograms.values_mut() {
+            hist.scale(factor);
         }
     }
 }

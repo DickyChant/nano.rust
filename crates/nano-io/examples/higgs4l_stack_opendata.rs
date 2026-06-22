@@ -408,13 +408,16 @@ fn sample_weight(
     luminosity_pb: f64,
     sample: &higgs4l_opendata::SampleConfig,
 ) -> Result<f64, Box<dyn Error>> {
+    use nano_analysis::{Pb, PbInv};
+    use nano_io::samples::mc_normalization_factor_pb;
+
     match (sample.xsec, sample.nevt) {
         (Some(xsec), Some(nevt)) => {
-            let mut weight = luminosity_pb * xsec;
+            let mut weight = mc_normalization_factor_pb(Pb(xsec), PbInv(luminosity_pb), nevt)?;
             if sample.scale != 1.0 {
                 weight *= sample.scale;
             }
-            Ok(weight / nevt)
+            Ok(weight)
         }
         (None, None) => Ok(sample.scale),
         _ => Err(format!("sample {} must set both xsec and nevt", sample.name).into()),

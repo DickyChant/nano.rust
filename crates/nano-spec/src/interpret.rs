@@ -87,6 +87,16 @@ impl InterpretedHistograms {
     pub fn get(&self, name: &str) -> Option<&HistSet1D<String>> {
         self.histograms.get(name)
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &HistSet1D<String>)> {
+        self.histograms.iter()
+    }
+
+    pub fn scale(&mut self, factor: f64) {
+        for histograms in self.histograms.values_mut() {
+            histograms.scale(factor);
+        }
+    }
 }
 
 /// Errors reported while interpreting a validated plan.
