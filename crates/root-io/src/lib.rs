@@ -36,7 +36,7 @@ pub mod utils;
 
 #[cfg(feature = "http")]
 pub use crate::core::HttpSourceOptions;
-pub use crate::core::{FileItem, RootFile, Source};
+pub use crate::core::{FileItem, Hist1F, RootFile, Source};
 pub use crate::error::{Result, RootError};
 
 /// Offset when using Context; should be in `Context`, maybe?

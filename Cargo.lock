@@ -1130,11 +1130,14 @@ dependencies = [
 name = "nano-io"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "kuva",
+ "nano-analysis",
  "nano-core",
  "nano-producers",
  "nano-rootio",
  "rayon",
+ "root-io",
  "serde",
  "toml",
 ]

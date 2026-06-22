@@ -8,6 +8,7 @@ description = "NanoAOD ROOT input reading and skim output writing for nano.rust"
 
 [dependencies]
 kuva = { version = "0.1", optional = true, default-features = false }
+nano-analysis = { workspace = true }
 nano-core = { workspace = true }
 nano-rootio = { workspace = true }
 serde = { workspace = true }
@@ -26,5 +27,7 @@ full = ["http", "plot"]
 full-png = ["http", "plot-png"]
 
 [dev-dependencies]
+futures = "0.3"
 nano-producers = { workspace = true }
 rayon = "1"
+root-io = { path = "../root-io" }

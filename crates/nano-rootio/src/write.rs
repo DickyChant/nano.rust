@@ -10,6 +10,7 @@ const FILE_BEGIN: u32 = 100;
 const DIRECTORY_OFFSET: u64 = FILE_BEGIN as u64;
 const DIRECTORY_SIZE: u64 = 30;
 const TREE_OFFSET: u64 = DIRECTORY_OFFSET + DIRECTORY_SIZE;
+const STOCK_DIRECTORY_SIZE: usize = 60;
 
 #[derive(Debug, Clone)]
 pub struct Branch {
@@ -41,6 +42,183 @@ pub enum BranchData {
     VecI64(Vec<Vec<i64>>),
     VecF32(Vec<Vec<f32>>),
     VecF64(Vec<Vec<f64>>),
+}
+
+/// Axis binning for a writable ROOT `TH1F`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HistogramAxis {
+    /// Uniform bins over `[low, high)`.
+    Fixed { bins: usize, low: f64, high: f64 },
+    /// Explicit bin edges. Length must be `nbins + 1`.
+    Variable { edges: Vec<f64> },
+}
+
+impl HistogramAxis {
+    fn validate(&self, name: &str) -> Result<()> {
+        match self {
+            Self::Fixed { bins, low, high } => {
+                if *bins == 0 {
+                    return Err(Error::unsupported(
+                        name,
+                        "histogram must have at least one bin",
+                    ));
+                }
+                if !(low.is_finite() && high.is_finite() && high > low) {
+                    return Err(Error::unsupported(
+                        name,
+                        "fixed histogram bounds must be finite and ordered",
+                    ));
+                }
+            }
+            Self::Variable { edges } => {
+                if edges.len() < 2 {
+                    return Err(Error::unsupported(
+                        name,
+                        "variable histogram needs at least two edges",
+                    ));
+                }
+                if edges
+                    .windows(2)
+                    .any(|pair| !pair[0].is_finite() || !pair[1].is_finite() || pair[1] <= pair[0])
+                {
+                    return Err(Error::unsupported(
+                        name,
+                        "variable histogram edges must be finite and strictly increasing",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn bins(&self) -> usize {
+        match self {
+            Self::Fixed { bins, .. } => *bins,
+            Self::Variable { edges } => edges.len() - 1,
+        }
+    }
+
+    fn low(&self) -> f64 {
+        match self {
+            Self::Fixed { low, .. } => *low,
+            Self::Variable { edges } => edges[0],
+        }
+    }
+
+    fn high(&self) -> f64 {
+        match self {
+            Self::Fixed { high, .. } => *high,
+            Self::Variable { edges } => edges[edges.len() - 1],
+        }
+    }
+
+    fn edges(&self) -> &[f64] {
+        match self {
+            Self::Fixed { .. } => &[],
+            Self::Variable { edges } => edges,
+        }
+    }
+}
+
+/// Writable one-dimensional histogram payload for a ROOT `TH1F` key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Th1F {
+    name: String,
+    title: String,
+    axis: HistogramAxis,
+    contents: Vec<f64>,
+    sumw2: Vec<f64>,
+    entries: f64,
+    tsumwx: f64,
+    tsumwx2: f64,
+}
+
+impl Th1F {
+    /// Build a `TH1F`.
+    ///
+    /// `contents` and `sumw2` include underflow at index 0 and overflow at
+    /// index `nbins + 1`.
+    pub fn new(
+        name: impl Into<String>,
+        title: impl Into<String>,
+        axis: HistogramAxis,
+        contents: Vec<f64>,
+        sumw2: Vec<f64>,
+        entries: f64,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            title: title.into(),
+            axis,
+            contents,
+            sumw2,
+            entries,
+            tsumwx: 0.0,
+            tsumwx2: 0.0,
+        }
+    }
+
+    /// Attach exact in-range weighted x statistics.
+    pub fn with_weighted_x_stats(mut self, sumwx: f64, sumwx2: f64) -> Self {
+        self.tsumwx = sumwx;
+        self.tsumwx2 = sumwx2;
+        self
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.name.is_empty() {
+            return Err(Error::unsupported(
+                "TH1F writer",
+                "histogram names must not be empty",
+            ));
+        }
+        self.axis.validate(&self.name)?;
+        let ncells = self.axis.bins() + 2;
+        if self.contents.len() != ncells {
+            return Err(Error::unsupported(
+                &self.name,
+                format!(
+                    "contents length is {}, expected nbins + 2 = {ncells}",
+                    self.contents.len()
+                ),
+            ));
+        }
+        if self.sumw2.len() != ncells {
+            return Err(Error::unsupported(
+                &self.name,
+                format!(
+                    "sumw2 length is {}, expected nbins + 2 = {ncells}",
+                    self.sumw2.len()
+                ),
+            ));
+        }
+        if self
+            .contents
+            .iter()
+            .any(|value| !value.is_finite() || *value < f32::MIN as f64 || *value > f32::MAX as f64)
+        {
+            return Err(Error::unsupported(
+                &self.name,
+                "TH1F bin contents must be finite and fit in f32",
+            ));
+        }
+        if self
+            .sumw2
+            .iter()
+            .chain([self.entries, self.tsumwx, self.tsumwx2].iter())
+            .any(|value| !value.is_finite())
+        {
+            return Err(Error::unsupported(
+                &self.name,
+                "histogram statistics must be finite",
+            ));
+        }
+        Ok(())
+    }
 }
 
 macro_rules! branch_ctor {
@@ -578,7 +756,109 @@ pub fn write_tree<P: AsRef<Path>>(path: P, tree_name: &str, branches: &[Branch])
     Ok(())
 }
 
+/// Write an uncompressed ROOT file containing one `TH1F` key per histogram.
+pub fn write_histograms<P: AsRef<Path>>(path: P, histograms: &[Th1F]) -> Result<()> {
+    if histograms.is_empty() {
+        return Err(Error::unsupported(
+            "TH1F writer",
+            "cannot write no histograms",
+        ));
+    }
+    for histogram in histograms {
+        histogram.validate()?;
+    }
+
+    let file_name = "nano.rust";
+    let tfile_key_len = tfile_directory_key_len(file_name);
+    let nbytes_name = tfile_nbytes_name(file_name);
+
+    let mut object_keys = Vec::with_capacity(histograms.len());
+    let mut object_headers = Vec::with_capacity(histograms.len());
+    let mut next_seek = FILE_BEGIN as u64 + tfile_key_len as u64;
+    for histogram in histograms {
+        let object = build_th1f_object(histogram)?;
+        let key = build_key(
+            "TH1F",
+            &histogram.name,
+            &histogram.title,
+            next_seek,
+            &object,
+        )?;
+        let header = key_spec(
+            "TH1F",
+            &histogram.name,
+            &histogram.title,
+            next_seek,
+            object.len(),
+            false,
+        )?;
+        next_seek += key.len() as u64;
+        object_keys.push(key);
+        object_headers.push(header);
+    }
+
+    let key_list_offset = next_seek;
+    let key_list_obj = build_key_list(&object_headers);
+    let key_list_key = build_key(
+        "TFile",
+        "nano.rust",
+        "nano.rust",
+        key_list_offset,
+        &key_list_obj,
+    )?;
+
+    let streamer_info_offset = key_list_offset + key_list_key.len() as u64;
+    let streamer_info_obj = checked(empty_tlist())?;
+    let streamer_info_key = build_key(
+        "TList",
+        "StreamerInfo",
+        "Doubly linked list",
+        streamer_info_offset,
+        &streamer_info_obj,
+    )?;
+
+    let file_end = streamer_info_offset + streamer_info_key.len() as u64 + 4;
+    let mut file_bytes = vec![0; FILE_BEGIN as usize];
+    write_file_header_with_nbytes_name(
+        &mut file_bytes[..75],
+        u32::try_from(file_end).map_err(|_| Error::unsupported("TFile", "file too large"))?,
+        u32::try_from(nbytes_name)
+            .map_err(|_| Error::unsupported("TFile", "TFile name too large"))?,
+        u32::try_from(streamer_info_offset)
+            .map_err(|_| Error::unsupported("TFile", "streamer info offset too large"))?,
+        u32::try_from(streamer_info_key.len())
+            .map_err(|_| Error::unsupported("TFile", "streamer info key too large"))?,
+    );
+    file_bytes.extend(build_tfile_directory_key(
+        file_name,
+        u32::try_from(key_list_offset)
+            .map_err(|_| Error::unsupported("TFile", "key list offset too large"))?,
+        u32::try_from(key_list_key.len())
+            .map_err(|_| Error::unsupported("TFile", "key list too large"))?,
+    )?);
+    for key in object_keys {
+        file_bytes.extend(key);
+    }
+    file_bytes.extend(key_list_key);
+    file_bytes.extend(streamer_info_key);
+    file_bytes.extend([0, 0, 0, 0]);
+
+    let mut file = File::create(path)?;
+    file.write_all(&file_bytes)?;
+    Ok(())
+}
+
 fn write_file_header(out: &mut [u8], end: u32, seek_info: u32, nbytes_info: u32) {
+    write_file_header_with_nbytes_name(out, end, 0, seek_info, nbytes_info);
+}
+
+fn write_file_header_with_nbytes_name(
+    out: &mut [u8],
+    end: u32,
+    nbytes_name: u32,
+    seek_info: u32,
+    nbytes_info: u32,
+) {
     let mut bytes = Vec::with_capacity(75);
     bytes.extend(b"root");
     put_i32(&mut bytes, 62400);
@@ -587,7 +867,7 @@ fn write_file_header(out: &mut [u8], end: u32, seek_info: u32, nbytes_info: u32)
     put_u32(&mut bytes, 0);
     put_i32(&mut bytes, 0);
     put_i32(&mut bytes, 0);
-    put_i32(&mut bytes, 0);
+    put_i32(&mut bytes, nbytes_name as i32);
     put_u8(&mut bytes, 4);
     put_i32(&mut bytes, 0);
     put_u32(&mut bytes, seek_info);
@@ -595,6 +875,63 @@ fn write_file_header(out: &mut [u8], end: u32, seek_info: u32, nbytes_info: u32)
     put_u16(&mut bytes, 1);
     bytes.extend([0; 16]);
     out[..bytes.len()].copy_from_slice(&bytes);
+}
+
+fn build_tfile_directory_key(
+    file_name: &str,
+    seek_keys: u32,
+    n_bytes_keys: u32,
+) -> Result<Vec<u8>> {
+    let directory = build_stock_directory(file_name, seek_keys, n_bytes_keys)?;
+    let object_len = root_c_string_len(file_name) + directory.len();
+    let key_len = key_header_len("TFile", file_name, "");
+    let spec = TKeySpec {
+        total_size: u32::try_from(key_len + object_len)
+            .map_err(|_| Error::unsupported("TFile", "directory key too large"))?,
+        version: 1004,
+        uncomp_len: u32::try_from(object_len)
+            .map_err(|_| Error::unsupported("TFile", "directory payload too large"))?,
+        datime: 0,
+        key_len: i16::try_from(key_len)
+            .map_err(|_| Error::unsupported("TFile", "directory key header too large"))?,
+        cycle: 1,
+        seek_key: FILE_BEGIN as u64,
+        seek_pdir: 0,
+        class_name: "TFile".to_string(),
+        obj_name: file_name.to_string(),
+        obj_title: String::new(),
+    };
+    let mut out = Vec::with_capacity(key_len + object_len);
+    write_key_header(&mut out, &spec);
+    put_c_string(&mut out, file_name);
+    out.extend(directory);
+    Ok(out)
+}
+
+fn tfile_nbytes_name(file_name: &str) -> usize {
+    key_header_len("TFile", file_name, "") + root_c_string_len(file_name)
+}
+
+fn tfile_directory_key_len(file_name: &str) -> usize {
+    tfile_nbytes_name(file_name) + STOCK_DIRECTORY_SIZE
+}
+
+fn build_stock_directory(file_name: &str, seek_keys: u32, n_bytes_keys: u32) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(STOCK_DIRECTORY_SIZE);
+    put_i16(&mut out, 5);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, 0);
+    put_i32(&mut out, n_bytes_keys as i32);
+    put_i32(
+        &mut out,
+        i32::try_from(tfile_nbytes_name(file_name))
+            .map_err(|_| Error::unsupported("TFile", "TFile name too large"))?,
+    );
+    put_u32(&mut out, FILE_BEGIN);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, seek_keys);
+    out.extend([0; STOCK_DIRECTORY_SIZE - 30]);
+    Ok(out)
 }
 
 fn build_directory(seek_keys: u32, n_bytes_keys: u32) -> Vec<u8> {
@@ -617,6 +954,100 @@ fn build_key_list(headers: &[TKeySpec]) -> Vec<u8> {
         write_key_header(&mut out, header);
     }
     out
+}
+
+fn build_th1f_object(histogram: &Th1F) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    put_u16(&mut out, 3);
+    out.extend(checked(build_th1_base(histogram)?)?);
+    out.extend(tarray_f(&histogram.contents)?);
+    checked(out)
+}
+
+fn build_th1_base(histogram: &Th1F) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    put_u16(&mut out, 8);
+    out.extend(checked(tnamed(&histogram.name, &histogram.title))?);
+    out.extend(checked(tattline_v2())?);
+    out.extend(checked(tattfill_v2())?);
+    out.extend(checked(tattmarker_v2())?);
+
+    let nbins = histogram.axis.bins();
+    let ncells = nbins + 2;
+    put_i32(
+        &mut out,
+        i32::try_from(ncells).map_err(|_| Error::unsupported(&histogram.name, "too many bins"))?,
+    );
+    out.extend(checked(taxis(
+        "xaxis",
+        "",
+        nbins,
+        histogram.axis.low(),
+        histogram.axis.high(),
+        histogram.axis.edges(),
+        1.0,
+    )?)?);
+    out.extend(checked(taxis("yaxis", "", 1, 0.0, 1.0, &[], 0.0)?)?);
+    out.extend(checked(taxis("zaxis", "", 1, 0.0, 1.0, &[], 1.0)?)?);
+
+    put_i16(&mut out, 0);
+    put_i16(&mut out, 1000);
+    put_f64(&mut out, histogram.entries);
+    put_f64(&mut out, in_range_sum(&histogram.contents));
+    put_f64(&mut out, in_range_sum(&histogram.sumw2));
+    put_f64(&mut out, histogram.tsumwx);
+    put_f64(&mut out, histogram.tsumwx2);
+    put_f64(&mut out, -1111.0);
+    put_f64(&mut out, -1111.0);
+    put_f64(&mut out, 0.0);
+
+    out.extend(tarray_d(&[])?);
+    out.extend(tarray_d(&histogram.sumw2)?);
+    put_string(&mut out, "");
+    out.extend(checked(empty_tlist())?);
+    put_i32(&mut out, 0);
+    put_u8(&mut out, 0);
+    put_i32(&mut out, 0);
+    put_i32(&mut out, 2);
+    Ok(out)
+}
+
+fn in_range_sum(values: &[f64]) -> f64 {
+    values
+        .get(1..values.len().saturating_sub(1))
+        .unwrap_or(&[])
+        .iter()
+        .sum()
+}
+
+fn taxis(
+    name: &str,
+    title: &str,
+    bins: usize,
+    low: f64,
+    high: f64,
+    edges: &[f64],
+    title_offset: f32,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    put_u16(&mut out, 10);
+    out.extend(checked(tnamed(name, title))?);
+    out.extend(checked(tattaxis_v4(title_offset))?);
+    put_i32(
+        &mut out,
+        i32::try_from(bins).map_err(|_| Error::unsupported(name, "too many axis bins"))?,
+    );
+    put_f64(&mut out, low);
+    put_f64(&mut out, high);
+    out.extend(tarray_d(edges)?);
+    put_i32(&mut out, 0);
+    put_i32(&mut out, 0);
+    put_u16(&mut out, 0);
+    put_u8(&mut out, 0);
+    put_string(&mut out, "");
+    put_u32(&mut out, 0);
+    put_u32(&mut out, 0);
+    Ok(out)
 }
 
 fn build_tree_object(
@@ -1016,9 +1447,26 @@ fn tattline_v1() -> Vec<u8> {
     out
 }
 
+fn tattline_v2() -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u16(&mut out, 2);
+    put_i16(&mut out, 1);
+    put_i16(&mut out, 1);
+    put_i16(&mut out, 1);
+    out
+}
+
 fn tattfill_v1() -> Vec<u8> {
     let mut out = Vec::new();
     put_u16(&mut out, 1);
+    put_i16(&mut out, 0);
+    put_i16(&mut out, 1001);
+    out
+}
+
+fn tattfill_v2() -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u16(&mut out, 2);
     put_i16(&mut out, 0);
     put_i16(&mut out, 1001);
     out
@@ -1031,6 +1479,47 @@ fn tattmarker_v2() -> Vec<u8> {
     put_i16(&mut out, 1);
     put_f32(&mut out, 1.0);
     out
+}
+
+fn tattaxis_v4(title_offset: f32) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u16(&mut out, 4);
+    put_i32(&mut out, 510);
+    put_i16(&mut out, 1);
+    put_i16(&mut out, 1);
+    put_i16(&mut out, 42);
+    put_f32(&mut out, 0.005);
+    put_f32(&mut out, 0.035);
+    put_f32(&mut out, 0.03);
+    put_f32(&mut out, title_offset);
+    put_f32(&mut out, 0.035);
+    put_i16(&mut out, 1);
+    put_i16(&mut out, 42);
+    out
+}
+
+fn tarray_f(values: &[f64]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    put_i32(
+        &mut out,
+        i32::try_from(values.len()).map_err(|_| Error::unsupported("TArrayF", "too large"))?,
+    );
+    for &value in values {
+        put_f32(&mut out, value as f32);
+    }
+    Ok(out)
+}
+
+fn tarray_d(values: &[f64]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    put_i32(
+        &mut out,
+        i32::try_from(values.len()).map_err(|_| Error::unsupported("TArrayD", "too large"))?,
+    );
+    for &value in values {
+        put_f64(&mut out, value);
+    }
+    Ok(out)
 }
 
 fn tobjarray(name: &str, objects: Vec<Vec<u8>>) -> Vec<u8> {
@@ -1187,6 +1676,10 @@ fn root_string_len(value: &str) -> usize {
     } else {
         5 + value.len()
     }
+}
+
+fn root_c_string_len(value: &str) -> usize {
+    value.len() + 1
 }
 
 fn put_c_string(out: &mut Vec<u8>, value: &str) {

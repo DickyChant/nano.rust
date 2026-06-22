@@ -350,8 +350,14 @@ pub struct Hist1D {
     low: f64,
     high: f64,
     bins: Vec<f64>,
+    bin_sumw2: Vec<f64>,
     underflow: f64,
     overflow: f64,
+    underflow_sumw2: f64,
+    overflow_sumw2: f64,
+    entries: f64,
+    sumwx: f64,
+    sumwx2: f64,
 }
 
 impl Hist1D {
@@ -369,14 +375,40 @@ impl Hist1D {
             low,
             high,
             bins: vec![0.0; bins],
+            bin_sumw2: vec![0.0; bins],
             underflow: 0.0,
             overflow: 0.0,
+            underflow_sumw2: 0.0,
+            overflow_sumw2: 0.0,
+            entries: 0.0,
+            sumwx: 0.0,
+            sumwx2: 0.0,
         }
+    }
+
+    /// Number of regular bins, excluding underflow and overflow.
+    pub fn nbins(&self) -> usize {
+        self.bins.len()
+    }
+
+    /// Lower edge of the first regular bin.
+    pub fn low(&self) -> f64 {
+        self.low
+    }
+
+    /// Upper edge of the last regular bin.
+    pub fn high(&self) -> f64 {
+        self.high
     }
 
     /// Bin contents, excluding underflow and overflow.
     pub fn bins(&self) -> &[f64] {
         &self.bins
+    }
+
+    /// Per-bin sum of squared weights, excluding underflow and overflow.
+    pub fn bin_sumw2(&self) -> &[f64] {
+        &self.bin_sumw2
     }
 
     pub fn underflow(&self) -> f64 {
@@ -387,8 +419,30 @@ impl Hist1D {
         self.overflow
     }
 
+    pub fn underflow_sumw2(&self) -> f64 {
+        self.underflow_sumw2
+    }
+
+    pub fn overflow_sumw2(&self) -> f64 {
+        self.overflow_sumw2
+    }
+
+    pub fn entries(&self) -> f64 {
+        self.entries
+    }
+
     pub fn sumw(&self) -> f64 {
         self.underflow + self.overflow + self.bins.iter().sum::<f64>()
+    }
+
+    /// In-range sum of weighted x values.
+    pub fn sumwx(&self) -> f64 {
+        self.sumwx
+    }
+
+    /// In-range sum of weighted x squared values.
+    pub fn sumwx2(&self) -> f64 {
+        self.sumwx2
     }
 
     /// Add another histogram with identical binning into this one.
@@ -400,21 +454,36 @@ impl Hist1D {
         assert_eq!(self.high, other.high, "histogram high edge mismatch");
         self.underflow += other.underflow;
         self.overflow += other.overflow;
+        self.underflow_sumw2 += other.underflow_sumw2;
+        self.overflow_sumw2 += other.overflow_sumw2;
+        self.entries += other.entries;
+        self.sumwx += other.sumwx;
+        self.sumwx2 += other.sumwx2;
         for (left, right) in self.bins.iter_mut().zip(&other.bins) {
+            *left += right;
+        }
+        for (left, right) in self.bin_sumw2.iter_mut().zip(&other.bin_sumw2) {
             *left += right;
         }
     }
 
     /// Fill one value with an explicit numeric weight.
     pub fn fill_weighted(&mut self, value: f64, weight: f64) {
+        self.entries += 1.0;
+        let weight2 = weight * weight;
         if value < self.low {
             self.underflow += weight;
+            self.underflow_sumw2 += weight2;
         } else if value >= self.high {
             self.overflow += weight;
+            self.overflow_sumw2 += weight2;
         } else {
             let width = self.high - self.low;
             let bin = ((value - self.low) / width * self.bins.len() as f64) as usize;
             self.bins[bin] += weight;
+            self.bin_sumw2[bin] += weight2;
+            self.sumwx += weight * value;
+            self.sumwx2 += weight * value * value;
         }
     }
 }
@@ -447,6 +516,11 @@ impl<S: Ord> HistSet1D<S> {
         self.histograms
             .get_mut(&systematic)
             .expect("systematic histogram was not initialized")
+    }
+
+    /// Iterate over systematic-variation histograms in stable key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&S, &Hist1D)> {
+        self.histograms.iter()
     }
 
     /// Add another histogram set with identical binning into this one.

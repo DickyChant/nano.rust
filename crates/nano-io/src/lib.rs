@@ -580,9 +580,13 @@ pub mod reader {
 }
 
 pub mod writer {
+    use std::fmt::Display;
     use std::path::Path;
 
-    use nano_rootio::write::{write_tree, Branch};
+    use nano_analysis::{Hist1D, HistSet1D};
+    use nano_rootio::write::{
+        write_histograms as write_root_histograms, write_tree, Branch, HistogramAxis, Th1F,
+    };
 
     use crate::Result;
 
@@ -641,6 +645,58 @@ pub mod writer {
             .map(OutputBranch::to_root_branch)
             .collect::<Vec<_>>();
         Ok(write_tree(path, "Events", &root_branches)?)
+    }
+
+    /// Write named analysis histograms as top-level ROOT `TH1F` objects.
+    pub fn write_histograms(path: &Path, histograms: &[(&str, &Hist1D)]) -> Result<()> {
+        let root_histograms = histograms
+            .iter()
+            .map(|(name, hist)| to_root_histogram(name, hist))
+            .collect::<Vec<_>>();
+        Ok(write_root_histograms(path, &root_histograms)?)
+    }
+
+    /// Write systematic histogram sets as top-level ROOT `TH1F` objects.
+    ///
+    /// Each variation is named `{base}_{variation}`.
+    pub fn write_histogram_sets<S>(path: &Path, histograms: &[(&str, &HistSet1D<S>)]) -> Result<()>
+    where
+        S: Ord + Display,
+    {
+        let root_histograms = histograms
+            .iter()
+            .flat_map(|(base_name, set)| {
+                set.iter().map(move |(variation, hist)| {
+                    let name = format!("{base_name}_{variation}");
+                    to_root_histogram(&name, hist)
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(write_root_histograms(path, &root_histograms)?)
+    }
+
+    fn to_root_histogram(name: &str, hist: &Hist1D) -> Th1F {
+        let contents = std::iter::once(hist.underflow())
+            .chain(hist.bins().iter().copied())
+            .chain(std::iter::once(hist.overflow()))
+            .collect::<Vec<_>>();
+        let sumw2 = std::iter::once(hist.underflow_sumw2())
+            .chain(hist.bin_sumw2().iter().copied())
+            .chain(std::iter::once(hist.overflow_sumw2()))
+            .collect::<Vec<_>>();
+        Th1F::new(
+            name,
+            name,
+            HistogramAxis::Fixed {
+                bins: hist.nbins(),
+                low: hist.low(),
+                high: hist.high(),
+            },
+            contents,
+            sumw2,
+            hist.entries(),
+        )
+        .with_weighted_x_stats(hist.sumwx(), hist.sumwx2())
     }
 }
 

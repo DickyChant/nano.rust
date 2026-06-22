@@ -23,4 +23,4 @@ pub(crate) use self::types::*;
 pub use self::data_source::HttpSourceOptions;
 pub use self::data_source::Source;
 pub use self::file::RootFile;
-pub use self::file_item::FileItem;
+pub use self::file_item::{FileItem, Th1F as Hist1F};
