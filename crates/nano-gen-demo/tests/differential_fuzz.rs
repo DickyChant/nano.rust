@@ -5,7 +5,8 @@
 //! NanoAOD v9 Muon/Electron/Jet branches, with randomized f32 object cuts,
 //! two or three count/predicate/derived-object regions, count/count-where/
 //! leading-pt/sum-pt/bool/derived outputs, pair-derived objects, nested
-//! pair-plus-candidate objects, cross-collection candidate objects, and optional
+//! pair-plus-candidate objects, cross-collection candidate objects, event-level
+//! trigger/flag/lumi-mask requirements, and optional
 //! histograms over object or derived attributes with optional weight, pt-shape,
 //! or combined weight-plus-shape systematics. Covered model combinations include
 //! model-only, model+histogram, model+derived, and model+weight-systematic
@@ -18,6 +19,10 @@
 //! histograms reading both score and derived attributes.
 //! A targeted union corpus adds multi-channel Muon/Electron/Jet specs with
 //! matching output schemas and shared histograms.
+//! Targeted real-analysis corpora cover correctionlib scale-factor weights,
+//! correctionlib JES shape variations with migration-sensitive rows, golden-JSON
+//! luminosity masks combined with trigger/flag requirements, and supported
+//! combined SF+JES+lumi-mask specs.
 //!
 //! This test validates every generated spec, lowers it to KIR, verifies KIR,
 //! requires string codegen to succeed, then compares the KIR interpreter against
@@ -34,13 +39,15 @@
 //! Derived objects under model-aware codegen are compared in their own targeted
 //! corpus, covering pair and candidate construction after mock inference.
 //! Multi-channel union specs are compared as rows per event plus their shared
-//! histogram contents. Non-mock model providers remain excluded because the
+//! histogram contents. Correctionlib SF histograms compare Nominal/SFUp/SFDown,
+//! JES shape specs compare Nominal/JESUp/JESDown rows and histograms, and
+//! lumi-mask specs compare event vetoes on data-like synthetic events. Non-mock model providers remain excluded because the
 //! dependency-free interpreter intentionally supports only the mock provider.
 
 use nano_core::{BranchColumn, BranchSchema, BranchSpec, BranchType, Event};
 use nano_gen_demo::fuzz::{
-    FuzzCaseResult, FuzzHist1D, FuzzHistVariation, FuzzRow, FuzzUnionCaseResult, FuzzUnionRow,
-    FuzzValue,
+    FuzzCaseResult, FuzzHist1D, FuzzHistVariation, FuzzRow, FuzzRowsVariation, FuzzUnionCaseResult,
+    FuzzUnionRow, FuzzValue,
 };
 use nano_spec::codegen::generate_producer_source;
 use nano_spec::interpret::{
@@ -589,6 +596,139 @@ fn generated_weight_shape_specs_interpret_like_compiled_codegen() {
 }
 
 #[test]
+fn generated_scale_factor_specs_interpret_like_compiled_codegen() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let cases = fuzz_specs::generated_scale_factor_specs();
+    let events = synthetic_events();
+
+    let counts = compare_generated_case_corpus(
+        "scale-factor",
+        &cases,
+        &catalogue,
+        &events,
+        nano_gen_demo::fuzz::run_scale_factor_case,
+    );
+
+    assert_eq!(cases.len(), fuzz_specs::FUZZ_SCALE_FACTOR_SPEC_COUNT);
+    assert_eq!(counts.compiled_compared, cases.len());
+    assert_eq!(
+        counts.compiled_compared,
+        nano_gen_demo::fuzz::FUZZ_SCALE_FACTOR_CASES
+    );
+    assert_eq!(counts.histogram_cases, cases.len());
+    assert_eq!(counts.weight_systematic_cases, cases.len());
+    assert_eq!(counts.shape_systematic_cases, 0);
+    eprintln!(
+        "scale-factor differential fuzz seed=0x{seed:016x} generated={generated} compiled_compared={compiled_compared} histogram_cases={histogram_cases} sf_systematic_cases={weight_systematic_cases}",
+        seed = fuzz_specs::FUZZ_SEED,
+        generated = cases.len(),
+        compiled_compared = counts.compiled_compared,
+        histogram_cases = counts.histogram_cases,
+        weight_systematic_cases = counts.weight_systematic_cases,
+    );
+}
+
+#[test]
+fn generated_jes_specs_interpret_like_compiled_codegen() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let cases = fuzz_specs::generated_jes_specs();
+    let events = synthetic_events();
+
+    let counts = compare_generated_case_corpus(
+        "JES",
+        &cases,
+        &catalogue,
+        &events,
+        nano_gen_demo::fuzz::run_jes_case,
+    );
+
+    assert_eq!(cases.len(), fuzz_specs::FUZZ_JES_SPEC_COUNT);
+    assert_eq!(counts.compiled_compared, cases.len());
+    assert_eq!(
+        counts.compiled_compared,
+        nano_gen_demo::fuzz::FUZZ_JES_CASES
+    );
+    assert_eq!(counts.histogram_cases, cases.len());
+    assert_eq!(counts.shape_systematic_cases, cases.len());
+    assert_eq!(counts.systematic_row_cases, cases.len());
+    eprintln!(
+        "JES differential fuzz seed=0x{seed:016x} generated={generated} compiled_compared={compiled_compared} histogram_cases={histogram_cases} shape_systematic_cases={shape_systematic_cases} systematic_row_cases={systematic_row_cases}",
+        seed = fuzz_specs::FUZZ_SEED,
+        generated = cases.len(),
+        compiled_compared = counts.compiled_compared,
+        histogram_cases = counts.histogram_cases,
+        shape_systematic_cases = counts.shape_systematic_cases,
+        systematic_row_cases = counts.systematic_row_cases,
+    );
+}
+
+#[test]
+fn generated_lumi_mask_specs_interpret_like_compiled_codegen() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let cases = fuzz_specs::generated_lumi_mask_specs();
+    let events = synthetic_events();
+
+    let counts = compare_generated_case_corpus(
+        "lumi-mask",
+        &cases,
+        &catalogue,
+        &events,
+        nano_gen_demo::fuzz::run_lumi_mask_case,
+    );
+
+    assert_eq!(cases.len(), fuzz_specs::FUZZ_LUMI_MASK_SPEC_COUNT);
+    assert_eq!(counts.compiled_compared, cases.len());
+    assert_eq!(
+        counts.compiled_compared,
+        nano_gen_demo::fuzz::FUZZ_LUMI_MASK_CASES
+    );
+    assert_eq!(counts.histogram_cases, 0);
+    eprintln!(
+        "lumi-mask differential fuzz seed=0x{seed:016x} generated={generated} compiled_compared={compiled_compared} histogram_cases={histogram_cases}",
+        seed = fuzz_specs::FUZZ_SEED,
+        generated = cases.len(),
+        compiled_compared = counts.compiled_compared,
+        histogram_cases = counts.histogram_cases,
+    );
+}
+
+#[test]
+fn generated_combined_real_specs_interpret_like_compiled_codegen() {
+    let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+    let cases = fuzz_specs::generated_combined_real_specs();
+    let events = synthetic_events();
+
+    let counts = compare_generated_case_corpus(
+        "combined-real",
+        &cases,
+        &catalogue,
+        &events,
+        nano_gen_demo::fuzz::run_combined_real_case,
+    );
+
+    assert_eq!(cases.len(), fuzz_specs::FUZZ_COMBINED_REAL_SPEC_COUNT);
+    assert_eq!(counts.compiled_compared, cases.len());
+    assert_eq!(
+        counts.compiled_compared,
+        nano_gen_demo::fuzz::FUZZ_COMBINED_REAL_CASES
+    );
+    assert_eq!(counts.histogram_cases, cases.len());
+    assert_eq!(counts.weight_systematic_cases, cases.len());
+    assert_eq!(counts.shape_systematic_cases, cases.len());
+    assert_eq!(counts.systematic_row_cases, cases.len());
+    eprintln!(
+        "combined-real differential fuzz seed=0x{seed:016x} generated={generated} compiled_compared={compiled_compared} histogram_cases={histogram_cases} sf_systematic_cases={weight_systematic_cases} shape_systematic_cases={shape_systematic_cases} systematic_row_cases={systematic_row_cases} skipped=0 skipped_reasons=[]",
+        seed = fuzz_specs::FUZZ_SEED,
+        generated = cases.len(),
+        compiled_compared = counts.compiled_compared,
+        histogram_cases = counts.histogram_cases,
+        weight_systematic_cases = counts.weight_systematic_cases,
+        shape_systematic_cases = counts.shape_systematic_cases,
+        systematic_row_cases = counts.systematic_row_cases,
+    );
+}
+
+#[test]
 fn derived_under_model_minimal_repro_interpret_like_compiled_codegen() {
     let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
     let case = fuzz_specs::generated_derived_under_model_specs()
@@ -605,12 +745,82 @@ fn derived_under_model_minimal_repro_interpret_like_compiled_codegen() {
     assert_eq!(compiled, interpreted, "derived-under-model repro");
 }
 
+#[derive(Debug, Default)]
+struct CorpusCounts {
+    compiled_compared: usize,
+    histogram_cases: usize,
+    weight_systematic_cases: usize,
+    shape_systematic_cases: usize,
+    systematic_row_cases: usize,
+}
+
+fn compare_generated_case_corpus(
+    label: &str,
+    cases: &[fuzz_specs::GeneratedSpec],
+    catalogue: &Catalogue,
+    events: &[Event],
+    run_compiled: fn(usize, &[Event]) -> nano_core::Result<FuzzCaseResult>,
+) -> CorpusCounts {
+    let mut counts = CorpusCounts::default();
+    for case in cases {
+        let plan = validate(&case.spec, catalogue).unwrap_or_else(|errors| {
+            panic!(
+                "generated {label} fuzz spec {} did not validate: {errors:?}\n{:#?}",
+                case.index, case.spec
+            )
+        });
+        let kir = nano_spec::kir::lower_plan_to_kir(&plan).unwrap_or_else(|error| {
+            panic!(
+                "generated {label} fuzz spec {} did not lower to KIR: {error}",
+                case.index
+            )
+        });
+        nano_spec::kir::verify(&kir).unwrap_or_else(|error| {
+            panic!(
+                "generated {label} fuzz spec {} produced invalid KIR: {error}",
+                case.index
+            )
+        });
+        generate_producer_source(&plan).unwrap_or_else(|error| {
+            panic!(
+                "generated {label} fuzz spec {} was not supported by codegen: {error}",
+                case.index
+            )
+        });
+
+        let interpreted = interpret_case(&plan, events, case);
+        let compiled = run_compiled(case.index, events).unwrap_or_else(|error| {
+            panic!("compiled {label} fuzz case {} failed: {error}", case.index)
+        });
+        assert_eq!(compiled, interpreted, "{label} fuzz case {}", case.index);
+        counts.compiled_compared += 1;
+        counts.histogram_cases += usize::from(case.has_histogram);
+        counts.weight_systematic_cases += usize::from(case.has_weight_systematic);
+        counts.shape_systematic_cases += usize::from(case.has_shape_correction);
+        counts.systematic_row_cases += usize::from(interpreted.systematic_rows.is_some());
+    }
+    counts
+}
+
 fn interpret_case(
     plan: &nano_spec::ResolvedPlan,
     events: &[Event],
     case: &fuzz_specs::GeneratedSpec,
 ) -> FuzzCaseResult {
     let mut histograms = InterpretedHistograms::new(plan);
+    let mut systematic_rows = if case.has_shape_correction && case.has_histogram {
+        Some(
+            systematic_variants(case)
+                .into_iter()
+                .map(|systematic| FuzzRowsVariation {
+                    systematic,
+                    rows: Vec::with_capacity(events.len()),
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
     let rows = events
         .iter()
         .enumerate()
@@ -619,14 +829,19 @@ fn interpret_case(
                 let row = interpret_systematic(plan, event, "Nominal")
                     .unwrap_or_else(|error| panic!("entry {entry} interpret failed: {error}"))
                     .map(normalize_interpreted_row);
-                for systematic in systematic_variants(case) {
-                    let _ =
+                for (variant_index, systematic) in systematic_variants(case).into_iter().enumerate()
+                {
+                    let systematic_row =
                         interpret_and_fill_systematic(plan, event, &mut histograms, &systematic)
                             .unwrap_or_else(|error| {
                                 panic!(
                                     "entry {entry} interpret fill {systematic:?} failed: {error}"
                                 )
-                            });
+                            })
+                            .map(normalize_interpreted_row);
+                    if let Some(rows_by_systematic) = &mut systematic_rows {
+                        rows_by_systematic[variant_index].rows.push(systematic_row);
+                    }
                 }
                 row
             } else {
@@ -653,7 +868,11 @@ fn interpret_case(
         }
     });
 
-    FuzzCaseResult { rows, histogram }
+    FuzzCaseResult {
+        rows,
+        histogram,
+        systematic_rows,
+    }
 }
 
 fn interpret_union_case(
@@ -757,6 +976,10 @@ fn systematic_variants(case: &fuzz_specs::GeneratedSpec) -> Vec<String> {
         variants.push(systematic_variant_name(name, "Up"));
         variants.push(systematic_variant_name(name, "Down"));
     }
+    for correction in case.spec.scale_factor_systematics() {
+        variants.push(systematic_variant_name(&correction.name, "Up"));
+        variants.push(systematic_variant_name(&correction.name, "Down"));
+    }
     variants
 }
 
@@ -851,6 +1074,10 @@ fn schema() -> BranchSchema {
         BranchSpec::new("Jet_mass", BranchType::VecF32),
         BranchSpec::new("Jet_btagDeepFlavB", BranchType::VecF32),
         BranchSpec::new("Jet_area", BranchType::VecF32),
+        BranchSpec::new("Flag_goodVertices", BranchType::Bool),
+        BranchSpec::new("HLT_IsoMu24", BranchType::Bool),
+        BranchSpec::new("luminosityBlock", BranchType::U32),
+        BranchSpec::new("run", BranchType::U32),
     ])
     .unwrap()
 }
@@ -954,12 +1181,65 @@ fn columns() -> Vec<(String, BranchColumn)> {
             "Jet_area".to_string(),
             BranchColumn::VecF32(vec_f32(&n_jet, "Jet", "area")),
         ),
+        (
+            "Flag_goodVertices".to_string(),
+            BranchColumn::Bool(flag_good_vertices()),
+        ),
+        (
+            "HLT_IsoMu24".to_string(),
+            BranchColumn::Bool(hlt_iso_mu24()),
+        ),
+        (
+            "luminosityBlock".to_string(),
+            BranchColumn::U32(luminosity_blocks()),
+        ),
+        ("run".to_string(), BranchColumn::U32(runs())),
     ]
 }
 
 fn counts(offset: usize) -> Vec<u32> {
     (0..EVENT_COUNT)
         .map(|entry| ((entry + offset) % 5) as u32)
+        .collect()
+}
+
+fn runs() -> Vec<u32> {
+    (0..EVENT_COUNT)
+        .map(|entry| match entry % 8 {
+            0 | 1 => 1001,
+            2 | 3 => 1002,
+            4 => 9999,
+            5 => 1001,
+            6 => 1002,
+            _ => 1003,
+        })
+        .collect()
+}
+
+fn luminosity_blocks() -> Vec<u32> {
+    (0..EVENT_COUNT)
+        .map(|entry| match entry % 8 {
+            0 => 1,
+            1 => 4,
+            2 => 5,
+            3 => 7,
+            4 => 10,
+            5 => 11,
+            6 => 9,
+            _ => 1,
+        })
+        .collect()
+}
+
+fn hlt_iso_mu24() -> Vec<bool> {
+    (0..EVENT_COUNT)
+        .map(|entry| !matches!(entry % 6, 1 | 4))
+        .collect()
+}
+
+fn flag_good_vertices() -> Vec<bool> {
+    (0..EVENT_COUNT)
+        .map(|entry| !matches!(entry % 7, 3 | 5))
         .collect()
 }
 

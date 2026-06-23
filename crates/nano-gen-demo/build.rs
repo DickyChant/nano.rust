@@ -22,6 +22,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed={}", catalogue_path.display());
     let jes_payload_path = repo_root.join("crates/nano-spec/tests/data/jes_uncertainty.json");
     println!("cargo:rerun-if-changed={}", jes_payload_path.display());
+    let muon_sf_payload_path = repo_root.join("crates/nano-spec/tests/data/muon_sf.json");
+    println!("cargo:rerun-if-changed={}", muon_sf_payload_path.display());
+    let golden_json_path = repo_root.join("crates/nano-spec/tests/data/synthetic_golden.json");
+    println!("cargo:rerun-if-changed={}", golden_json_path.display());
 
     let catalogue_text = fs::read_to_string(&catalogue_path)?;
     let catalogue = Catalogue::from_nanoaod_yaml_str(&catalogue_text, "v9")?;
@@ -83,6 +87,10 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     let model_shape_specs = fuzz_specs::generated_model_shape_specs();
     let derived_model_specs = fuzz_specs::generated_derived_under_model_specs();
     let weight_shape_specs = fuzz_specs::generated_weight_shape_specs();
+    let scale_factor_specs = fuzz_specs::generated_scale_factor_specs();
+    let jes_specs = fuzz_specs::generated_jes_specs();
+    let lumi_mask_specs = fuzz_specs::generated_lumi_mask_specs();
+    let combined_real_specs = fuzz_specs::generated_combined_real_specs();
     let mut modules = String::new();
     let derived_cases = specs.iter().filter(|case| case.has_derived_object).count();
     let candidate_cases = specs
@@ -95,6 +103,10 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     let model_shape_cases = model_shape_specs.len();
     let derived_model_cases = derived_model_specs.len();
     let weight_shape_cases = weight_shape_specs.len();
+    let scale_factor_cases = scale_factor_specs.len();
+    let jes_cases = jes_specs.len();
+    let lumi_mask_cases = lumi_mask_specs.len();
+    let combined_real_cases = combined_real_specs.len();
     writeln!(
         modules,
         "pub const FUZZ_DERIVED_CASES: usize = {derived_cases};"
@@ -132,6 +144,19 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
         modules,
         "pub const FUZZ_WEIGHT_SHAPE_CASES: usize = {weight_shape_cases};"
     )?;
+    writeln!(
+        modules,
+        "pub const FUZZ_SCALE_FACTOR_CASES: usize = {scale_factor_cases};"
+    )?;
+    writeln!(modules, "pub const FUZZ_JES_CASES: usize = {jes_cases};")?;
+    writeln!(
+        modules,
+        "pub const FUZZ_LUMI_MASK_CASES: usize = {lumi_mask_cases};"
+    )?;
+    writeln!(
+        modules,
+        "pub const FUZZ_COMBINED_REAL_CASES: usize = {combined_real_cases};"
+    )?;
     writeln!(modules)?;
     writeln!(modules, "#[derive(Debug, Clone, Copy, PartialEq)]")?;
     writeln!(modules, "pub enum FuzzValue {{")?;
@@ -160,11 +185,21 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     writeln!(modules, "}}")?;
     writeln!(modules)?;
     writeln!(modules, "#[derive(Debug, Clone, PartialEq)]")?;
+    writeln!(modules, "pub struct FuzzRowsVariation {{")?;
+    writeln!(modules, "    pub systematic: String,")?;
+    writeln!(modules, "    pub rows: Vec<Option<FuzzRow>>,")?;
+    writeln!(modules, "}}")?;
+    writeln!(modules)?;
+    writeln!(modules, "#[derive(Debug, Clone, PartialEq)]")?;
     writeln!(modules, "pub struct FuzzCaseResult {{")?;
     writeln!(modules, "    pub rows: Vec<Option<FuzzRow>>,")?;
     writeln!(
         modules,
         "    pub histogram: Option<Vec<FuzzHistVariation>>,"
+    )?;
+    writeln!(
+        modules,
+        "    pub systematic_rows: Option<Vec<FuzzRowsVariation>>,"
     )?;
     writeln!(modules, "}}")?;
     writeln!(modules)?;
@@ -348,6 +383,86 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
         emit_run_case(&mut modules, &module_name, generated)?;
     }
 
+    let mut scale_factor_arms = String::new();
+    for generated in &scale_factor_specs {
+        let module_name = format!("scale_factor_case_{:03}", generated.index);
+        let file_name = format!("generated_fuzz_scale_factor_{:03}.rs", generated.index);
+        emit_generated_module(
+            catalogue,
+            out_dir,
+            generated,
+            &module_name,
+            &file_name,
+            &mut modules,
+        )?;
+        writeln!(
+            scale_factor_arms,
+            "        {} => run_{}(events),",
+            generated.index, module_name
+        )?;
+        emit_run_case(&mut modules, &module_name, generated)?;
+    }
+
+    let mut jes_arms = String::new();
+    for generated in &jes_specs {
+        let module_name = format!("jes_case_{:03}", generated.index);
+        let file_name = format!("generated_fuzz_jes_{:03}.rs", generated.index);
+        emit_generated_module(
+            catalogue,
+            out_dir,
+            generated,
+            &module_name,
+            &file_name,
+            &mut modules,
+        )?;
+        writeln!(
+            jes_arms,
+            "        {} => run_{}(events),",
+            generated.index, module_name
+        )?;
+        emit_run_case(&mut modules, &module_name, generated)?;
+    }
+
+    let mut lumi_mask_arms = String::new();
+    for generated in &lumi_mask_specs {
+        let module_name = format!("lumi_mask_case_{:03}", generated.index);
+        let file_name = format!("generated_fuzz_lumi_mask_{:03}.rs", generated.index);
+        emit_generated_module(
+            catalogue,
+            out_dir,
+            generated,
+            &module_name,
+            &file_name,
+            &mut modules,
+        )?;
+        writeln!(
+            lumi_mask_arms,
+            "        {} => run_{}(events),",
+            generated.index, module_name
+        )?;
+        emit_run_case(&mut modules, &module_name, generated)?;
+    }
+
+    let mut combined_real_arms = String::new();
+    for generated in &combined_real_specs {
+        let module_name = format!("combined_real_case_{:03}", generated.index);
+        let file_name = format!("generated_fuzz_combined_real_{:03}.rs", generated.index);
+        emit_generated_module(
+            catalogue,
+            out_dir,
+            generated,
+            &module_name,
+            &file_name,
+            &mut modules,
+        )?;
+        writeln!(
+            combined_real_arms,
+            "        {} => run_{}(events),",
+            generated.index, module_name
+        )?;
+        emit_run_case(&mut modules, &module_name, generated)?;
+    }
+
     writeln!(
         modules,
         "pub fn run_case(case: usize, events: &[nano_core::Event]) -> nano_core::Result<FuzzCaseResult> {{"
@@ -439,6 +554,58 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     writeln!(modules, "    }}")?;
     writeln!(modules, "}}")?;
 
+    writeln!(
+        modules,
+        "pub fn run_scale_factor_case(case: usize, events: &[nano_core::Event]) -> nano_core::Result<FuzzCaseResult> {{"
+    )?;
+    writeln!(modules, "    match case {{")?;
+    modules.push_str(&scale_factor_arms);
+    writeln!(
+        modules,
+        "        _ => Err(nano_core::NanoError::MissingBranch {{ branch: format!(\"unknown scale-factor fuzz case {{case}}\") }}),"
+    )?;
+    writeln!(modules, "    }}")?;
+    writeln!(modules, "}}")?;
+
+    writeln!(
+        modules,
+        "pub fn run_jes_case(case: usize, events: &[nano_core::Event]) -> nano_core::Result<FuzzCaseResult> {{"
+    )?;
+    writeln!(modules, "    match case {{")?;
+    modules.push_str(&jes_arms);
+    writeln!(
+        modules,
+        "        _ => Err(nano_core::NanoError::MissingBranch {{ branch: format!(\"unknown JES fuzz case {{case}}\") }}),"
+    )?;
+    writeln!(modules, "    }}")?;
+    writeln!(modules, "}}")?;
+
+    writeln!(
+        modules,
+        "pub fn run_lumi_mask_case(case: usize, events: &[nano_core::Event]) -> nano_core::Result<FuzzCaseResult> {{"
+    )?;
+    writeln!(modules, "    match case {{")?;
+    modules.push_str(&lumi_mask_arms);
+    writeln!(
+        modules,
+        "        _ => Err(nano_core::NanoError::MissingBranch {{ branch: format!(\"unknown lumi-mask fuzz case {{case}}\") }}),"
+    )?;
+    writeln!(modules, "    }}")?;
+    writeln!(modules, "}}")?;
+
+    writeln!(
+        modules,
+        "pub fn run_combined_real_case(case: usize, events: &[nano_core::Event]) -> nano_core::Result<FuzzCaseResult> {{"
+    )?;
+    writeln!(modules, "    match case {{")?;
+    modules.push_str(&combined_real_arms);
+    writeln!(
+        modules,
+        "        _ => Err(nano_core::NanoError::MissingBranch {{ branch: format!(\"unknown combined real-surface fuzz case {{case}}\") }}),"
+    )?;
+    writeln!(modules, "    }}")?;
+    writeln!(modules, "}}")?;
+
     fs::write(out_dir.join("generated_fuzz_modules.rs"), modules)?;
     Ok(())
 }
@@ -514,6 +681,14 @@ fn emit_run_case(
             )?;
         }
         if generated.has_shape_correction {
+            writeln!(modules, "    let mut shape_rows = vec![")?;
+            for (name, _) in systematic_variants(&generated.spec) {
+                writeln!(
+                    modules,
+                    "        FuzzRowsVariation {{ systematic: \"{name}\".to_string(), rows: Vec::with_capacity(events.len()) }},"
+                )?;
+            }
+            writeln!(modules, "    ];")?;
             writeln!(modules, "    for event in events {{")?;
             writeln!(
                 modules,
@@ -524,10 +699,12 @@ fn emit_run_case(
                     format!("{module_name}::GeneratedProducer::analyze(event)?.map(normalize_{module_name})")
                 }
             )?;
-            for (_, variant) in systematic_variants(&generated.spec) {
+            for (variant_index, (_, variant)) in
+                systematic_variants(&generated.spec).into_iter().enumerate()
+            {
                 writeln!(
                     modules,
-                    "        let _ = {fill_call};",
+                    "        shape_rows[{variant_index}].rows.push({fill_call}.map(normalize_{module_name}));",
                     fill_call = if generated.has_model {
                         format!("{module_name}::GeneratedProducer::analyze_and_fill(event, &mut histograms, {module_name}::Systematic::{variant}, &predictor).map_err(|error| nano_core::NanoError::MissingAttachment {{ name: error.to_string() }})?")
                     } else {
@@ -536,6 +713,7 @@ fn emit_run_case(
                 )?;
             }
             writeln!(modules, "    }}")?;
+            writeln!(modules, "    let systematic_rows = Some(shape_rows);")?;
         } else {
             writeln!(modules, "    for event in events {{")?;
             writeln!(
@@ -593,7 +771,13 @@ fn emit_run_case(
         writeln!(modules, "    }}")?;
         writeln!(modules, "    let histogram = None;")?;
     }
-    writeln!(modules, "    Ok(FuzzCaseResult {{ rows, histogram }})")?;
+    if !generated.has_shape_correction {
+        writeln!(modules, "    let systematic_rows = None;")?;
+    }
+    writeln!(
+        modules,
+        "    Ok(FuzzCaseResult {{ rows, histogram, systematic_rows }})"
+    )?;
     writeln!(modules, "}}")?;
     writeln!(modules)?;
     writeln!(
@@ -720,6 +904,16 @@ fn systematic_variants(spec: &AnalysisSpec) -> Vec<(String, String)> {
         }
     }
     for correction in &spec.shape_corrections {
+        variants.push((
+            format!("{}Up", upper_camel(&correction.name)),
+            format!("{}Up", upper_camel(&correction.name)),
+        ));
+        variants.push((
+            format!("{}Down", upper_camel(&correction.name)),
+            format!("{}Down", upper_camel(&correction.name)),
+        ));
+    }
+    for correction in spec.scale_factor_systematics() {
         variants.push((
             format!("{}Up", upper_camel(&correction.name)),
             format!("{}Up", upper_camel(&correction.name)),
