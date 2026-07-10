@@ -943,6 +943,7 @@ fn channel_as_spec(channel: &ChannelDef, parent: &AnalysisSpec) -> AnalysisSpec 
         object_corrections: parent.object_corrections.clone(),
         shape_corrections: parent.shape_corrections.clone(),
         scale_factor_corrections: parent.scale_factor_corrections.clone(),
+        validation: parent.validation.clone(),
         channels: Vec::new(),
     }
 }
@@ -1038,6 +1039,7 @@ fn normalize_value(value: Value) -> FuzzValue {
         Value::F64(value) => FuzzValue::F64(value),
         Value::I64(value) => FuzzValue::I64(value),
         Value::U32(value) => FuzzValue::U32(value),
+        Value::U64(value) => FuzzValue::U64(value),
         Value::Bool(value) => FuzzValue::Bool(value),
     }
 }

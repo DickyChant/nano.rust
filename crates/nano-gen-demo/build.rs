@@ -162,6 +162,7 @@ fn generate_fuzz_modules(catalogue: &Catalogue, out_dir: &Path) -> Result<(), Bo
     writeln!(modules, "pub enum FuzzValue {{")?;
     writeln!(modules, "    F64(f64),")?;
     writeln!(modules, "    U32(u32),")?;
+    writeln!(modules, "    U64(u64),")?;
     writeln!(modules, "    Bool(bool),")?;
     writeln!(modules, "    I64(i64),")?;
     writeln!(modules, "}}")?;

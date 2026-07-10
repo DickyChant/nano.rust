@@ -203,6 +203,7 @@ fn expr_uses_candidate_filter_expr(expr: &Expr) -> bool {
         | Expr::IndexNotIn { .. }
         | Expr::JetIdTightRun2024 { .. }
         | Expr::JetVetoMapRun2024 { .. }
+        | Expr::LeadingType1Mt { .. }
         | Expr::LeadingAttr { .. }
         | Expr::PairDeltaR
         | Expr::PairLeadingPt

@@ -608,6 +608,7 @@ pub fn generated_scale_factor_specs() -> Vec<GeneratedSpec> {
                         &format!("sf_weight_{index:03}"),
                         &collection,
                     )],
+                    validation: None,
                     channels: Vec::new(),
                 },
                 has_histogram: true,
@@ -706,6 +707,7 @@ pub fn generated_jes_specs() -> Vec<GeneratedSpec> {
                         &collection,
                     )],
                     scale_factor_corrections: Vec::new(),
+                    validation: None,
                     channels: Vec::new(),
                 },
                 has_histogram: true,
@@ -787,6 +789,7 @@ pub fn generated_lumi_mask_specs() -> Vec<GeneratedSpec> {
                     object_corrections: Vec::new(),
                     shape_corrections: Vec::new(),
                     scale_factor_corrections: Vec::new(),
+                    validation: None,
                     channels: Vec::new(),
                 },
                 has_histogram: false,
@@ -922,6 +925,7 @@ pub fn generated_combined_real_specs() -> Vec<GeneratedSpec> {
                         &format!("combo_sf_{index:03}"),
                         "combo_muon",
                     )],
+                    validation: None,
                     channels: Vec::new(),
                 },
                 has_histogram: true,
@@ -1024,6 +1028,7 @@ fn generated_union_spec(index: usize) -> GeneratedSpec {
             object_corrections: Vec::new(),
             shape_corrections: Vec::new(),
             scale_factor_corrections: Vec::new(),
+            validation: None,
             channels,
         },
         has_histogram: true,
@@ -1205,6 +1210,7 @@ fn generated_standard_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec 
             object_corrections: Vec::new(),
             shape_corrections,
             scale_factor_corrections: Vec::new(),
+            validation: None,
             channels: Vec::new(),
         },
         has_histogram,
@@ -1352,6 +1358,7 @@ fn generated_model_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
             object_corrections: Vec::new(),
             shape_corrections: Vec::new(),
             scale_factor_corrections: Vec::new(),
+            validation: None,
             channels: Vec::new(),
         },
         has_histogram: false,
@@ -1721,6 +1728,7 @@ fn output(name: &str, expr: Expr) -> OutputDef {
     OutputDef {
         name: name.to_string(),
         expr,
+        dtype: None,
     }
 }
 
