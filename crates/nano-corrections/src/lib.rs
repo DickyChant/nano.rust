@@ -13,6 +13,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Convenient result alias for correction evaluation.
 pub type Result<T> = std::result::Result<T, CorrectionError>;
@@ -158,6 +159,8 @@ impl From<serde_json::Error> for CorrectionError {
 pub struct CorrectionSet {
     pub schema_version: Option<u32>,
     pub corrections: Vec<Correction>,
+    #[serde(default)]
+    pub compound_corrections: Vec<CompoundCorrection>,
 }
 
 impl CorrectionSet {
@@ -185,6 +188,60 @@ impl CorrectionSet {
             .iter()
             .find(|correction| correction.name == name)
             .ok_or_else(|| CorrectionError::MissingCorrection(name.to_string()))
+    }
+
+    /// Return a compound correction by name.
+    pub fn compound_correction(&self, name: &str) -> Result<&CompoundCorrection> {
+        self.compound_corrections
+            .iter()
+            .find(|correction| correction.name == name)
+            .ok_or_else(|| CorrectionError::MissingCorrection(name.to_string()))
+    }
+
+    /// Return a simple or compound correction by name.
+    pub fn correction_ref(&self, name: &str) -> Result<CorrectionRef<'_>> {
+        if let Some(correction) = self
+            .corrections
+            .iter()
+            .find(|correction| correction.name == name)
+        {
+            return Ok(CorrectionRef::Simple(correction));
+        }
+        self.compound_corrections
+            .iter()
+            .find(|correction| correction.name == name)
+            .map(CorrectionRef::Compound)
+            .ok_or_else(|| CorrectionError::MissingCorrection(name.to_string()))
+    }
+}
+
+/// Borrowed view over a simple or compound correctionlib payload.
+#[derive(Debug, Clone, Copy)]
+pub enum CorrectionRef<'a> {
+    Simple(&'a Correction),
+    Compound(&'a CompoundCorrection),
+}
+
+impl CorrectionRef<'_> {
+    pub fn inputs(&self) -> &[Variable] {
+        match self {
+            Self::Simple(correction) => &correction.inputs,
+            Self::Compound(correction) => &correction.inputs,
+        }
+    }
+
+    pub fn output(&self) -> &Variable {
+        match self {
+            Self::Simple(correction) => &correction.output,
+            Self::Compound(correction) => &correction.output,
+        }
+    }
+
+    pub fn evaluate(&self, set: &CorrectionSet, values: &[Value]) -> Result<f64> {
+        match self {
+            Self::Simple(correction) => correction.evaluate(values),
+            Self::Compound(correction) => correction.evaluate(set, values),
+        }
     }
 }
 
@@ -227,6 +284,113 @@ impl Correction {
     }
 }
 
+/// A correctionlib compound correction.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompoundCorrection {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub inputs: Vec<Variable>,
+    pub output: Variable,
+    #[serde(default)]
+    pub inputs_update: Vec<String>,
+    pub input_op: String,
+    pub output_op: String,
+    pub stack: Vec<String>,
+}
+
+impl CompoundCorrection {
+    /// Evaluate a correctionlib compound correction using corrections from its parent set.
+    ///
+    /// The supported slice covers correctionlib's numeric `+` and `*` input and
+    /// output operations, which is enough for standard JEC compound stacks.
+    pub fn evaluate(&self, set: &CorrectionSet, values: &[Value]) -> Result<f64> {
+        if values.len() != self.inputs.len() {
+            return Err(CorrectionError::InputCount {
+                correction: self.name.clone(),
+                expected: self.inputs.len(),
+                actual: values.len(),
+            });
+        }
+        for (input, value) in self.inputs.iter().zip(values) {
+            validate_value(input, value)?;
+        }
+
+        let mut context = self
+            .inputs
+            .iter()
+            .zip(values)
+            .map(|(input, value)| (input.name.clone(), value.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut output = op_identity(&self.output_op)?;
+
+        for correction_name in &self.stack {
+            let correction = set.correction(correction_name)?;
+            let stack_values = correction
+                .inputs
+                .iter()
+                .map(|input| {
+                    context
+                        .get(&input.name)
+                        .cloned()
+                        .ok_or_else(|| CorrectionError::UnknownInput(input.name.clone()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let value = correction.evaluate(&stack_values)?;
+            output = apply_op(&self.output_op, output, value)?;
+
+            for input_name in &self.inputs_update {
+                let current = context
+                    .get(input_name)
+                    .ok_or_else(|| CorrectionError::UnknownInput(input_name.clone()))?;
+                let current = match current {
+                    Value::Real(value) => *value,
+                    Value::Str(_) => {
+                        return Err(CorrectionError::TypeMismatch {
+                            input: input_name.clone(),
+                            expected: InputType::Real,
+                            actual: "string",
+                        });
+                    }
+                    Value::Int(_) => {
+                        return Err(CorrectionError::TypeMismatch {
+                            input: input_name.clone(),
+                            expected: InputType::Real,
+                            actual: "int",
+                        });
+                    }
+                };
+                context.insert(
+                    input_name.clone(),
+                    Value::Real(apply_op(&self.input_op, current, value)?),
+                );
+            }
+        }
+
+        Ok(output)
+    }
+}
+
+fn op_identity(op: &str) -> Result<f64> {
+    match op {
+        "*" => Ok(1.0),
+        "+" => Ok(0.0),
+        other => Err(CorrectionError::Unsupported(format!(
+            "compound correction operation `{other}` is not supported"
+        ))),
+    }
+}
+
+fn apply_op(op: &str, left: f64, right: f64) -> Result<f64> {
+    match op {
+        "*" => Ok(left * right),
+        "+" => Ok(left + right),
+        other => Err(CorrectionError::Unsupported(format!(
+            "compound correction operation `{other}` is not supported"
+        ))),
+    }
+}
+
 /// A correctionlib input or output variable.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Variable {
@@ -251,6 +415,7 @@ pub enum InputType {
 pub enum Content {
     Constant(f64),
     Binning(Binning),
+    MultiBinning(MultiBinning),
     Category(Category),
     Formula(Formula),
     FormulaRef(FormulaRef),
@@ -261,6 +426,7 @@ impl Content {
         match self {
             Self::Constant(value) => Ok(*value),
             Self::Binning(node) => node.evaluate(context),
+            Self::MultiBinning(node) => node.evaluate(context),
             Self::Category(node) => node.evaluate(context),
             Self::Formula(node) => node.evaluate(context),
             Self::FormulaRef(node) => Err(CorrectionError::Unsupported(format!(
@@ -333,6 +499,86 @@ impl Binning {
             FlowBin::Node(node) => node.evaluate(context),
             FlowBin::Constant(value) => Ok(value),
         }
+    }
+}
+
+/// A correctionlib multibinning node.
+#[derive(Debug, Clone)]
+pub struct MultiBinning {
+    pub inputs: Vec<String>,
+    pub edges: Vec<EdgeSpec>,
+    pub content: Vec<Content>,
+    pub flow: Flow,
+}
+
+impl MultiBinning {
+    fn evaluate(&self, context: &EvalContext<'_>) -> Result<f64> {
+        if self.inputs.len() != self.edges.len() {
+            return Err(CorrectionError::MalformedJson(
+                "multibinning inputs and edges must have the same length".into(),
+            ));
+        }
+
+        let mut bins = Vec::with_capacity(self.inputs.len());
+        let mut bin_counts = Vec::with_capacity(self.inputs.len());
+        for (input, edges) in self.inputs.iter().zip(&self.edges) {
+            let value = context.real(input)?;
+            let edges = match edges {
+                EdgeSpec::Explicit(edges) => edges,
+                EdgeSpec::Uniform { .. } => {
+                    return Err(CorrectionError::Unsupported(
+                        "uniform multibinning edges are parsed but not evaluated in this slice"
+                            .to_string(),
+                    ))
+                }
+            };
+            if edges.len() < 2 {
+                return Err(CorrectionError::BinningEdges {
+                    input: input.clone(),
+                    edges: edges.len(),
+                    content: self.content.len(),
+                });
+            }
+            let bin_count = edges.len() - 1;
+            let bin = if value < edges[0] {
+                self.flow.bin_for_underflow(input, value, bin_count)?
+            } else if value >= edges[edges.len() - 1] {
+                self.flow.bin_for_overflow(input, value, bin_count)?
+            } else {
+                FlowBin::Index(
+                    edges
+                        .windows(2)
+                        .position(|window| value >= window[0] && value < window[1])
+                        .ok_or_else(|| CorrectionError::BinningFlow {
+                            input: input.clone(),
+                            value,
+                        })?,
+                )
+            };
+            match bin {
+                FlowBin::Index(index) => bins.push(index),
+                FlowBin::Node(node) => return node.evaluate(context),
+                FlowBin::Constant(value) => return Ok(value),
+            }
+            bin_counts.push(bin_count);
+        }
+
+        let expected_content = bin_counts.iter().product::<usize>();
+        if expected_content != self.content.len() {
+            return Err(CorrectionError::BinningEdges {
+                input: self.inputs.join(","),
+                edges: expected_content + 1,
+                content: self.content.len(),
+            });
+        }
+
+        let mut flat_index = 0_usize;
+        for (bin, following_bins) in bins.iter().zip(
+            (0..bin_counts.len()).map(|index| bin_counts[index + 1..].iter().product::<usize>()),
+        ) {
+            flat_index += bin * following_bins;
+        }
+        self.content[flat_index].evaluate(context)
     }
 }
 
@@ -467,12 +713,25 @@ impl fmt::Display for CategoryKey {
 }
 
 /// A correctionlib Formula node.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Formula {
     pub expression: String,
     pub parser: String,
     pub variables: Vec<String>,
     pub parameters: Vec<f64>,
+    ast: OnceLock<Arc<FormulaExpr>>,
+}
+
+impl Clone for Formula {
+    fn clone(&self) -> Self {
+        Self {
+            expression: self.expression.clone(),
+            parser: self.parser.clone(),
+            variables: self.variables.clone(),
+            parameters: self.parameters.clone(),
+            ast: OnceLock::new(),
+        }
+    }
 }
 
 impl Formula {
@@ -489,12 +748,14 @@ impl Formula {
             .iter()
             .map(|name| context.real(name))
             .collect::<Result<Vec<_>>>()?;
-        evaluate_formula(
-            &self.expression,
-            &self.variables,
-            &variables,
-            &self.parameters,
-        )
+        let ast = if let Some(ast) = self.ast.get() {
+            Arc::clone(ast)
+        } else {
+            let ast = compile_formula_ast(&self.expression, &self.variables)?;
+            let _ = self.ast.set(Arc::clone(&ast));
+            ast
+        };
+        ast.evaluate(&variables, &self.parameters)
     }
 }
 
@@ -564,6 +825,7 @@ fn parse_content(value: &JsonValue) -> Result<Content> {
     let node_type = string_field(object, "nodetype")?;
     match node_type {
         "binning" => parse_binning(object).map(Content::Binning),
+        "multibinning" => parse_multibinning(object).map(Content::MultiBinning),
         "category" => parse_category(object).map(Content::Category),
         "formula" => parse_formula(object).map(Content::Formula),
         "formularef" => parse_formula_ref(object).map(Content::FormulaRef),
@@ -590,6 +852,38 @@ fn parse_binning(object: &serde_json::Map<String, JsonValue>) -> Result<Binning>
 
     Ok(Binning {
         input,
+        edges,
+        content,
+        flow,
+    })
+}
+
+fn parse_multibinning(object: &serde_json::Map<String, JsonValue>) -> Result<MultiBinning> {
+    let inputs = string_array_field(object, "inputs")?;
+    let edges = required_field(object, "edges")?
+        .as_array()
+        .ok_or_else(|| {
+            CorrectionError::MalformedJson("multibinning edges must be an array".into())
+        })?
+        .iter()
+        .map(parse_edges)
+        .collect::<Result<Vec<_>>>()?;
+    let content = required_field(object, "content")?
+        .as_array()
+        .ok_or_else(|| {
+            CorrectionError::MalformedJson("multibinning content must be an array".into())
+        })?
+        .iter()
+        .map(parse_content)
+        .collect::<Result<Vec<_>>>()?;
+    let flow = object
+        .get("flow")
+        .map(parse_flow)
+        .transpose()?
+        .unwrap_or(Flow::Error);
+
+    Ok(MultiBinning {
+        inputs,
         edges,
         content,
         flow,
@@ -685,6 +979,7 @@ fn parse_formula(object: &serde_json::Map<String, JsonValue>) -> Result<Formula>
         parser,
         variables,
         parameters,
+        ast: OnceLock::new(),
     })
 }
 
@@ -853,15 +1148,10 @@ fn muon_input_value(variable: &Variable, input: &MuonIdInput) -> Result<Value> {
     }
 }
 
-fn evaluate_formula(
-    expression: &str,
-    variable_names: &[String],
-    variables: &[f64],
-    parameters: &[f64],
-) -> Result<f64> {
+fn compile_formula_ast(expression: &str, variable_names: &[String]) -> Result<Arc<FormulaExpr>> {
     let normalized = expression.replace("TMath::", "");
-    let tokens = Lexer::new(&normalized).tokens()?;
-    let mut parser = FormulaParser {
+    let tokens = cached_formula_tokens(&normalized)?;
+    let mut parser = FormulaAstParser {
         tokens,
         position: 0,
         variable_names: variable_names
@@ -869,17 +1159,37 @@ fn evaluate_formula(
             .enumerate()
             .map(|(index, name)| (name.as_str(), index))
             .collect(),
-        variables,
-        parameters,
     };
-    let value = parser.expression()?;
+    let ast = parser.expression()?;
     if parser.position != parser.tokens.len() {
         return Err(CorrectionError::Formula(format!(
             "unexpected token {:?}",
             parser.tokens[parser.position]
         )));
     }
-    Ok(value)
+    Ok(Arc::new(ast))
+}
+
+fn cached_formula_tokens(expression: &str) -> Result<Vec<Token>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<Token>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache.lock().map_err(|error| {
+            CorrectionError::Formula(format!("formula token cache lock failed: {error}"))
+        })?;
+        if let Some(tokens) = guard.get(expression) {
+            return Ok(tokens.clone());
+        }
+    }
+
+    let tokens = Lexer::new(expression).tokens()?;
+    let mut guard = cache.lock().map_err(|error| {
+        CorrectionError::Formula(format!("formula token cache lock failed: {error}"))
+    })?;
+    guard
+        .entry(expression.to_string())
+        .or_insert_with(|| tokens.clone());
+    Ok(tokens)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -891,6 +1201,10 @@ enum Token {
     Star,
     Slash,
     Pow,
+    Less,
+    LessEq,
+    Greater,
+    GreaterEq,
     LParen,
     RParen,
     Comma,
@@ -937,6 +1251,24 @@ impl<'a> Lexer<'a> {
                 '/' => {
                     self.advance_char();
                     tokens.push(Token::Slash);
+                }
+                '<' => {
+                    self.advance_char();
+                    if self.peek_char() == Some('=') {
+                        self.advance_char();
+                        tokens.push(Token::LessEq);
+                    } else {
+                        tokens.push(Token::Less);
+                    }
+                }
+                '>' => {
+                    self.advance_char();
+                    if self.peek_char() == Some('=') {
+                        self.advance_char();
+                        tokens.push(Token::GreaterEq);
+                    } else {
+                        tokens.push(Token::Greater);
+                    }
                 }
                 '^' => {
                     self.advance_char();
@@ -1016,6 +1348,7 @@ impl<'a> Lexer<'a> {
     }
 }
 
+#[allow(dead_code)]
 struct FormulaParser<'a> {
     tokens: Vec<Token>,
     position: usize,
@@ -1024,9 +1357,348 @@ struct FormulaParser<'a> {
     parameters: &'a [f64],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormulaBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Pow,
+    Less,
+    LessEq,
+    Greater,
+    GreaterEq,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormulaFunction {
+    Sqrt,
+    Log,
+    Log10,
+    Exp,
+    Abs,
+    Sin,
+    Cos,
+    Tan,
+    Pow,
+    Min,
+    Max,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum FormulaExpr {
+    Number(f64),
+    Variable(usize),
+    Parameter(usize),
+    UnaryMinus(Box<FormulaExpr>),
+    Binary {
+        op: FormulaBinaryOp,
+        lhs: Box<FormulaExpr>,
+        rhs: Box<FormulaExpr>,
+    },
+    Function {
+        function: FormulaFunction,
+        args: Vec<FormulaExpr>,
+    },
+}
+
+impl FormulaExpr {
+    fn evaluate(&self, variables: &[f64], parameters: &[f64]) -> Result<f64> {
+        match self {
+            Self::Number(value) => Ok(*value),
+            Self::Variable(index) => variables.get(*index).copied().ok_or_else(|| {
+                CorrectionError::Formula(format!("variable index x[{index}] is out of range"))
+            }),
+            Self::Parameter(index) => parameters.get(*index).copied().ok_or_else(|| {
+                CorrectionError::Formula(format!("parameter index [{index}] is out of range"))
+            }),
+            Self::UnaryMinus(inner) => Ok(-inner.evaluate(variables, parameters)?),
+            Self::Binary { op, lhs, rhs } => {
+                let lhs = lhs.evaluate(variables, parameters)?;
+                let rhs = rhs.evaluate(variables, parameters)?;
+                Ok(match op {
+                    FormulaBinaryOp::Add => lhs + rhs,
+                    FormulaBinaryOp::Sub => lhs - rhs,
+                    FormulaBinaryOp::Mul => lhs * rhs,
+                    FormulaBinaryOp::Div => lhs / rhs,
+                    FormulaBinaryOp::Pow => lhs.powf(rhs),
+                    FormulaBinaryOp::Less => bool_as_formula_number(lhs < rhs),
+                    FormulaBinaryOp::LessEq => bool_as_formula_number(lhs <= rhs),
+                    FormulaBinaryOp::Greater => bool_as_formula_number(lhs > rhs),
+                    FormulaBinaryOp::GreaterEq => bool_as_formula_number(lhs >= rhs),
+                })
+            }
+            Self::Function { function, args } => {
+                let values = args
+                    .iter()
+                    .map(|arg| arg.evaluate(variables, parameters))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(match (function, values.as_slice()) {
+                    (FormulaFunction::Sqrt, [x]) => x.sqrt(),
+                    (FormulaFunction::Log, [x]) => x.ln(),
+                    (FormulaFunction::Log10, [x]) => x.log10(),
+                    (FormulaFunction::Exp, [x]) => x.exp(),
+                    (FormulaFunction::Abs, [x]) => x.abs(),
+                    (FormulaFunction::Sin, [x]) => x.sin(),
+                    (FormulaFunction::Cos, [x]) => x.cos(),
+                    (FormulaFunction::Tan, [x]) => x.tan(),
+                    (FormulaFunction::Pow, [x, y]) => x.powf(*y),
+                    (FormulaFunction::Min, [x, y]) => x.min(*y),
+                    (FormulaFunction::Max, [x, y]) => x.max(*y),
+                    _ => {
+                        return Err(CorrectionError::Formula(
+                            "formula function arity changed after parsing".to_string(),
+                        ));
+                    }
+                })
+            }
+        }
+    }
+}
+
+struct FormulaAstParser<'a> {
+    tokens: Vec<Token>,
+    position: usize,
+    variable_names: HashMap<&'a str, usize>,
+}
+
+impl FormulaAstParser<'_> {
+    fn expression(&mut self) -> Result<FormulaExpr> {
+        self.comparison()
+    }
+
+    fn comparison(&mut self) -> Result<FormulaExpr> {
+        let mut value = self.add_sub()?;
+        loop {
+            let op = if self.consume(&Token::Less) {
+                FormulaBinaryOp::Less
+            } else if self.consume(&Token::LessEq) {
+                FormulaBinaryOp::LessEq
+            } else if self.consume(&Token::Greater) {
+                FormulaBinaryOp::Greater
+            } else if self.consume(&Token::GreaterEq) {
+                FormulaBinaryOp::GreaterEq
+            } else {
+                return Ok(value);
+            };
+            value = FormulaExpr::Binary {
+                op,
+                lhs: Box::new(value),
+                rhs: Box::new(self.add_sub()?),
+            };
+        }
+    }
+
+    fn add_sub(&mut self) -> Result<FormulaExpr> {
+        let mut value = self.mul_div()?;
+        loop {
+            let op = if self.consume(&Token::Plus) {
+                FormulaBinaryOp::Add
+            } else if self.consume(&Token::Minus) {
+                FormulaBinaryOp::Sub
+            } else {
+                return Ok(value);
+            };
+            value = FormulaExpr::Binary {
+                op,
+                lhs: Box::new(value),
+                rhs: Box::new(self.mul_div()?),
+            };
+        }
+    }
+
+    fn mul_div(&mut self) -> Result<FormulaExpr> {
+        let mut value = self.power()?;
+        loop {
+            let op = if self.consume(&Token::Star) {
+                FormulaBinaryOp::Mul
+            } else if self.consume(&Token::Slash) {
+                FormulaBinaryOp::Div
+            } else {
+                return Ok(value);
+            };
+            value = FormulaExpr::Binary {
+                op,
+                lhs: Box::new(value),
+                rhs: Box::new(self.power()?),
+            };
+        }
+    }
+
+    fn power(&mut self) -> Result<FormulaExpr> {
+        let base = self.unary()?;
+        if self.consume(&Token::Pow) {
+            Ok(FormulaExpr::Binary {
+                op: FormulaBinaryOp::Pow,
+                lhs: Box::new(base),
+                rhs: Box::new(self.power()?),
+            })
+        } else {
+            Ok(base)
+        }
+    }
+
+    fn unary(&mut self) -> Result<FormulaExpr> {
+        if self.consume(&Token::Plus) {
+            self.unary()
+        } else if self.consume(&Token::Minus) {
+            Ok(FormulaExpr::UnaryMinus(Box::new(self.unary()?)))
+        } else {
+            self.primary()
+        }
+    }
+
+    fn primary(&mut self) -> Result<FormulaExpr> {
+        match self.next() {
+            Some(Token::Number(value)) => Ok(FormulaExpr::Number(value)),
+            Some(Token::LParen) => {
+                let value = self.expression()?;
+                self.expect(Token::RParen)?;
+                Ok(value)
+            }
+            Some(Token::LBracket) => {
+                let index = self.parameter_index()?;
+                self.expect(Token::RBracket)?;
+                Ok(FormulaExpr::Parameter(index))
+            }
+            Some(Token::Ident(name)) => self.identifier(&name),
+            token => Err(CorrectionError::Formula(format!(
+                "expected formula primary, got {token:?}"
+            ))),
+        }
+    }
+
+    fn identifier(&mut self, name: &str) -> Result<FormulaExpr> {
+        if self.consume(&Token::LParen) {
+            return self.function(name);
+        }
+
+        if self.consume(&Token::LBracket) {
+            let index = self.parameter_index()?;
+            self.expect(Token::RBracket)?;
+            return match name {
+                "x" => Ok(FormulaExpr::Variable(index)),
+                "param" | "p" => Ok(FormulaExpr::Parameter(index)),
+                other => Err(CorrectionError::Formula(format!(
+                    "unsupported indexed identifier `{other}[{index}]`"
+                ))),
+            };
+        }
+
+        match name {
+            "pi" | "Pi" | "PI" => Ok(FormulaExpr::Number(std::f64::consts::PI)),
+            "e" => Ok(FormulaExpr::Number(std::f64::consts::E)),
+            "x" => Ok(FormulaExpr::Variable(0)),
+            "y" => Ok(FormulaExpr::Variable(1)),
+            "z" => Ok(FormulaExpr::Variable(2)),
+            "t" => Ok(FormulaExpr::Variable(3)),
+            variable_name => self
+                .variable_names
+                .get(variable_name)
+                .copied()
+                .map(FormulaExpr::Variable)
+                .ok_or_else(|| {
+                    CorrectionError::Formula(format!("unknown identifier `{variable_name}`"))
+                }),
+        }
+    }
+
+    fn function(&mut self, name: &str) -> Result<FormulaExpr> {
+        let mut args = Vec::new();
+        if !self.consume(&Token::RParen) {
+            loop {
+                args.push(self.expression()?);
+                if self.consume(&Token::Comma) {
+                    continue;
+                }
+                self.expect(Token::RParen)?;
+                break;
+            }
+        }
+
+        let function = match (name, args.len()) {
+            ("sqrt", 1) | ("Sqrt", 1) => FormulaFunction::Sqrt,
+            ("log", 1) | ("Log", 1) => FormulaFunction::Log,
+            ("log10", 1) | ("Log10", 1) => FormulaFunction::Log10,
+            ("exp", 1) | ("Exp", 1) => FormulaFunction::Exp,
+            ("abs", 1) | ("Abs", 1) => FormulaFunction::Abs,
+            ("sin", 1) | ("Sin", 1) => FormulaFunction::Sin,
+            ("cos", 1) | ("Cos", 1) => FormulaFunction::Cos,
+            ("tan", 1) | ("Tan", 1) => FormulaFunction::Tan,
+            ("pow", 2) | ("Power", 2) | ("Power_t", 2) => FormulaFunction::Pow,
+            ("min", 2) | ("Min", 2) => FormulaFunction::Min,
+            ("max", 2) | ("Max", 2) => FormulaFunction::Max,
+            _ => {
+                return Err(CorrectionError::Formula(format!(
+                    "unsupported function `{name}` with {} arguments",
+                    args.len()
+                )));
+            }
+        };
+        Ok(FormulaExpr::Function { function, args })
+    }
+
+    fn parameter_index(&mut self) -> Result<usize> {
+        match self.next() {
+            Some(Token::Number(value)) if value.fract() == 0.0 && value >= 0.0 => {
+                Ok(value as usize)
+            }
+            token => Err(CorrectionError::Formula(format!(
+                "expected non-negative integer index, got {token:?}"
+            ))),
+        }
+    }
+
+    fn next(&mut self) -> Option<Token> {
+        let token = self.tokens.get(self.position).cloned();
+        if token.is_some() {
+            self.position += 1;
+        }
+        token
+    }
+
+    fn consume(&mut self, token: &Token) -> bool {
+        if self.tokens.get(self.position) == Some(token) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, token: Token) -> Result<()> {
+        if self.consume(&token) {
+            Ok(())
+        } else {
+            Err(CorrectionError::Formula(format!(
+                "expected token {token:?}, got {:?}",
+                self.tokens.get(self.position)
+            )))
+        }
+    }
+}
+
+#[allow(dead_code)]
 impl FormulaParser<'_> {
     fn expression(&mut self) -> Result<f64> {
-        self.add_sub()
+        self.comparison()
+    }
+
+    fn comparison(&mut self) -> Result<f64> {
+        let mut value = self.add_sub()?;
+        loop {
+            if self.consume(&Token::Less) {
+                value = bool_as_formula_number(value < self.add_sub()?);
+            } else if self.consume(&Token::LessEq) {
+                value = bool_as_formula_number(value <= self.add_sub()?);
+            } else if self.consume(&Token::Greater) {
+                value = bool_as_formula_number(value > self.add_sub()?);
+            } else if self.consume(&Token::GreaterEq) {
+                value = bool_as_formula_number(value >= self.add_sub()?);
+            } else {
+                return Ok(value);
+            }
+        }
     }
 
     fn add_sub(&mut self) -> Result<f64> {
@@ -1208,5 +1880,13 @@ impl FormulaParser<'_> {
                 self.tokens.get(self.position)
             )))
         }
+    }
+}
+
+fn bool_as_formula_number(value: bool) -> f64 {
+    if value {
+        1.0
+    } else {
+        0.0
     }
 }

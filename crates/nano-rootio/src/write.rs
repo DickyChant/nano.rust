@@ -8,8 +8,6 @@ use crate::parse::TBUFFER_OBJECT_MAP_OFFSET;
 
 const FILE_BEGIN: u32 = 100;
 const DIRECTORY_OFFSET: u64 = FILE_BEGIN as u64;
-const DIRECTORY_SIZE: u64 = 30;
-const TREE_OFFSET: u64 = DIRECTORY_OFFSET + DIRECTORY_SIZE;
 const STOCK_DIRECTORY_SIZE: usize = 60;
 
 #[derive(Debug, Clone)]
@@ -671,16 +669,21 @@ pub fn write_tree<P: AsRef<Path>>(path: P, tree_name: &str, branches: &[Branch])
         })
         .collect();
 
+    let file_name = "nano.rust";
+    let tfile_key_len = tfile_directory_key_len(file_name);
+    let nbytes_name = tfile_nbytes_name(file_name);
+    let tree_offset = FILE_BEGIN as u64 + tfile_key_len as u64;
+
     let provisional_tree_obj =
         build_tree_object(tree_name, branches, &branch_meta, &baskets, entries)?;
     let provisional_tree_key = build_key(
         "TTree",
         tree_name,
         tree_name,
-        TREE_OFFSET,
+        tree_offset,
         &provisional_tree_obj,
     )?;
-    let mut next_seek = TREE_OFFSET + provisional_tree_key.len() as u64;
+    let mut next_seek = tree_offset + provisional_tree_key.len() as u64;
 
     for (branch, basket) in branches.iter().zip(baskets.iter_mut()) {
         basket.seek = next_seek;
@@ -695,17 +698,17 @@ pub fn write_tree<P: AsRef<Path>>(path: P, tree_name: &str, branches: &[Branch])
     }
 
     let tree_obj = build_tree_object(tree_name, branches, &branch_meta, &baskets, entries)?;
-    let tree_key = build_key("TTree", tree_name, tree_name, TREE_OFFSET, &tree_obj)?;
+    let tree_key = build_key("TTree", tree_name, tree_name, tree_offset, &tree_obj)?;
     let tree_key_header = key_spec(
         "TTree",
         tree_name,
         tree_name,
-        TREE_OFFSET,
+        tree_offset,
         tree_obj.len(),
         false,
     )?;
 
-    let key_list_offset = TREE_OFFSET
+    let key_list_offset = tree_offset
         + tree_key.len() as u64
         + baskets.iter().map(|b| b.bytes.len() as u64).sum::<u64>();
     let key_list_obj = build_key_list(&[tree_key_header]);
@@ -729,20 +732,23 @@ pub fn write_tree<P: AsRef<Path>>(path: P, tree_name: &str, branches: &[Branch])
 
     let file_end = streamer_info_offset + streamer_info_key.len() as u64 + 4;
     let mut file_bytes = vec![0; FILE_BEGIN as usize];
-    write_file_header(
+    write_file_header_with_nbytes_name(
         &mut file_bytes[..75],
         u32::try_from(file_end).map_err(|_| Error::unsupported("TFile", "file too large"))?,
+        u32::try_from(nbytes_name)
+            .map_err(|_| Error::unsupported("TFile", "TFile name too large"))?,
         u32::try_from(streamer_info_offset)
             .map_err(|_| Error::unsupported("TFile", "streamer info offset too large"))?,
         u32::try_from(streamer_info_key.len())
             .map_err(|_| Error::unsupported("TFile", "streamer info key too large"))?,
     );
-    file_bytes.extend(build_directory(
+    file_bytes.extend(build_tfile_directory_key(
+        file_name,
         u32::try_from(key_list_offset)
             .map_err(|_| Error::unsupported("TFile", "key list offset too large"))?,
         u32::try_from(key_list_key.len())
             .map_err(|_| Error::unsupported("TFile", "key list too large"))?,
-    ));
+    )?);
     file_bytes.extend(tree_key);
     for basket in &baskets {
         file_bytes.extend(&basket.bytes);
@@ -848,10 +854,6 @@ pub fn write_histograms<P: AsRef<Path>>(path: P, histograms: &[Th1F]) -> Result<
     Ok(())
 }
 
-fn write_file_header(out: &mut [u8], end: u32, seek_info: u32, nbytes_info: u32) {
-    write_file_header_with_nbytes_name(out, end, 0, seek_info, nbytes_info);
-}
-
 fn write_file_header_with_nbytes_name(
     out: &mut [u8],
     end: u32,
@@ -932,19 +934,6 @@ fn build_stock_directory(file_name: &str, seek_keys: u32, n_bytes_keys: u32) -> 
     put_u32(&mut out, seek_keys);
     out.extend([0; STOCK_DIRECTORY_SIZE - 30]);
     Ok(out)
-}
-
-fn build_directory(seek_keys: u32, n_bytes_keys: u32) -> Vec<u8> {
-    let mut out = Vec::new();
-    put_i16(&mut out, 5);
-    put_u32(&mut out, 0);
-    put_u32(&mut out, 0);
-    put_i32(&mut out, n_bytes_keys as i32);
-    put_i32(&mut out, 0);
-    put_u32(&mut out, DIRECTORY_OFFSET as u32);
-    put_u32(&mut out, 0);
-    put_u32(&mut out, seek_keys);
-    out
 }
 
 fn build_key_list(headers: &[TKeySpec]) -> Vec<u8> {

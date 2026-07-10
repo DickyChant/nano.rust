@@ -43,7 +43,54 @@ flowchart LR
 
 - **Source / chunk** — each input (local path or HTTPS URL) is split into
   bounded entry ranges via the existing `events_chunked` / `events_url_chunked`,
-  so memory is bounded regardless of dataset size. One chunk → one map node.
+  so memory is bounded regardless of dataset size. `nano run` can take sources
+  directly with `--inputs a.root,b.root` or from a direct raw-NanoAOD source list
+  with `--input-list sources.txt` (blank lines and `#` comments ignored). There
+  is no required skim artifact between source and analysis; one chunk → one map
+  node. XRootD `root://` sources are not implemented in the Rust data plane yet;
+  use local files or HTTP(S) byte-range sources.
+
+### Mounted EOS inputs
+
+For CERN validation, prefer mounted EOS paths over `root://` while native XRootD
+is still deferred. A source list should contain concrete NanoAOD ROOT files under
+`/eos/cms/store/data/...` or `/eos/cms/store/mc/...`; the workflow treats these
+as local files and keeps chunking bounded by entry ranges. If EOS access needs a
+grid proxy, set it before launching the workflow:
+
+```bash
+export X509_USER_PROXY=/eos/user/s/sqian/.proxy
+nano validate --catalogue-version v15 crates/nano-spec/examples/wz_vbs.toml
+nano eos-sources configs/samples/wz_vbs_2024_v15_MC.yaml \
+  --x509-proxy /eos/user/s/sqian/.proxy \
+  --max-files-per-dataset 1 \
+  --output run/wz_vbs_eos_sources.txt
+nano run crates/nano-spec/examples/wz_vbs.toml \
+  --interpret \
+  --catalogue-version v15 \
+  --input-list run/wz_vbs_eos_sources.txt \
+  --output run/wz_vbs_skim.root
+```
+
+Campaign-level validation should be declared in `configs/validation/` instead of
+living only in shell history. See [`validation-campaigns.md`](validation-campaigns.md)
+and the WZ VBS campaign:
+
+```bash
+nano campaign configs/validation/wz_vbs_2024_v15_campaign.toml
+```
+
+That campaign records the bounded EOS slice, the Rust run, the legacy ROOT parity
+gate, and the planned yield/distribution closure gates needed before treating the
+branch as a new-analysis validation campaign.
+
+The local validation path for the WZ VBS migration starts from the confirmed
+Run 3 NanoAODv15 MC area, for example
+`/eos/cms/store/mc/RunIII2024Summer24NanoAODv15/WZJJto3LNu-EWK_TuneCP5_13p6TeV_madgraph-pythia8/.../NANOAODSIM/*.root`.
+The semantic MC dataset set is recorded in
+`configs/samples/wz_vbs_2024_v15_MC.yaml`. Keep resolved source lists explicit
+and reviewable; do not hide dataset expansion in an analysis-specific shell
+script.
 - **Map** — runs the per-event kernel over one chunk, yielding a
   `PartialOutput` (skim rows + partial `Hist1D`s + a cutflow). The muon slice now
   exercises the closed path: `nano-spec` emits a `nano-analysis` typestate
@@ -144,12 +191,17 @@ only decides *where/when* tasks run, never *what* they compute.
 
 - **Input:** a validated `ResolvedPlan` (`nano-spec`) gives `read_branches` and
   codegen emits the per-event function as a `nano-analysis` typestate program; a
-  dataset list gives the source files/URLs. `MuonProducer` remains the golden
-  hand-written reference used by equivalence tests, not a separate scheduler
-  path.
-- **Output:** merged skim (`nano_io`) + histograms + the manifest. Eventually
-  `nano run <spec> --inputs <list> [--systematics all]` builds and executes the
-  DAG — the CLI/MCP "run" verb on top of the same compiler-gated action space.
+  dataset list gives the raw source files/URLs. This is the `nano.rust` version
+  of the fused skim+analysis mode: the semantic analysis runs directly over raw
+  sources and writes the final skim/histogram artifacts, instead of materializing
+  an analysis-specific pre-skim first. It mirrors the `MitAnalysisRunIII`
+  `fuse_skim_analyze` branch's direct-NanoAOD idea while keeping source handling
+  inside the typed DAG. `MuonProducer` remains the golden hand-written reference
+  used by equivalence tests, not a separate scheduler path.
+- **Output:** merged skim (`nano_io`) + histograms + the manifest. `nano run
+  <spec> --inputs <paths>` or `nano run <spec> --input-list <file>` builds and
+  executes the DAG — the CLI/MCP "run" verb on top of the same compiler-gated
+  action space.
 
 ## Slice 1 — typed DAG + local executor (`nano-workflow`) — **built**
 

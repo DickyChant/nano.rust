@@ -544,6 +544,7 @@ fn tight_compare_options() -> CompareOptions {
         rtol: 0.0,
         atol: 0.0,
         max_mismatches: 5,
+        branch_tolerances: Default::default(),
     }
 }
 

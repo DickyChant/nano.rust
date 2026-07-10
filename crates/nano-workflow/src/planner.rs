@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifacts::{ChunkSpec, EntryRange, MergedOutput, PartialOutput};
 use crate::error::Result;
+use crate::sources::{is_http_source, is_xrootd_source};
 
 pub type Kernel =
     Arc<dyn Fn(&Event) -> nano_core::Result<Option<MuonSkimRow>> + Send + Sync + 'static>;
@@ -261,7 +262,12 @@ fn source_events(
     schema: &BranchSchema,
     chunk_size: usize,
 ) -> Result<Box<dyn Iterator<Item = nano_io::Result<Event>>>> {
-    if is_http_url(source) {
+    if is_xrootd_source(source) {
+        return Err(crate::error::WorkflowError::UnsupportedSource(format!(
+            "XRootD source `{source}` is not implemented in nano.rust; use a local ROOT path or an HTTP(S) byte-range source"
+        )));
+    }
+    if is_http_source(source) {
         Ok(Box::new(nano_io::events_url_chunked(
             source, schema, chunk_size,
         )?))
@@ -277,14 +283,15 @@ fn source_events(
     schema: &BranchSchema,
     chunk_size: usize,
 ) -> Result<Box<dyn Iterator<Item = nano_io::Result<Event>>>> {
-    if is_http_url(source) {
+    if is_xrootd_source(source) {
+        return Err(crate::error::WorkflowError::UnsupportedSource(format!(
+            "XRootD source `{source}` is not implemented in nano.rust; use a local ROOT path or an HTTP(S) byte-range source"
+        )));
+    }
+    if is_http_source(source) {
         return Err(crate::error::WorkflowError::UnsupportedSource(format!(
             "HTTP source `{source}` requires the nano-workflow `http` feature"
         )));
     }
     Ok(Box::new(nano_io::events_chunked(path, schema, chunk_size)?))
-}
-
-fn is_http_url(source: &str) -> bool {
-    source.starts_with("http://") || source.starts_with("https://")
 }

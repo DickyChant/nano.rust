@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifacts::ChunkSpec;
 use crate::error::Result;
+use crate::sources::{is_http_source, is_xrootd_source};
 
 pub const CODE_SPEC_VERSION: &str = "nano-workflow.first-slice.v1";
 
@@ -52,7 +53,7 @@ pub(crate) fn read_branch_signature(schema: &BranchSchema) -> Vec<String> {
 }
 
 pub(crate) fn map_key(chunk: &ChunkSpec, schema: &BranchSchema) -> Result<String> {
-    if chunk.source.starts_with("http://") || chunk.source.starts_with("https://") {
+    if is_http_source(&chunk.source) || is_xrootd_source(&chunk.source) {
         return Ok(hash_parts(&[
             CODE_SPEC_VERSION.to_string(),
             "map".to_string(),

@@ -189,6 +189,20 @@ fn expr_uses_candidate_filter_expr(expr: &Expr) -> bool {
         | Expr::EitherPairPt { .. }
         | Expr::ClosestMass { .. }
         | Expr::OtherMass { .. }
+        | Expr::ZepVv { .. }
+        | Expr::SystemMetEta { .. }
+        | Expr::SystemMetPt { .. }
+        | Expr::SystemPairMetPt { .. }
+        | Expr::SystemPairPtBalance { .. }
+        | Expr::MetType1Pt { .. }
+        | Expr::MetType1Phi { .. }
+        | Expr::SystemDeltaPhi { .. }
+        | Expr::LegacyLeptonRpt { .. }
+        | Expr::PairConstituentAttr { .. }
+        | Expr::ZepMax { .. }
+        | Expr::IndexNotIn { .. }
+        | Expr::JetIdTightRun2024 { .. }
+        | Expr::JetVetoMapRun2024 { .. }
         | Expr::LeadingAttr { .. }
         | Expr::PairDeltaR
         | Expr::PairLeadingPt

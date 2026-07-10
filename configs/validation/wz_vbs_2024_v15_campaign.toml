@@ -1,0 +1,78 @@
+[campaign]
+name = "wz_vbs_2024_v15_campaign"
+analysis_spec = "../../crates/nano-spec/examples/wz_vbs.toml"
+catalogue_version = "v15"
+purpose = "Validate the Run 3 WZ VBS migration as a spec-driven analysis, then extend that proof into branch/new-analysis closure gates."
+
+[demo]
+objective = "Use WZ VBS as the real-analysis demo for the nano.rust thesis: physicists review the TOML semantics, agents generate/modify implementation, and Rust plus validation reject inconsistent states."
+thesis_points = [
+  "The reviewed artifact is the analysis and validation spec, not hand-written event-loop code.",
+  "NanoAOD v15 branch access, correction payload bindings, output dtypes, and stochastic validation policy are statically declared.",
+  "Legacy ROOT parity is one gate in a campaign, not the full definition of analysis correctness.",
+  "Branch/new-analysis closure requires explicit sample, run, yield, and distribution gates before production use.",
+]
+
+[[sample_slice]]
+name = "wz_vbs_eos_20_event_slice"
+role = "bounded EOS smoke and legacy-parity slice"
+sample_config = "../samples/wz_vbs_2024_v15_MC.yaml"
+source_list = "/tmp/sqian/nano-rust-test/wz_vbs_eos_sources.txt"
+max_files_per_dataset = 1
+max_events = 20
+
+[[run]]
+name = "rust_interpret_20_event_slice"
+spec = "../../crates/nano-spec/examples/wz_vbs.toml"
+input_list = "/tmp/sqian/nano-rust-test/wz_vbs_eos_sources.txt"
+output = "/tmp/sqian/nano-rust-test/validation/rust_wz_vbs_20_latest.root"
+mode = "interpret"
+max_events = 20
+omit_channel_index = true
+
+[[gate]]
+name = "static_semantic_spec"
+kind = "spec_static_validation"
+status = "implemented"
+scope = "new_analysis_semantics"
+required = true
+description = "The WZ spec must validate against the NanoAOD v15 catalogue and correction payloads before any event loop runs."
+
+[[gate]]
+name = "legacy_wz_root_parity"
+kind = "root_compare"
+status = "implemented"
+scope = "legacy_parity"
+required = true
+description = "Compare the legacy MitAnalysisRunIII WZ skim to the Rust WZ skim with tight global tolerance and only declared stochastic branch allowances."
+reference = "/tmp/sqian/nano-rust-test/validation/legacy_wz_vbs_20.root"
+candidate = "/tmp/sqian/nano-rust-test/validation/rust_wz_vbs_20_latest.root"
+validation_spec = "../../crates/nano-spec/examples/wz_vbs.toml"
+stochastic_branches = [
+  "PuppiMET_phiDef",
+  "PuppiMET_ptDef",
+  "m3lDef",
+  "mllZDef",
+  "mtWDef",
+  "ptlWDef",
+  "vbs_sumHT",
+]
+
+[[gate]]
+name = "branch_new_analysis_yield_closure"
+kind = "yield_closure"
+status = "implemented"
+scope = "branch_new_analysis"
+required = true
+description = "Check the selected-event yield of the reviewed 20-event WZ VBS slice as an analysis-level closure gate independent of branch-by-branch legacy parity."
+artifact = "/tmp/sqian/nano-rust-test/validation/rust_wz_vbs_20_latest.root"
+tree = "Events"
+expected_entries = 1
+
+[[gate]]
+name = "campaign_scale_distribution_closure"
+kind = "yield_closure"
+status = "planned"
+scope = "production_readiness"
+required = false
+description = "Run the same gates on the full resolved WZ MC sample set, replacing the 20-event slice with explicit process-normalized yield and distribution tolerances."

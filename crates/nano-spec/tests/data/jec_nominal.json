@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "corrections": [
+    {
+      "name": "synthetic_jec_nominal",
+      "description": "synthetic nominal JEC fixture",
+      "version": 1,
+      "inputs": [
+        { "name": "JetA", "type": "real" },
+        { "name": "JetEta", "type": "real" },
+        { "name": "JetPt", "type": "real" },
+        { "name": "Rho", "type": "real" },
+        { "name": "JetPhi", "type": "real" }
+      ],
+      "output": { "name": "factor", "type": "real" },
+      "data": 1.1
+    }
+  ]
+}

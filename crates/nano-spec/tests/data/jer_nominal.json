@@ -1,0 +1,29 @@
+{
+  "schema_version": 2,
+  "corrections": [
+    {
+      "name": "synthetic_jer_scale_factor",
+      "description": "synthetic nominal JER scale factor fixture",
+      "version": 1,
+      "inputs": [
+        { "name": "JetEta", "type": "real" },
+        { "name": "JetPt", "type": "real" },
+        { "name": "systematic", "type": "string" }
+      ],
+      "output": { "name": "factor", "type": "real" },
+      "data": 1.2
+    },
+    {
+      "name": "synthetic_jer_resolution",
+      "description": "synthetic nominal JER resolution fixture",
+      "version": 1,
+      "inputs": [
+        { "name": "JetEta", "type": "real" },
+        { "name": "JetPt", "type": "real" },
+        { "name": "Rho", "type": "real" }
+      ],
+      "output": { "name": "resolution", "type": "real" },
+      "data": 0.1
+    }
+  ]
+}

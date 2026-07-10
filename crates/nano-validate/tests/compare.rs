@@ -1,9 +1,10 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nano_rootio::write::{write_tree, Branch};
 use nano_validate::{
-    compare_root_files, BranchPresence, CompareOptions, ComparisonStatus, ValueKind,
+    compare_root_files, BranchPresence, CompareOptions, ComparisonStatus, FloatTolerance, ValueKind,
 };
 
 #[test]
@@ -50,6 +51,52 @@ fn perturbed_branch_beyond_tolerance_is_detected() {
     assert_eq!(pt.n_mismatched, 1);
     assert_eq!(pt.first_mismatches[0].entry, 1);
     assert!(pt.max_abs_diff.unwrap() > 0.19);
+}
+
+#[test]
+fn branch_specific_tolerance_applies_only_to_matching_branch() {
+    let fixture = Fixture::new("branch-tolerance");
+    let reference = fixture.path("reference.root");
+    let candidate = fixture.path("candidate.root");
+    write_validation_file(
+        &reference,
+        &[
+            Branch::f32("pt", vec![1.0, 2.0, 3.0]),
+            Branch::f32("eta", vec![0.1, 0.2, 0.3]),
+        ],
+    );
+    write_validation_file(
+        &candidate,
+        &[
+            Branch::f32("pt", vec![1.0, 2.2, 3.0]),
+            Branch::f32("eta", vec![0.1, 0.25, 0.3]),
+        ],
+    );
+
+    let report = compare_root_files(
+        &reference,
+        &candidate,
+        &CompareOptions {
+            rtol: 0.0,
+            atol: 0.0,
+            branch_tolerances: BTreeMap::from([(
+                "pt".to_string(),
+                FloatTolerance {
+                    rtol: 0.0,
+                    atol: 0.25,
+                },
+            )]),
+            ..CompareOptions::default()
+        },
+    )
+    .unwrap();
+
+    let pt = branch(&report.branches, "pt");
+    let eta = branch(&report.branches, "eta");
+    assert_eq!(report.status, ComparisonStatus::Fail);
+    assert_eq!(report.branch_tolerances.len(), 1);
+    assert_eq!(pt.n_mismatched, 0);
+    assert_eq!(eta.n_mismatched, 1);
 }
 
 #[test]

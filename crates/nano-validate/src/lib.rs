@@ -55,6 +55,8 @@ pub struct CompareOptions {
     pub rtol: f64,
     pub atol: f64,
     pub max_mismatches: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub branch_tolerances: BTreeMap<String, FloatTolerance>,
 }
 
 impl Default for CompareOptions {
@@ -64,7 +66,24 @@ impl Default for CompareOptions {
             rtol: 1e-6,
             atol: 1e-6,
             max_mismatches: DEFAULT_MAX_MISMATCHES,
+            branch_tolerances: BTreeMap::new(),
         }
+    }
+}
+
+impl CompareOptions {
+    fn tolerance(&self) -> FloatTolerance {
+        FloatTolerance {
+            rtol: self.rtol,
+            atol: self.atol,
+        }
+    }
+
+    fn tolerance_for(&self, branch: &str) -> FloatTolerance {
+        self.branch_tolerances
+            .get(branch)
+            .copied()
+            .unwrap_or_else(|| self.tolerance())
     }
 }
 
@@ -75,6 +94,8 @@ pub struct ComparisonReport {
     pub candidate: PathBuf,
     pub tree: String,
     pub tolerance: FloatTolerance,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub branch_tolerances: BTreeMap<String, FloatTolerance>,
     pub reference_entries: i64,
     pub candidate_entries: i64,
     pub compared_entries: i64,
@@ -134,6 +155,20 @@ impl ComparisonReport {
             "tolerance: abs_diff <= atol + rtol * abs(reference), rtol={} atol={}",
             self.tolerance.rtol, self.tolerance.atol
         ));
+        if !self.branch_tolerances.is_empty() {
+            let overrides = self
+                .branch_tolerances
+                .iter()
+                .map(|(branch, tolerance)| {
+                    format!(
+                        "{}(rtol={} atol={})",
+                        branch, tolerance.rtol, tolerance.atol
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("branch_tolerances: {overrides}"));
+        }
 
         for branch in &self.branches {
             match branch.presence {
@@ -327,10 +362,7 @@ fn compare_trees(
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut comparisons = Vec::with_capacity(names.len());
-    let tolerance = FloatTolerance {
-        rtol: options.rtol,
-        atol: options.atol,
-    };
+    let tolerance = options.tolerance();
 
     for name in names {
         let comparison = match (reference_branches.get(&name), candidate_branches.get(&name)) {
@@ -374,6 +406,7 @@ fn compare_trees(
         candidate: candidate_path.to_path_buf(),
         tree: options.tree.clone(),
         tolerance,
+        branch_tolerances: options.branch_tolerances.clone(),
         reference_entries: reference_tree.entries(),
         candidate_entries: candidate_tree.entries(),
         compared_entries: reference_tree
@@ -473,6 +506,7 @@ fn compare_branch(
         &candidate.types,
         reference_values,
         candidate_values,
+        options.tolerance_for(&reference.name),
         options,
     )
 }
@@ -629,6 +663,7 @@ fn read_branch(tree: &Tree, name: &str, value_type: ValueType) -> Result<BranchV
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compare_values(
     name: &str,
     value_type: ValueType,
@@ -636,9 +671,10 @@ fn compare_values(
     candidate_types: &[String],
     reference: BranchValues,
     candidate: BranchValues,
+    tolerance: FloatTolerance,
     options: &CompareOptions,
 ) -> BranchComparison {
-    let mut accumulator = Accumulator::new(options);
+    let mut accumulator = Accumulator::new(tolerance, options.max_mismatches);
     let error = match (reference, candidate) {
         (BranchValues::ScalarBool(reference), BranchValues::ScalarBool(candidate)) => {
             compare_exact_slice(&mut accumulator, &reference, &candidate);
@@ -783,8 +819,9 @@ fn kind_for(value_type: ValueType, jagged: bool) -> ValueKind {
     }
 }
 
-struct Accumulator<'a> {
-    options: &'a CompareOptions,
+struct Accumulator {
+    tolerance: FloatTolerance,
+    max_mismatches: usize,
     kind: ValueKind,
     n_compared: u64,
     n_mismatched: u64,
@@ -793,10 +830,11 @@ struct Accumulator<'a> {
     first_mismatches: Vec<ValueMismatch>,
 }
 
-impl<'a> Accumulator<'a> {
-    fn new(options: &'a CompareOptions) -> Self {
+impl Accumulator {
+    fn new(tolerance: FloatTolerance, max_mismatches: usize) -> Self {
         Self {
-            options,
+            tolerance,
+            max_mismatches,
             kind: ValueKind::ScalarBool,
             n_compared: 0,
             n_mismatched: 0,
@@ -835,7 +873,7 @@ impl<'a> Accumulator<'a> {
                     .unwrap_or(diff.rel),
             );
         }
-        if self.first_mismatches.len() < self.options.max_mismatches {
+        if self.first_mismatches.len() < self.max_mismatches {
             self.first_mismatches.push(ValueMismatch {
                 entry,
                 element,
@@ -854,7 +892,7 @@ struct FloatDiff {
     rel: f64,
 }
 
-fn compare_exact_slice<T>(accumulator: &mut Accumulator<'_>, reference: &[T], candidate: &[T])
+fn compare_exact_slice<T>(accumulator: &mut Accumulator, reference: &[T], candidate: &[T])
 where
     T: fmt::Debug + PartialEq + 'static,
 {
@@ -877,7 +915,7 @@ where
 }
 
 fn compare_exact_jagged<T>(
-    accumulator: &mut Accumulator<'_>,
+    accumulator: &mut Accumulator,
     reference: &[Vec<T>],
     candidate: &[Vec<T>],
 ) where
@@ -936,7 +974,7 @@ fn exact_kind<T: 'static>(jagged: bool) -> ValueKind {
     }
 }
 
-fn compare_float_slice<T>(accumulator: &mut Accumulator<'_>, reference: &[T], candidate: &[T])
+fn compare_float_slice<T>(accumulator: &mut Accumulator, reference: &[T], candidate: &[T])
 where
     T: FloatValue,
 {
@@ -956,7 +994,7 @@ where
 }
 
 fn compare_float_jagged<T>(
-    accumulator: &mut Accumulator<'_>,
+    accumulator: &mut Accumulator,
     reference: &[Vec<T>],
     candidate: &[Vec<T>],
 ) where
@@ -990,7 +1028,7 @@ fn compare_float_jagged<T>(
 }
 
 fn compare_float_value<T: FloatValue>(
-    accumulator: &mut Accumulator<'_>,
+    accumulator: &mut Accumulator,
     entry: i64,
     element: Option<usize>,
     reference: T,
@@ -998,7 +1036,7 @@ fn compare_float_value<T: FloatValue>(
 ) {
     let reference = reference.to_f64();
     let candidate = candidate.to_f64();
-    if floats_match(reference, candidate, accumulator.options) {
+    if floats_match(reference, candidate, accumulator.tolerance) {
         let diff = float_diff(reference, candidate);
         accumulator.max_abs_diff = Some(
             accumulator
@@ -1025,7 +1063,7 @@ fn compare_float_value<T: FloatValue>(
 }
 
 fn compare_len(
-    accumulator: &mut Accumulator<'_>,
+    accumulator: &mut Accumulator,
     compared_len: usize,
     reference_len: usize,
     candidate_len: usize,
@@ -1056,7 +1094,7 @@ fn compare_len(
     }
 }
 
-fn floats_match(reference: f64, candidate: f64, options: &CompareOptions) -> bool {
+fn floats_match(reference: f64, candidate: f64, tolerance: FloatTolerance) -> bool {
     if reference == candidate {
         return true;
     }
@@ -1067,7 +1105,7 @@ fn floats_match(reference: f64, candidate: f64, options: &CompareOptions) -> boo
         return false;
     }
     let abs = (reference - candidate).abs();
-    abs <= options.atol + options.rtol * reference.abs()
+    abs <= tolerance.atol + tolerance.rtol * reference.abs()
 }
 
 fn float_diff(reference: f64, candidate: f64) -> FloatDiff {

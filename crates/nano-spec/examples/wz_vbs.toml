@@ -1,0 +1,686 @@
+[analysis]
+name = "wz_vbs_nominal"
+year = "Run2024"
+
+[validation.compare]
+tree = "Events"
+rtol = 1e-5
+atol = 1e-4
+
+[[validation.compare.branch_tolerance]]
+branch = "PuppiMET_phiDef"
+rtol = 0.0
+atol = 0.02
+reason = "Legacy Type-1 MET depends on stochastic lepton/JER smearing not replayed by the Rust interpreter."
+
+[[validation.compare.branch_tolerance]]
+branch = "PuppiMET_ptDef"
+rtol = 0.0
+atol = 0.01
+reason = "Legacy Type-1 MET depends on stochastic lepton/JER smearing not replayed by the Rust interpreter."
+
+[[validation.compare.branch_tolerance]]
+branch = "m3lDef"
+rtol = 0.0
+atol = 2.0
+reason = "Three-lepton mass uses legacy stochastic lepton pT corrections."
+
+[[validation.compare.branch_tolerance]]
+branch = "mllZDef"
+rtol = 0.0
+atol = 0.5
+reason = "Z mass uses legacy stochastic electron pT corrections."
+
+[[validation.compare.branch_tolerance]]
+branch = "mtWDef"
+rtol = 0.0
+atol = 2.0
+reason = "W transverse mass depends on stochastic lepton and Type-1 MET corrections."
+
+[[validation.compare.branch_tolerance]]
+branch = "ptlWDef"
+rtol = 0.0
+atol = 1.0
+reason = "W lepton pT uses legacy stochastic muon pT correction."
+
+[[validation.compare.branch_tolerance]]
+branch = "vbs_sumHT"
+rtol = 0.0
+atol = 0.1
+reason = "Legacy jet/JER stochastic path leaves a small HT residual."
+
+[[correction]]
+name = "clean_jet_pt_jec"
+kind = "jec_nominal"
+file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+correction = "Summer24Prompt24_V2_MC_L1L2L3Res_AK4PFPuppi"
+collection = "clean_jet"
+attr = "ptJec"
+source_attr = "pt"
+raw_factor_attr = "rawFactor"
+inputs = [
+  { name = "JetA", from = "area" },
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "raw_pt" },
+  { name = "Rho", from = "Rho_fixedGridRhoFastjetAll" },
+  { name = "JetPhi", from = "phi" },
+]
+
+[[correction]]
+name = "vbs_jet_pt_jec"
+kind = "jec_nominal"
+file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+correction = "Summer24Prompt24_V2_MC_L1L2L3Res_AK4PFPuppi"
+collection = "vbs_jet"
+attr = "ptJec"
+source_attr = "pt"
+raw_factor_attr = "rawFactor"
+inputs = [
+  { name = "JetA", from = "area" },
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "raw_pt" },
+  { name = "Rho", from = "Rho_fixedGridRhoFastjetAll" },
+  { name = "JetPhi", from = "phi" },
+]
+
+[[correction]]
+name = "btag_jet_pt_jec"
+kind = "jec_nominal"
+file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+correction = "Summer24Prompt24_V2_MC_L1L2L3Res_AK4PFPuppi"
+collection = "btag_jet"
+attr = "ptJec"
+source_attr = "pt"
+raw_factor_attr = "rawFactor"
+inputs = [
+  { name = "JetA", from = "area" },
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "raw_pt" },
+  { name = "Rho", from = "Rho_fixedGridRhoFastjetAll" },
+  { name = "JetPhi", from = "phi" },
+]
+
+[[correction]]
+name = "clean_jet_pt_def"
+kind = "jer_nominal"
+collection = "clean_jet"
+attr = "ptDef"
+source_attr = "ptJec"
+scale_factor_file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+scale_factor_correction = "Summer23BPixPrompt23_RunD_JRV1_MC_ScaleFactor_AK4PFPuppi"
+scale_factor_inputs = [
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "ptJec" },
+  { name = "systematic", value = "nom" },
+]
+resolution_file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+resolution_correction = "Summer23BPixPrompt23_RunD_JRV1_MC_PtResolution_AK4PFPuppi"
+resolution_inputs = [
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "ptJec" },
+  { name = "Rho", from = "Rho_fixedGridRhoFastjetAll" },
+]
+gen_jet_index_attr = "genJetIdx"
+gen_jet_pt_branch = "GenJet_pt"
+
+[[correction]]
+name = "vbs_jet_pt_def"
+kind = "jer_nominal"
+collection = "vbs_jet"
+attr = "ptDef"
+source_attr = "ptJec"
+scale_factor_file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+scale_factor_correction = "Summer23BPixPrompt23_RunD_JRV1_MC_ScaleFactor_AK4PFPuppi"
+scale_factor_inputs = [
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "ptJec" },
+  { name = "systematic", value = "nom" },
+]
+resolution_file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+resolution_correction = "Summer23BPixPrompt23_RunD_JRV1_MC_PtResolution_AK4PFPuppi"
+resolution_inputs = [
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "ptJec" },
+  { name = "Rho", from = "Rho_fixedGridRhoFastjetAll" },
+]
+gen_jet_index_attr = "genJetIdx"
+gen_jet_pt_branch = "GenJet_pt"
+
+[[correction]]
+name = "btag_jet_pt_def"
+kind = "jer_nominal"
+collection = "btag_jet"
+attr = "ptDef"
+source_attr = "ptJec"
+scale_factor_file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+scale_factor_correction = "Summer23BPixPrompt23_RunD_JRV1_MC_ScaleFactor_AK4PFPuppi"
+scale_factor_inputs = [
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "ptJec" },
+  { name = "systematic", value = "nom" },
+]
+resolution_file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+resolution_correction = "Summer23BPixPrompt23_RunD_JRV1_MC_PtResolution_AK4PFPuppi"
+resolution_inputs = [
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "ptJec" },
+  { name = "Rho", from = "Rho_fixedGridRhoFastjetAll" },
+]
+gen_jet_index_attr = "genJetIdx"
+gen_jet_pt_branch = "GenJet_pt"
+
+[[channel]]
+name = "mm_e"
+
+[channel.objects.fake_muon]
+source = "Muon"
+cuts = [
+  "pt > 10 GeV",
+  "abs(eta) < 2.4",
+  "abs(dxy) < 0.05",
+  "abs(dz) < 0.10",
+  "pfIsoId >= 1",
+  "jetRelIso < 0.5",
+]
+
+[channel.objects.fake_electron]
+source = "Electron"
+cuts = [
+  "pt > 10 GeV",
+  "abs(eta) < 2.5",
+  "abs(dxy) < 0.05",
+  "abs(dz) < 0.10",
+  "cutBased >= 2",
+  "jetRelIso < 0.5",
+]
+
+[channel.objects.clean_jet]
+source = "Jet"
+cuts = [
+  "pt > 10 GeV",
+  "index_not_in(fake_muon.jetIdx) == 1",
+  "index_not_in(fake_electron.jetIdx) == 1",
+  "jet_veto_map_run2024() == 0",
+  "jet_id_tight_run2024() == 1",
+]
+
+[channel.objects.vbs_jet]
+source = "Jet"
+kinematics = { pt = "ptDef" }
+cuts = [
+  "ptDef > 50 GeV",
+  "abs(eta) < 4.7",
+  "index_not_in(fake_muon.jetIdx) == 1",
+  "index_not_in(fake_electron.jetIdx) == 1",
+  "jet_veto_map_run2024() == 0",
+  "jet_id_tight_run2024() == 1",
+]
+
+[channel.objects.btag_jet]
+source = "Jet"
+cuts = [
+  "ptDef > 20 GeV",
+  "abs(eta) < 2.5",
+  "index_not_in(fake_muon.jetIdx) == 1",
+  "index_not_in(fake_electron.jetIdx) == 1",
+  "jet_veto_map_run2024() == 0",
+  "jet_id_tight_run2024() == 1",
+  "btagUParTAK4B > 0.4648",
+]
+
+[channel.objects.good_tau]
+source = "Tau"
+cuts = [
+  "pt > 20 GeV",
+  "abs(eta) < 2.5",
+  "idDeepTau2018v2p5VSjet >= 6",
+  "idDeepTau2018v2p5VSe >= 6",
+  "idDeepTau2018v2p5VSmu >= 4",
+]
+
+[channel.derived.z_pair]
+kind = "pair"
+object = "fake_muon"
+constraints = ["opposite_charge"]
+selection = "nearest_mass"
+target = "91.1876 GeV"
+
+[channel.derived.trilepton]
+kind = "combine"
+items = ["z_pair", "fake_electron"]
+
+[channel.derived.vbs_jj]
+kind = "pair"
+object = "vbs_jet"
+selection = "leading_pt"
+
+[channel.regions.signal]
+require = [
+  "count(fake_muon) == 2",
+  "count(fake_electron) == 1",
+  "abs(sum(fake_muon.charge) + sum(fake_electron.charge)) == 1",
+  "z_pair.mass > 76.1876 GeV",
+  "z_pair.mass < 106.1876 GeV",
+  "trilepton.mass > 100 GeV",
+  "leading(fake_electron).pt > 20 GeV",
+  "met_type1_pt(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, ptDef) > 30 GeV",
+  "count(btag_jet) == 0",
+  "count(vbs_jet) >= 2",
+  "vbs_jj.mass > 500 GeV",
+  "vbs_jj.delta_eta > 2.5",
+  "zep_vv(trilepton, PuppiMET_pt, PuppiMET_phi, vbs_jj) < 1.0",
+  "count(good_tau) == 0",
+]
+
+[[channel.outputs]]
+name = "eventNum"
+expr = "event"
+dtype = "U64"
+
+[[channel.outputs]]
+name = "mll"
+expr = "z_pair.mass"
+
+[[channel.outputs]]
+name = "mllmin"
+expr = "z_pair.mass"
+
+[[channel.outputs]]
+name = "mllZDef"
+expr = "abs(z_pair.mass - 91.1876)"
+dtype = "F64"
+
+[[channel.outputs]]
+name = "m3lDef"
+expr = "trilepton.mass"
+
+[[channel.outputs]]
+name = "ptlWDef"
+expr = "leading(fake_electron).pt"
+
+[[channel.outputs]]
+name = "mtWDef"
+expr = "leading_type1_mt(fake_electron, clean_jet, PuppiMET_pt, PuppiMET_phi, pt, ptDef)"
+
+[[channel.outputs]]
+name = "run"
+expr = "run"
+
+[[channel.outputs]]
+name = "luminosityBlock"
+expr = "luminosityBlock"
+
+[[channel.outputs]]
+name = "PuppiMET_ptDef"
+expr = "met_type1_pt(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, ptDef)"
+
+[[channel.outputs]]
+name = "PuppiMET_phiDef"
+expr = "met_type1_phi(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, ptDef)"
+
+[[channel.outputs]]
+name = "nbtag_goodbtag_Jet_bjet"
+expr = "count(btag_jet) * 1.0"
+
+[[channel.outputs]]
+name = "nvbs_jets"
+expr = "count(vbs_jet) * 1.0"
+
+[[channel.outputs]]
+name = "vbs_mjj"
+expr = "vbs_jj.mass"
+
+[[channel.outputs]]
+name = "vbs_ptjj"
+expr = "vbs_jj.pt"
+
+[[channel.outputs]]
+name = "vbs_detajj"
+expr = "vbs_jj.delta_eta"
+
+[[channel.outputs]]
+name = "vbs_dphijj"
+expr = "vbs_jj.delta_phi"
+
+[[channel.outputs]]
+name = "vbs_ptj1"
+expr = "vbs_jj.leading_pt"
+
+[[channel.outputs]]
+name = "vbs_ptj2"
+expr = "vbs_jj.subleading_pt"
+
+[[channel.outputs]]
+name = "vbs_etaj1"
+expr = "abs(vbs_jj.leading_eta)"
+
+[[channel.outputs]]
+name = "vbs_etaj2"
+expr = "abs(vbs_jj.subleading_eta)"
+
+[[channel.outputs]]
+name = "vbs_phij1"
+expr = "vbs_jj.leading_phi"
+
+[[channel.outputs]]
+name = "vbs_phij2"
+expr = "vbs_jj.subleading_phi"
+
+[[channel.outputs]]
+name = "vbs_massj1"
+expr = "vbs_jj.leading_mass"
+
+[[channel.outputs]]
+name = "vbs_massj2"
+expr = "vbs_jj.subleading_mass"
+
+[[channel.outputs]]
+name = "vbs_btagj1"
+expr = "pair_leading_attr(vbs_jj, btagUParTAK4B)"
+
+[[channel.outputs]]
+name = "vbs_btagj2"
+expr = "pair_subleading_attr(vbs_jj, btagUParTAK4B)"
+
+[[channel.outputs]]
+name = "vbs_zepvv"
+expr = "zep_vv(trilepton, PuppiMET_pt, PuppiMET_phi, vbs_jj)"
+
+[[channel.outputs]]
+name = "vbs_zepmax"
+expr = "zep_max(trilepton, vbs_jj)"
+
+[[channel.outputs]]
+name = "vbs_sumHT"
+expr = "vbs_jj.leading_pt + (vbs_jj.subleading_pt + (met_type1_pt(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, ptDef) + (sum(fake_muon.pt) + sum(fake_electron.pt))))"
+
+[[channel.outputs]]
+name = "vbs_ptvv"
+expr = "system_met_pt(trilepton, PuppiMET_pt, PuppiMET_phi)"
+
+[[channel.outputs]]
+name = "vbs_pttot"
+expr = "system_pair_met_pt(trilepton, PuppiMET_pt, PuppiMET_phi, vbs_jj)"
+
+[[channel.outputs]]
+name = "vbs_detavvj1"
+expr = "abs(system_met_eta(trilepton, PuppiMET_pt, PuppiMET_phi) - vbs_jj.leading_eta)"
+
+[[channel.outputs]]
+name = "vbs_detavvj2"
+expr = "abs(system_met_eta(trilepton, PuppiMET_pt, PuppiMET_phi) - vbs_jj.subleading_eta)"
+
+[[channel.outputs]]
+name = "vbs_ptbalance"
+expr = "system_pair_pt_balance(trilepton, PuppiMET_pt, PuppiMET_phi, vbs_jj)"
+
+[[channel.outputs]]
+name = "vbs_dphijjll"
+expr = "system_delta_phi(vbs_jj, trilepton)"
+
+[[channel.outputs]]
+name = "vbs_rpt"
+expr = "legacy_lepton_rpt(fake_muon, fake_electron, vbs_jj)"
+
+[[channel.outputs]]
+name = "TriLepton_flavor"
+expr = "1.0"
+dtype = "I32"
+
+[[channel]]
+name = "ee_mu"
+
+[channel.objects.fake_muon]
+source = "Muon"
+cuts = [
+  "pt > 10 GeV",
+  "abs(eta) < 2.4",
+  "abs(dxy) < 0.05",
+  "abs(dz) < 0.10",
+  "pfIsoId >= 1",
+  "jetRelIso < 0.5",
+]
+
+[channel.objects.fake_electron]
+source = "Electron"
+cuts = [
+  "pt > 10 GeV",
+  "abs(eta) < 2.5",
+  "abs(dxy) < 0.05",
+  "abs(dz) < 0.10",
+  "cutBased >= 2",
+  "jetRelIso < 0.5",
+]
+
+[channel.objects.clean_jet]
+source = "Jet"
+cuts = [
+  "pt > 10 GeV",
+  "index_not_in(fake_muon.jetIdx) == 1",
+  "index_not_in(fake_electron.jetIdx) == 1",
+  "jet_veto_map_run2024() == 0",
+  "jet_id_tight_run2024() == 1",
+]
+
+[channel.objects.vbs_jet]
+source = "Jet"
+kinematics = { pt = "ptDef" }
+cuts = [
+  "ptDef > 50 GeV",
+  "abs(eta) < 4.7",
+  "index_not_in(fake_muon.jetIdx) == 1",
+  "index_not_in(fake_electron.jetIdx) == 1",
+  "jet_veto_map_run2024() == 0",
+  "jet_id_tight_run2024() == 1",
+]
+
+[channel.objects.btag_jet]
+source = "Jet"
+cuts = [
+  "ptDef > 20 GeV",
+  "abs(eta) < 2.5",
+  "index_not_in(fake_muon.jetIdx) == 1",
+  "index_not_in(fake_electron.jetIdx) == 1",
+  "jet_veto_map_run2024() == 0",
+  "jet_id_tight_run2024() == 1",
+  "btagUParTAK4B > 0.4648",
+]
+
+[channel.objects.good_tau]
+source = "Tau"
+cuts = [
+  "pt > 20 GeV",
+  "abs(eta) < 2.5",
+  "idDeepTau2018v2p5VSjet >= 6",
+  "idDeepTau2018v2p5VSe >= 6",
+  "idDeepTau2018v2p5VSmu >= 4",
+]
+
+[channel.derived.z_pair]
+kind = "pair"
+object = "fake_electron"
+constraints = ["opposite_charge"]
+selection = "nearest_mass"
+target = "91.1876 GeV"
+
+[channel.derived.trilepton]
+kind = "combine"
+items = ["z_pair", "fake_muon"]
+
+[channel.derived.vbs_jj]
+kind = "pair"
+object = "vbs_jet"
+selection = "leading_pt"
+
+[channel.regions.signal]
+require = [
+  "count(fake_muon) == 1",
+  "count(fake_electron) == 2",
+  "abs(sum(fake_muon.charge) + sum(fake_electron.charge)) == 1",
+  "z_pair.mass > 76.1876 GeV",
+  "z_pair.mass < 106.1876 GeV",
+  "trilepton.mass > 100 GeV",
+  "leading(fake_muon).pt > 20 GeV",
+  "met_type1_pt(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, ptDef) > 30 GeV",
+  "count(btag_jet) == 0",
+  "count(vbs_jet) >= 2",
+  "vbs_jj.mass > 500 GeV",
+  "vbs_jj.delta_eta > 2.5",
+  "zep_vv(trilepton, PuppiMET_pt, PuppiMET_phi, vbs_jj) < 1.0",
+  "count(good_tau) == 0",
+]
+
+[[channel.outputs]]
+name = "eventNum"
+expr = "event"
+dtype = "U64"
+
+[[channel.outputs]]
+name = "mll"
+expr = "z_pair.mass"
+
+[[channel.outputs]]
+name = "mllmin"
+expr = "z_pair.mass"
+
+[[channel.outputs]]
+name = "mllZDef"
+expr = "abs(z_pair.mass - 91.1876)"
+dtype = "F64"
+
+[[channel.outputs]]
+name = "m3lDef"
+expr = "trilepton.mass"
+
+[[channel.outputs]]
+name = "ptlWDef"
+expr = "leading(fake_muon).pt"
+
+[[channel.outputs]]
+name = "mtWDef"
+expr = "leading_type1_mt(fake_muon, clean_jet, PuppiMET_pt, PuppiMET_phi, pt, ptDef)"
+
+[[channel.outputs]]
+name = "run"
+expr = "run"
+
+[[channel.outputs]]
+name = "luminosityBlock"
+expr = "luminosityBlock"
+
+[[channel.outputs]]
+name = "PuppiMET_ptDef"
+expr = "met_type1_pt(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, ptDef)"
+
+[[channel.outputs]]
+name = "PuppiMET_phiDef"
+expr = "met_type1_phi(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, ptDef)"
+
+[[channel.outputs]]
+name = "nbtag_goodbtag_Jet_bjet"
+expr = "count(btag_jet) * 1.0"
+
+[[channel.outputs]]
+name = "nvbs_jets"
+expr = "count(vbs_jet) * 1.0"
+
+[[channel.outputs]]
+name = "vbs_mjj"
+expr = "vbs_jj.mass"
+
+[[channel.outputs]]
+name = "vbs_ptjj"
+expr = "vbs_jj.pt"
+
+[[channel.outputs]]
+name = "vbs_detajj"
+expr = "vbs_jj.delta_eta"
+
+[[channel.outputs]]
+name = "vbs_dphijj"
+expr = "vbs_jj.delta_phi"
+
+[[channel.outputs]]
+name = "vbs_ptj1"
+expr = "vbs_jj.leading_pt"
+
+[[channel.outputs]]
+name = "vbs_ptj2"
+expr = "vbs_jj.subleading_pt"
+
+[[channel.outputs]]
+name = "vbs_etaj1"
+expr = "abs(vbs_jj.leading_eta)"
+
+[[channel.outputs]]
+name = "vbs_etaj2"
+expr = "abs(vbs_jj.subleading_eta)"
+
+[[channel.outputs]]
+name = "vbs_phij1"
+expr = "vbs_jj.leading_phi"
+
+[[channel.outputs]]
+name = "vbs_phij2"
+expr = "vbs_jj.subleading_phi"
+
+[[channel.outputs]]
+name = "vbs_massj1"
+expr = "vbs_jj.leading_mass"
+
+[[channel.outputs]]
+name = "vbs_massj2"
+expr = "vbs_jj.subleading_mass"
+
+[[channel.outputs]]
+name = "vbs_btagj1"
+expr = "pair_leading_attr(vbs_jj, btagUParTAK4B)"
+
+[[channel.outputs]]
+name = "vbs_btagj2"
+expr = "pair_subleading_attr(vbs_jj, btagUParTAK4B)"
+
+[[channel.outputs]]
+name = "vbs_zepvv"
+expr = "zep_vv(trilepton, PuppiMET_pt, PuppiMET_phi, vbs_jj)"
+
+[[channel.outputs]]
+name = "vbs_zepmax"
+expr = "zep_max(trilepton, vbs_jj)"
+
+[[channel.outputs]]
+name = "vbs_sumHT"
+expr = "vbs_jj.leading_pt + (vbs_jj.subleading_pt + (met_type1_pt(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, ptDef) + (sum(fake_muon.pt) + sum(fake_electron.pt))))"
+
+[[channel.outputs]]
+name = "vbs_ptvv"
+expr = "system_met_pt(trilepton, PuppiMET_pt, PuppiMET_phi)"
+
+[[channel.outputs]]
+name = "vbs_pttot"
+expr = "system_pair_met_pt(trilepton, PuppiMET_pt, PuppiMET_phi, vbs_jj)"
+
+[[channel.outputs]]
+name = "vbs_detavvj1"
+expr = "abs(system_met_eta(trilepton, PuppiMET_pt, PuppiMET_phi) - vbs_jj.leading_eta)"
+
+[[channel.outputs]]
+name = "vbs_detavvj2"
+expr = "abs(system_met_eta(trilepton, PuppiMET_pt, PuppiMET_phi) - vbs_jj.subleading_eta)"
+
+[[channel.outputs]]
+name = "vbs_ptbalance"
+expr = "system_pair_pt_balance(trilepton, PuppiMET_pt, PuppiMET_phi, vbs_jj)"
+
+[[channel.outputs]]
+name = "vbs_dphijjll"
+expr = "system_delta_phi(vbs_jj, trilepton)"
+
+[[channel.outputs]]
+name = "vbs_rpt"
+expr = "legacy_lepton_rpt(fake_muon, fake_electron, vbs_jj)"
+
+[[channel.outputs]]
+name = "TriLepton_flavor"
+expr = "2.0"
+dtype = "I32"

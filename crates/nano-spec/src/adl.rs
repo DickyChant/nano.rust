@@ -455,6 +455,77 @@ fn expr_to_adl(expr: &Expr) -> String {
             right,
             quantity_to_adl(target)
         ),
+        Expr::ZepVv {
+            system,
+            met_pt,
+            met_phi,
+            dijet,
+        } => format!("zep_vv({system}, {met_pt}, {met_phi}, {dijet})"),
+        Expr::SystemMetEta {
+            system,
+            met_pt,
+            met_phi,
+        } => format!("system_met_eta({system}, {met_pt}, {met_phi})"),
+        Expr::SystemMetPt {
+            system,
+            met_pt,
+            met_phi,
+        } => format!("system_met_pt({system}, {met_pt}, {met_phi})"),
+        Expr::SystemPairMetPt {
+            system,
+            met_pt,
+            met_phi,
+            pair,
+        } => format!("system_pair_met_pt({system}, {met_pt}, {met_phi}, {pair})"),
+        Expr::SystemPairPtBalance {
+            system,
+            met_pt,
+            met_phi,
+            pair,
+        } => format!("system_pair_pt_balance({system}, {met_pt}, {met_phi}, {pair})"),
+        Expr::MetType1Pt {
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => format!("met_type1_pt({jets}, {met_pt}, {met_phi}, {nominal_pt}, {shifted_pt})"),
+        Expr::MetType1Phi {
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => {
+            format!("met_type1_phi({jets}, {met_pt}, {met_phi}, {nominal_pt}, {shifted_pt})")
+        }
+        Expr::LeadingType1Mt {
+            object,
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => {
+            format!("leading_type1_mt({object}, {jets}, {met_pt}, {met_phi}, {nominal_pt}, {shifted_pt})")
+        }
+        Expr::SystemDeltaPhi { left, right } => format!("system_delta_phi({left}, {right})"),
+        Expr::LegacyLeptonRpt {
+            muons,
+            electrons,
+            dijet,
+        } => format!("legacy_lepton_rpt({muons}, {electrons}, {dijet})"),
+        Expr::PairConstituentAttr { pair, attr, rank } => {
+            let function = match rank {
+                crate::PairConstituentRank::Leading => "pair_leading_attr",
+                crate::PairConstituentRank::Subleading => "pair_subleading_attr",
+            };
+            format!("{function}({pair}, {attr})")
+        }
+        Expr::ZepMax { system, dijet } => format!("zep_max({system}, {dijet})"),
+        Expr::IndexNotIn { object, attr } => format!("index_not_in({object}.{attr})"),
+        Expr::JetIdTightRun2024 { object } => format!("jet_id_tight_run2024({object})"),
+        Expr::JetVetoMapRun2024 { object } => format!("jet_veto_map_run2024({object})"),
         Expr::LeadingAttr { object, attr } => format!("leading({object}).{attr}"),
         Expr::PairDeltaR => "delta_r".to_string(),
         Expr::PairLeadingPt => "leading_pt".to_string(),
@@ -521,6 +592,9 @@ fn year_to_string(year: &Year) -> String {
         Year::Run2016 => "Run2016".to_string(),
         Year::Run2017 => "Run2017".to_string(),
         Year::Run2018 => "Run2018".to_string(),
+        Year::Run2022 => "Run2022".to_string(),
+        Year::Run2023 => "Run2023".to_string(),
+        Year::Run2024 => "Run2024".to_string(),
         Year::Other(year) => year.clone(),
     }
 }
@@ -626,6 +700,7 @@ impl Parser {
             systematic: self.systematic,
             corrections: self.corrections,
             channels: Vec::new(),
+            validation: None,
         })?;
         reorder_by_names(&mut spec.objects, &self.object_order, |object| &object.name);
         reorder_by_names(&mut spec.derived_objects, &self.derived_order, |object| {
@@ -671,7 +746,14 @@ impl Parser {
                 .flat_map(expand_select_statement)
                 .map(|stmt| self.expand_aliases(stmt.trim()))
                 .collect::<Vec<_>>();
-            self.insert_object(name, RawObject { source, cuts })
+            self.insert_object(
+                name,
+                RawObject {
+                    source,
+                    kinematics: Default::default(),
+                    cuts,
+                },
+            )
         }
     }
 
@@ -1040,11 +1122,21 @@ impl Parser {
             kind,
             collection,
             attr: Some(attr),
+            source_attr: None,
+            raw_factor_attr: None,
             up: Some(up),
             down: Some(down),
             file: None,
             correction: None,
             inputs: Vec::new(),
+            scale_factor_file: None,
+            scale_factor_correction: None,
+            scale_factor_inputs: Vec::new(),
+            resolution_file: None,
+            resolution_correction: None,
+            resolution_inputs: Vec::new(),
+            gen_jet_index_attr: None,
+            gen_jet_pt_branch: None,
             systematic: None,
         });
         Ok(())
@@ -1081,7 +1173,11 @@ impl Parser {
                 "failed to parse ADL: duplicate output `{name}`"
             )));
         }
-        self.outputs.push(RawOutput { name, expr });
+        self.outputs.push(RawOutput {
+            name,
+            expr,
+            dtype: None,
+        });
         Ok(())
     }
 
@@ -1590,11 +1686,21 @@ fn parse_scale_factor_correction_adl(name: &str, input: &str) -> Result<RawCorre
             ))
         })?,
         attr: None,
+        source_attr: None,
+        raw_factor_attr: None,
         up: None,
         down: None,
         file,
         correction: payload_correction,
         inputs,
+        scale_factor_file: None,
+        scale_factor_correction: None,
+        scale_factor_inputs: Vec::new(),
+        resolution_file: None,
+        resolution_correction: None,
+        resolution_inputs: Vec::new(),
+        gen_jet_index_attr: None,
+        gen_jet_pt_branch: None,
         systematic,
     })
 }
@@ -1668,11 +1774,21 @@ fn parse_jes_correction_adl(name: &str, input: &str) -> Result<RawCorrection, Pa
             ))
         })?,
         attr,
+        source_attr: None,
+        raw_factor_attr: None,
         up: None,
         down: None,
         file,
         correction: payload_correction,
         inputs,
+        scale_factor_file: None,
+        scale_factor_correction: None,
+        scale_factor_inputs: Vec::new(),
+        resolution_file: None,
+        resolution_correction: None,
+        resolution_inputs: Vec::new(),
+        gen_jet_index_attr: None,
+        gen_jet_pt_branch: None,
         systematic: None,
     })
 }

@@ -297,6 +297,31 @@ fn task_atoms_match_single_pass_and_local_executor() {
     );
 }
 
+#[test]
+fn xrootd_sources_report_explicit_unsupported_error() {
+    let fixture = Fixture::new("xrootd-unsupported");
+    let source = "root://cms-xrd-global.cern.ch//store/mc/example.root";
+
+    let plan_error = match plan_muon_workflow(
+        [Path::new(source)],
+        input_schema(),
+        2,
+        fixture.path("cache"),
+        fixture.path("skim.root"),
+    ) {
+        Ok(_) => panic!("xrootd planning should fail explicitly"),
+        Err(error) => error,
+    };
+    assert!(plan_error.to_string().contains("XRootD source"));
+    assert!(plan_error.to_string().contains("not implemented"));
+
+    let registry = KernelRegistry::with_muon();
+    let task_error = run_chunk(&RunChunkRequest::new(source, 0, 1, "muon"), &registry)
+        .expect_err("xrootd task atom should fail explicitly");
+    assert!(task_error.to_string().contains("XRootD source"));
+    assert!(task_error.to_string().contains("not implemented"));
+}
+
 /// End-to-end local proof for the portable-DAG boundary used by the Dask/Ray
 /// adapters: export/import a graph, run each map through the same `run-chunk`
 /// task atom that writes partial JSON, merge those partial files, and compare

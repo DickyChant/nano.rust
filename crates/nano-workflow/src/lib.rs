@@ -11,6 +11,7 @@ pub mod planner;
 pub mod portable;
 pub mod provenance;
 pub mod sink;
+pub mod sources;
 pub mod tasks;
 
 pub use artifacts::{ChunkSpec, Cutflow, EntryRange, Histogram1D, MergedOutput, PartialOutput};
@@ -27,6 +28,10 @@ pub use portable::{
 };
 pub use provenance::{Manifest, CODE_SPEC_VERSION};
 pub use sink::write_muon_skim;
+pub use sources::{
+    eos_dataset_base_path, resolve_eos_dataset_files, validate_x509_proxy, EosDatasetFiles,
+    EosResolveOptions, InputSource, SourceKind, SourceList,
+};
 pub use tasks::{
     merge_partial_files, merge_partials, muon_schema, read_merged_output, read_partial_output,
     run_chunk, run_chunk_to_path, run_chunk_with_kernel, write_merged_output, write_partial_output,

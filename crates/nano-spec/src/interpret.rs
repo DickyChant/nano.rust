@@ -4,9 +4,10 @@
 //! object cuts, region requirements, and output expressions directly over an
 //! event instead of requiring a compiled producer.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use nano_analysis::{EventWeight, HistSet1D};
 use nano_core::{BranchType, Event, ObjectView};
@@ -14,12 +15,13 @@ use nano_corrections::Value as CorrectionValue;
 use nano_inference::{mock_scores, InferRequest, Tensor, TensorData};
 
 use crate::kir::{
-    Block, ForEachAxis, KirObject, KirProgram, KirShapeCorrection, KirShapeCorrectionPayload,
-    Rvalue, Stmt, ValueId,
+    Block, ForEachAxis, KirObject, KirObjectCorrection, KirObjectCorrectionPayload, KirProgram,
+    KirShapeCorrection, KirShapeCorrectionPayload, Rvalue, Stmt, ValueId,
 };
 use crate::{
     ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef, ModelProviderKind,
-    ObjectCandidateDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan, SystematicDef,
+    ObjectCandidateDef, ObjectPairDef, PairConstituentRank, PairConstraint, PairSelection,
+    ResolvedPlan, SystematicDef,
 };
 
 /// One typed output cell produced by the interpreter.
@@ -29,6 +31,7 @@ pub enum Value {
     F64(f64),
     I64(i64),
     U32(u32),
+    U64(u64),
     Bool(bool),
 }
 
@@ -161,14 +164,46 @@ type RuntimeValues = HashMap<ValueId, RuntimeValue>;
 #[derive(Debug, Clone, PartialEq)]
 struct SelectedObject {
     source_index: usize,
+    p4: SelectedKinematics,
     leading_values: HashMap<String, NumericValue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SelectedKinematics {
+    pt: f64,
+    eta: f64,
+    phi: f64,
+    mass: f64,
+}
+
+impl Default for SelectedKinematics {
+    fn default() -> Self {
+        Self {
+            pt: 0.0,
+            eta: 0.0,
+            phi: 0.0,
+            mass: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct DerivedObject {
     mass: f64,
     pt: f64,
+    eta: f64,
+    phi: f64,
     min_delta_r: f64,
+    delta_eta: f64,
+    delta_phi: f64,
+    leading_pt: f64,
+    subleading_pt: f64,
+    leading_eta: f64,
+    subleading_eta: f64,
+    leading_phi: f64,
+    subleading_phi: f64,
+    leading_mass: f64,
+    subleading_mass: f64,
     energy: f64,
     px: f64,
     py: f64,
@@ -183,6 +218,8 @@ struct Constituent {
     pt: NumericValue,
     eta: NumericValue,
     phi: NumericValue,
+    mass: NumericValue,
+    values: HashMap<String, NumericValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -398,7 +435,7 @@ fn model_input_value(
             )));
         }
         let value = object_input_value(item, attr, branch_type)?;
-        let factor = shape_factor_for_source(program, batch, attr, item, systematic)?;
+        let factor = shape_factor_for_source(program, event, batch, attr, item, systematic)?;
         Ok((f64::from(value) * factor) as f32)
     } else {
         scalar_input_value(event, input, branch_type)
@@ -471,6 +508,33 @@ fn branch_type(program: &KirProgram, branch: &str) -> Result<BranchType> {
         .find(|spec| spec.name == branch)
         .map(|spec| spec.branch_type)
         .ok_or_else(|| InterpretError::MissingBranch(branch.to_string()))
+}
+
+fn correction_set_from_path(file: &str) -> Result<Arc<nano_corrections::CorrectionSet>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<nano_corrections::CorrectionSet>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache.lock().map_err(|error| {
+            InterpretError::Correction(format!("correction cache lock failed: {error}"))
+        })?;
+        if let Some(set) = guard.get(file) {
+            return Ok(Arc::clone(set));
+        }
+    }
+
+    let loaded = Arc::new(
+        nano_corrections::CorrectionSet::from_path(file).map_err(|error| {
+            InterpretError::Correction(format!("failed to load `{file}`: {error}"))
+        })?,
+    );
+    let mut guard = cache.lock().map_err(|error| {
+        InterpretError::Correction(format!("correction cache lock failed: {error}"))
+    })?;
+    let entry = guard
+        .entry(file.to_string())
+        .or_insert_with(|| Arc::clone(&loaded));
+    Ok(Arc::clone(entry))
 }
 
 fn provider_kind_name(kind: &ModelProviderKind) -> &str {
@@ -727,9 +791,14 @@ impl<'a> KirEvaluator<'a> {
             if expr_has_missing_value(&histogram.def.expr, &self.selected, &self.derived)? {
                 return Ok(false);
             }
-            let value =
-                eval_numeric_expr(&histogram.def.expr, &self.selected, &self.derived, None)?
-                    .as_f64();
+            let value = eval_numeric_expr(
+                &histogram.def.expr,
+                &self.selected,
+                &self.derived,
+                None,
+                Some(self.event),
+            )?
+            .as_f64();
             let Some(histograms) = &mut self.histograms else {
                 return Ok(true);
             };
@@ -753,6 +822,7 @@ impl<'a> KirEvaluator<'a> {
                     self.program,
                     self.event,
                     object,
+                    &self.selected,
                     &self.systematic,
                     &self.model_outputs,
                 )?;
@@ -766,17 +836,31 @@ impl<'a> KirEvaluator<'a> {
             }
             Rvalue::Requirement { requirement } => {
                 if let Expr::EventScalar(branch) = &requirement.lhs {
-                    let lhs = self.event.scalar::<bool>(branch)?;
-                    return Ok(RuntimeValue::Bool(compare_bool(
-                        lhs,
-                        requirement.op,
-                        requirement.rhs.value,
-                    )?));
+                    let branch_type = self
+                        .event
+                        .schema()
+                        .find(branch)
+                        .map(|info| info.branch_type)
+                        .ok_or_else(|| InterpretError::MissingBranch(branch.clone()))?;
+                    if branch_type == BranchType::Bool {
+                        let lhs = self.event.scalar::<bool>(branch)?;
+                        return Ok(RuntimeValue::Bool(compare_bool(
+                            lhs,
+                            requirement.op,
+                            requirement.rhs.value,
+                        )?));
+                    }
                 }
                 if expr_has_missing_value(&requirement.lhs, &self.selected, &self.derived)? {
                     return Ok(RuntimeValue::Bool(false));
                 }
-                let lhs = eval_numeric_expr(&requirement.lhs, &self.selected, &self.derived, None)?;
+                let lhs = eval_numeric_expr(
+                    &requirement.lhs,
+                    &self.selected,
+                    &self.derived,
+                    None,
+                    Some(self.event),
+                )?;
                 Ok(RuntimeValue::Bool(compare(
                     lhs.as_f64(),
                     requirement.op,
@@ -795,6 +879,7 @@ impl<'a> KirEvaluator<'a> {
                 expr,
                 &self.selected,
                 &self.derived,
+                self.event,
             )?)),
             Rvalue::Histogram { histogram } => Ok(RuntimeValue::Histogram(histogram.name.clone())),
             Rvalue::HistogramValue { expr, .. } => {
@@ -802,7 +887,8 @@ impl<'a> KirEvaluator<'a> {
                     return Ok(RuntimeValue::Output(None));
                 }
                 Ok(RuntimeValue::Numeric(
-                    eval_numeric_expr(expr, &self.selected, &self.derived, None)?.as_f64(),
+                    eval_numeric_expr(expr, &self.selected, &self.derived, None, Some(self.event))?
+                        .as_f64(),
                 ))
             }
             Rvalue::ScaleFactor { systematic } => {
@@ -938,18 +1024,22 @@ pub fn interpret_union(plan: &ResolvedPlan, event: &Event) -> Result<Vec<Channel
 
 fn passes_object_cuts(
     program: &KirProgram,
+    event: &Event,
     object: &KirObject,
     item: &ObjectView<'_>,
+    selected: &SelectedObjects,
     systematic: &str,
     model_outputs: &ModelOutputs,
 ) -> Result<bool> {
     for cut in &object.cuts {
         let lhs = eval_object_numeric_expr(
             program,
+            event,
             &object.name,
             &object.source,
             &cut.lhs,
             item,
+            selected,
             systematic,
             model_outputs,
         )?;
@@ -964,6 +1054,7 @@ fn select_object(
     program: &KirProgram,
     event: &Event,
     object: &KirObject,
+    selected: &SelectedObjects,
     systematic: &str,
     model_outputs: &ModelOutputs,
 ) -> Result<Vec<SelectedObject>> {
@@ -972,10 +1063,19 @@ fn select_object(
 
     for item in collection.iter() {
         let mut leading_values = HashMap::new();
-        if passes_object_cuts(program, object, item, systematic, model_outputs)? {
+        if passes_object_cuts(
+            program,
+            event,
+            object,
+            item,
+            selected,
+            systematic,
+            model_outputs,
+        )? {
             for attr in leading_attrs_for_object(program, &object.name) {
                 let value = read_object_attr(
                     program,
+                    event,
                     &object.name,
                     &object.source,
                     item,
@@ -985,14 +1085,146 @@ fn select_object(
                 )?;
                 leading_values.insert(attr, value);
             }
+            let kinematic_components = object_required_kinematic_components(program, &object.name);
+            let p4 = if !kinematic_components.is_empty() {
+                selected_kinematics(
+                    program,
+                    event,
+                    object,
+                    item,
+                    systematic,
+                    model_outputs,
+                    &kinematic_components,
+                )?
+            } else {
+                SelectedKinematics::default()
+            };
             objects.push(SelectedObject {
                 source_index: item.index(),
+                p4,
                 leading_values,
             });
         }
     }
 
     Ok(objects)
+}
+
+fn object_required_kinematic_components(
+    program: &KirProgram,
+    object_name: &str,
+) -> BTreeSet<&'static str> {
+    let mut components = BTreeSet::new();
+    for derived in &program.derived_objects {
+        match &derived.def.source {
+            DerivedSource::Pair(pair) if pair.object == object_name => {
+                components.extend(["pt", "eta", "phi", "mass"]);
+            }
+            DerivedSource::Candidate(candidate)
+                if candidate.items.iter().any(|item| item == object_name) =>
+            {
+                components.extend(["pt", "eta", "phi", "mass"]);
+            }
+            _ => {}
+        }
+    }
+    for requirement in program
+        .regions
+        .iter()
+        .flat_map(|region| region.requirements.iter())
+    {
+        collect_expr_required_kinematic_components(&requirement.lhs, object_name, &mut components);
+    }
+    for output in &program.outputs {
+        collect_expr_required_kinematic_components(&output.expr, object_name, &mut components);
+    }
+    components
+}
+
+fn collect_expr_required_kinematic_components(
+    expr: &Expr,
+    object_name: &str,
+    components: &mut BTreeSet<&'static str>,
+) {
+    match expr {
+        Expr::EitherPairPt { left, right, .. } => {
+            if left == object_name || right == object_name {
+                components.insert("pt");
+            }
+        }
+        Expr::LegacyLeptonRpt {
+            muons, electrons, ..
+        } => {
+            if muons == object_name || electrons == object_name {
+                components.insert("pt");
+            }
+        }
+        Expr::LeadingType1Mt { object, .. } => {
+            if object == object_name {
+                components.insert("pt");
+                components.insert("phi");
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_expr_required_kinematic_components(lhs, object_name, components);
+            collect_expr_required_kinematic_components(rhs, object_name, components);
+        }
+        Expr::Abs(inner) | Expr::Sqrt(inner) => {
+            collect_expr_required_kinematic_components(inner, object_name, components);
+        }
+        Expr::CountWhere { predicate, .. }
+        | Expr::All { predicate, .. }
+        | Expr::Any { predicate, .. } => {
+            collect_expr_required_kinematic_components(&predicate.lhs, object_name, components);
+        }
+        _ => {}
+    }
+}
+
+fn selected_kinematics(
+    program: &KirProgram,
+    event: &Event,
+    object: &KirObject,
+    item: &ObjectView<'_>,
+    systematic: &str,
+    model_outputs: &ModelOutputs,
+    components: &BTreeSet<&'static str>,
+) -> Result<SelectedKinematics> {
+    let read = |attr: &str| {
+        read_object_attr(
+            program,
+            event,
+            &object.name,
+            &object.source,
+            item,
+            attr,
+            systematic,
+            model_outputs,
+        )
+        .map(NumericValue::as_f64)
+    };
+    Ok(SelectedKinematics {
+        pt: if components.contains("pt") {
+            read(&object.kinematics.pt)?
+        } else {
+            0.0
+        },
+        eta: if components.contains("eta") {
+            read(&object.kinematics.eta)?
+        } else {
+            0.0
+        },
+        phi: if components.contains("phi") {
+            read(&object.kinematics.phi)?
+        } else {
+            0.0
+        },
+        mass: if components.contains("mass") {
+            read(&object.kinematics.mass)?
+        } else {
+            0.0
+        },
+    })
 }
 
 fn derive_object(
@@ -1029,9 +1261,7 @@ fn derive_pair(
 
     let mut order = (0..objects.len()).collect::<Vec<_>>();
     if !matches!(pair.selection, PairSelection::NearestMassTruncated { .. }) {
-        order.sort_by(|&left, &right| {
-            attr_f64(&objects[right], "pt").total_cmp(&attr_f64(&objects[left], "pt"))
-        });
+        order.sort_by(|&left, &right| objects[right].p4.pt.total_cmp(&objects[left].p4.pt));
     }
 
     let target = match &pair.selection {
@@ -1105,25 +1335,7 @@ fn derive_candidate(
             px += item_px;
             py += item_py;
             pz += item_pz;
-            constituents.push(Constituent {
-                object: item.clone(),
-                index: object.source_index,
-                pt: object
-                    .leading_values
-                    .get("pt")
-                    .copied()
-                    .unwrap_or(NumericValue::F64(0.0)),
-                eta: object
-                    .leading_values
-                    .get("eta")
-                    .copied()
-                    .unwrap_or(NumericValue::F64(0.0)),
-                phi: object
-                    .leading_values
-                    .get("phi")
-                    .copied()
-                    .unwrap_or(NumericValue::F64(0.0)),
-            });
+            constituents.push(constituent_from_selected(item, object));
             *occurrence += 1;
         } else if derived.contains_key(item) {
             let Some(object) = derived_object(derived, item)? else {
@@ -1141,10 +1353,23 @@ fn derive_candidate(
 
     let (mass, pt) = mass_pt(energy, px, py, pz);
     if mass.is_finite() && mass > 0.0 {
+        let geometry = constituent_geometry(&constituents);
         let candidate = DerivedObject {
             mass,
             pt,
-            min_delta_r: candidate_min_delta_r(&constituents),
+            eta: vector_eta(px, py, pz),
+            phi: vector_phi(px, py),
+            min_delta_r: geometry.min_delta_r,
+            delta_eta: geometry.delta_eta,
+            delta_phi: geometry.delta_phi,
+            leading_pt: geometry.leading_pt,
+            subleading_pt: geometry.subleading_pt,
+            leading_eta: geometry.leading_eta,
+            subleading_eta: geometry.subleading_eta,
+            leading_phi: geometry.leading_phi,
+            subleading_phi: geometry.subleading_phi,
+            leading_mass: geometry.leading_mass,
+            subleading_mass: geometry.subleading_mass,
             energy,
             px,
             py,
@@ -1200,13 +1425,13 @@ fn eval_pair_filter_expr(
 ) -> Result<f64> {
     match expr {
         Expr::PairDeltaR => Ok(delta_r(
-            attr_f64(first, "eta"),
-            attr_f64(first, "phi"),
-            attr_f64(second, "eta"),
-            attr_f64(second, "phi"),
+            first.p4.eta,
+            first.p4.phi,
+            second.p4.eta,
+            second.p4.phi,
         )),
-        Expr::PairLeadingPt => Ok(attr_f64(first, "pt").max(attr_f64(second, "pt"))),
-        Expr::PairSubleadingPt => Ok(attr_f64(first, "pt").min(attr_f64(second, "pt"))),
+        Expr::PairLeadingPt => Ok(first.p4.pt.max(second.p4.pt)),
+        Expr::PairSubleadingPt => Ok(first.p4.pt.min(second.p4.pt)),
         other => Err(InterpretError::InvalidExpression(format!(
             "unsupported pair filter expression `{other}`"
         ))),
@@ -1274,31 +1499,26 @@ fn combine_selected<'a>(
         px += item_px;
         py += item_py;
         pz += item_pz;
-        constituents.push(Constituent {
-            object: object.to_string(),
-            index: item.source_index,
-            pt: item
-                .leading_values
-                .get("pt")
-                .copied()
-                .unwrap_or(NumericValue::F64(0.0)),
-            eta: item
-                .leading_values
-                .get("eta")
-                .copied()
-                .unwrap_or(NumericValue::F64(0.0)),
-            phi: item
-                .leading_values
-                .get("phi")
-                .copied()
-                .unwrap_or(NumericValue::F64(0.0)),
-        });
+        constituents.push(constituent_from_selected(object, item));
     }
     let (mass, pt) = mass_pt(energy, px, py, pz);
+    let geometry = constituent_geometry(&constituents);
     Ok(DerivedObject {
         mass,
         pt,
-        min_delta_r: candidate_min_delta_r(&constituents),
+        eta: vector_eta(px, py, pz),
+        phi: vector_phi(px, py),
+        min_delta_r: geometry.min_delta_r,
+        delta_eta: geometry.delta_eta,
+        delta_phi: geometry.delta_phi,
+        leading_pt: geometry.leading_pt,
+        subleading_pt: geometry.subleading_pt,
+        leading_eta: geometry.leading_eta,
+        subleading_eta: geometry.subleading_eta,
+        leading_phi: geometry.leading_phi,
+        subleading_phi: geometry.subleading_phi,
+        leading_mass: geometry.leading_mass,
+        subleading_mass: geometry.subleading_mass,
         energy,
         px,
         py,
@@ -1308,15 +1528,27 @@ fn combine_selected<'a>(
 }
 
 fn selected_four_vector(item: &SelectedObject) -> (f64, f64, f64, f64) {
-    let pt = attr_f64(item, "pt");
-    let eta = attr_f64(item, "eta");
-    let phi = attr_f64(item, "phi");
-    let mass = attr_f64(item, "mass");
+    let pt = item.p4.pt;
+    let eta = item.p4.eta;
+    let phi = item.p4.phi;
+    let mass = item.p4.mass;
     let px = pt * phi.cos();
     let py = pt * phi.sin();
     let pz = pt * eta.sinh();
     let energy = (px * px + py * py + pz * pz + mass * mass).sqrt();
     (energy, px, py, pz)
+}
+
+fn constituent_from_selected(object_name: &str, item: &SelectedObject) -> Constituent {
+    Constituent {
+        object: object_name.to_string(),
+        index: item.source_index,
+        pt: NumericValue::F64(item.p4.pt),
+        eta: NumericValue::F64(item.p4.eta),
+        phi: NumericValue::F64(item.p4.phi),
+        mass: NumericValue::F64(item.p4.mass),
+        values: item.leading_values.clone(),
+    }
 }
 
 fn attr_f64(item: &SelectedObject, attr: &str) -> f64 {
@@ -1325,6 +1557,18 @@ fn attr_f64(item: &SelectedObject, attr: &str) -> f64 {
         .copied()
         .map(NumericValue::as_f64)
         .unwrap_or(0.0)
+}
+
+fn required_attr_f64(item: &SelectedObject, object: &str, attr: &str) -> Result<f64> {
+    item.leading_values
+        .get(attr)
+        .copied()
+        .map(NumericValue::as_f64)
+        .ok_or_else(|| {
+            InterpretError::InvalidExpression(format!(
+                "attribute `{attr}` was not materialized for `{object}`"
+            ))
+        })
 }
 
 fn mass_pt(energy: f64, px: f64, py: f64, pz: f64) -> (f64, f64) {
@@ -1336,8 +1580,28 @@ fn mass_pt(energy: f64, px: f64, py: f64, pz: f64) -> (f64, f64) {
     )
 }
 
+fn vector_eta(px: f64, py: f64, pz: f64) -> f64 {
+    let pt = px.hypot(py);
+    let momentum = pt.hypot(pz);
+    let denominator = momentum - pz;
+    if denominator <= 0.0 {
+        0.0
+    } else {
+        0.5 * ((momentum + pz) / denominator).ln()
+    }
+}
+
+fn vector_phi(px: f64, py: f64) -> f64 {
+    py.atan2(px)
+}
+
 fn delta_r(left_eta: f64, left_phi: f64, right_eta: f64, right_phi: f64) -> f64 {
     let deta = left_eta - right_eta;
+    let dphi = delta_phi(left_phi, right_phi);
+    (deta * deta + dphi * dphi).sqrt()
+}
+
+fn delta_phi(left_phi: f64, right_phi: f64) -> f64 {
     let mut dphi = left_phi - right_phi;
     while dphi > std::f64::consts::PI {
         dphi -= 2.0 * std::f64::consts::PI;
@@ -1345,7 +1609,57 @@ fn delta_r(left_eta: f64, left_phi: f64, right_eta: f64, right_phi: f64) -> f64 
     while dphi <= -std::f64::consts::PI {
         dphi += 2.0 * std::f64::consts::PI;
     }
-    (deta * deta + dphi * dphi).sqrt()
+    dphi.abs()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ConstituentGeometry {
+    min_delta_r: f64,
+    delta_eta: f64,
+    delta_phi: f64,
+    leading_pt: f64,
+    subleading_pt: f64,
+    leading_eta: f64,
+    subleading_eta: f64,
+    leading_phi: f64,
+    subleading_phi: f64,
+    leading_mass: f64,
+    subleading_mass: f64,
+}
+
+fn constituent_geometry(constituents: &[Constituent]) -> ConstituentGeometry {
+    let mut ordered = constituents.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| right.pt.as_f64().total_cmp(&left.pt.as_f64()));
+    let leading = ordered.first().copied();
+    let subleading = ordered.get(1).copied();
+    let leading_pt = leading.map(|item| item.pt.as_f64()).unwrap_or(0.0);
+    let subleading_pt = subleading.map(|item| item.pt.as_f64()).unwrap_or(0.0);
+    let leading_eta = leading.map(|item| item.eta.as_f64()).unwrap_or(0.0);
+    let subleading_eta = subleading.map(|item| item.eta.as_f64()).unwrap_or(0.0);
+    let leading_phi = leading.map(|item| item.phi.as_f64()).unwrap_or(0.0);
+    let subleading_phi = subleading.map(|item| item.phi.as_f64()).unwrap_or(0.0);
+    let leading_mass = leading.map(|item| item.mass.as_f64()).unwrap_or(0.0);
+    let subleading_mass = subleading.map(|item| item.mass.as_f64()).unwrap_or(0.0);
+
+    ConstituentGeometry {
+        min_delta_r: candidate_min_delta_r(constituents),
+        delta_eta: leading
+            .zip(subleading)
+            .map(|(left, right)| (left.eta.as_f64() - right.eta.as_f64()).abs())
+            .unwrap_or(0.0),
+        delta_phi: leading
+            .zip(subleading)
+            .map(|(left, right)| delta_phi(left.phi.as_f64(), right.phi.as_f64()))
+            .unwrap_or(0.0),
+        leading_pt,
+        subleading_pt,
+        leading_eta,
+        subleading_eta,
+        leading_phi,
+        subleading_phi,
+        leading_mass,
+        subleading_mass,
+    }
 }
 
 fn candidate_min_delta_r(constituents: &[Constituent]) -> f64 {
@@ -1375,6 +1689,11 @@ fn derived_object<'a>(
 
 fn leading_attrs_for_object(program: &KirProgram, object_name: &str) -> Vec<String> {
     let mut attrs = Vec::new();
+    for object in &program.objects {
+        for cut in &object.cuts {
+            collect_selected_attrs(&cut.lhs, object_name, &mut attrs);
+        }
+    }
     for output in &program.outputs {
         if let Expr::LeadingAttr { object, attr } = &output.expr {
             if object == object_name && !attrs.contains(attr) {
@@ -1386,10 +1705,12 @@ fn leading_attrs_for_object(program: &KirProgram, object_name: &str) -> Vec<Stri
         for requirement in &region.requirements {
             collect_leading_attrs(&requirement.lhs, object_name, &mut attrs);
             collect_selected_attrs(&requirement.lhs, object_name, &mut attrs);
+            collect_pair_constituent_attrs(program, &requirement.lhs, object_name, &mut attrs);
         }
     }
     for output in &program.outputs {
         collect_selected_attrs(&output.expr, object_name, &mut attrs);
+        collect_pair_constituent_attrs(program, &output.expr, object_name, &mut attrs);
     }
     for correction in &program.scale_factor_corrections {
         if correction.collection == object_name {
@@ -1411,7 +1732,7 @@ fn leading_attrs_for_object(program: &KirProgram, object_name: &str) -> Vec<Stri
     for derived in &program.derived_objects {
         match &derived.def.source {
             DerivedSource::Pair(pair) if pair.object == object_name => {
-                for attr in ["pt", "eta", "phi", "mass"] {
+                for attr in kinematic_attrs_for_object(program, object_name) {
                     push_attr(&mut attrs, attr);
                 }
                 for constraint in &pair.constraints {
@@ -1426,7 +1747,7 @@ fn leading_attrs_for_object(program: &KirProgram, object_name: &str) -> Vec<Stri
             DerivedSource::Candidate(candidate)
                 if candidate.items.iter().any(|item| item == object_name) =>
             {
-                for attr in ["pt", "eta", "phi", "mass"] {
+                for attr in kinematic_attrs_for_object(program, object_name) {
                     push_attr(&mut attrs, attr);
                 }
                 for filter in &candidate.filters {
@@ -1437,6 +1758,22 @@ fn leading_attrs_for_object(program: &KirProgram, object_name: &str) -> Vec<Stri
         }
     }
     attrs
+}
+
+fn kinematic_attrs_for_object<'a>(program: &'a KirProgram, object_name: &str) -> Vec<&'a str> {
+    program
+        .objects
+        .iter()
+        .find(|object| object.name == object_name)
+        .map(|object| {
+            object
+                .kinematics
+                .component_attrs()
+                .into_iter()
+                .map(|(_, attr)| attr)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn push_attr(attrs: &mut Vec<String>, attr: &str) {
@@ -1463,11 +1800,46 @@ fn collect_leading_attrs(expr: &Expr, object_name: &str, attrs: &mut Vec<String>
 fn collect_selected_attrs(expr: &Expr, object_name: &str, attrs: &mut Vec<String>) {
     match expr {
         Expr::Attr { object, attr } if object == object_name => push_attr(attrs, attr),
+        Expr::IndexNotIn { object, attr } if object == object_name => push_attr(attrs, attr),
+        Expr::JetVetoMapRun2024 { object } if object == object_name => {
+            for attr in crate::JET_VETO_MAP_RUN2024_ATTRS {
+                push_attr(attrs, attr);
+            }
+        }
         Expr::Binary { lhs, rhs, .. } => {
             collect_selected_attrs(lhs, object_name, attrs);
             collect_selected_attrs(rhs, object_name, attrs);
         }
         Expr::Abs(inner) | Expr::Sqrt(inner) => collect_selected_attrs(inner, object_name, attrs),
+        Expr::LegacyLeptonRpt { .. } => {}
+        Expr::MetType1Pt {
+            jets,
+            nominal_pt,
+            shifted_pt,
+            ..
+        }
+        | Expr::MetType1Phi {
+            jets,
+            nominal_pt,
+            shifted_pt,
+            ..
+        }
+        | Expr::LeadingType1Mt {
+            jets,
+            nominal_pt,
+            shifted_pt,
+            ..
+        } if jets == object_name => {
+            for attr in crate::MET_TYPE1_JET_ATTRS {
+                push_attr(attrs, attr);
+            }
+            push_attr(attrs, nominal_pt);
+            push_attr(attrs, shifted_pt);
+        }
+        Expr::LeadingType1Mt { object, .. } if object == object_name => {
+            push_attr(attrs, "pt");
+            push_attr(attrs, "phi");
+        }
         Expr::CountWhere { object, predicate }
         | Expr::All { object, predicate }
         | Expr::Any { object, predicate }
@@ -1480,13 +1852,41 @@ fn collect_selected_attrs(expr: &Expr, object_name: &str, attrs: &mut Vec<String
     }
 }
 
-fn collect_pair_filter_attrs(expr: &Expr, attrs: &mut Vec<String>) {
+fn collect_pair_constituent_attrs(
+    program: &KirProgram,
+    expr: &Expr,
+    object_name: &str,
+    attrs: &mut Vec<String>,
+) {
     match expr {
-        Expr::PairDeltaR => {
-            push_attr(attrs, "eta");
-            push_attr(attrs, "phi");
+        Expr::PairConstituentAttr { pair, attr, .. } => {
+            let Some(derived) = program
+                .derived_objects
+                .iter()
+                .find(|derived| derived.name == *pair)
+            else {
+                return;
+            };
+            if let DerivedSource::Pair(pair_def) = &derived.def.source {
+                if pair_def.object == object_name {
+                    push_attr(attrs, attr);
+                }
+            }
         }
-        Expr::PairLeadingPt | Expr::PairSubleadingPt => push_attr(attrs, "pt"),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_pair_constituent_attrs(program, lhs, object_name, attrs);
+            collect_pair_constituent_attrs(program, rhs, object_name, attrs);
+        }
+        Expr::Abs(inner) | Expr::Sqrt(inner) => {
+            collect_pair_constituent_attrs(program, inner, object_name, attrs);
+        }
+        _ => {}
+    }
+}
+
+fn collect_pair_filter_attrs(expr: &Expr, _attrs: &mut Vec<String>) {
+    match expr {
+        Expr::PairDeltaR | Expr::PairLeadingPt | Expr::PairSubleadingPt => {}
         _ => {}
     }
 }
@@ -1502,12 +1902,15 @@ fn collect_candidate_filter_attrs(expr: &Expr, attrs: &mut Vec<String>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_object_numeric_expr(
     program: &KirProgram,
+    event: &Event,
     current_object: &str,
     source: &str,
     expr: &Expr,
     item: &ObjectView<'_>,
+    selected: &SelectedObjects,
     systematic: &str,
     model_outputs: &ModelOutputs,
 ) -> Result<NumericValue> {
@@ -1515,6 +1918,7 @@ fn eval_object_numeric_expr(
         Expr::Attr { object, attr } if object == current_object => {
             read_object_attr(
                 program,
+                event,
                 current_object,
                 source,
                 item,
@@ -1527,14 +1931,50 @@ fn eval_object_numeric_expr(
             "object `{current_object}` cut references `{object}`; this slice only supports cuts on the object being selected"
         ))),
         Expr::Literal(value) => Ok(NumericValue::F64(*value)),
+        Expr::IndexNotIn { object, attr } => Ok(NumericValue::U64(u64::from(index_not_in(
+            selected,
+            object,
+            attr,
+            item.index(),
+        )?))),
+        Expr::JetIdTightRun2024 { object } if object == current_object => {
+            Ok(NumericValue::U64(u64::from(jet_id_tight_run2024(
+                program,
+                event,
+                current_object,
+                source,
+                item,
+                systematic,
+                model_outputs,
+            )?)))
+        }
+        Expr::JetIdTightRun2024 { object } => Err(InterpretError::Unsupported(format!(
+            "object `{current_object}` cut references jet ID for `{object}`"
+        ))),
+        Expr::JetVetoMapRun2024 { object } if object == current_object => {
+            Ok(NumericValue::F64(jet_veto_map_run2024(
+                program,
+                event,
+                current_object,
+                source,
+                item,
+                systematic,
+                model_outputs,
+            )?))
+        }
+        Expr::JetVetoMapRun2024 { object } => Err(InterpretError::Unsupported(format!(
+            "object `{current_object}` cut references jet veto map for `{object}`"
+        ))),
         Expr::Binary { op, lhs, rhs } => {
             let lhs =
                 eval_object_numeric_expr(
                     program,
+                    event,
                     current_object,
                     source,
                     lhs,
                     item,
+                    selected,
                     systematic,
                     model_outputs,
                 )?
@@ -1542,10 +1982,12 @@ fn eval_object_numeric_expr(
             let rhs =
                 eval_object_numeric_expr(
                     program,
+                    event,
                     current_object,
                     source,
                     rhs,
                     item,
+                    selected,
                     systematic,
                     model_outputs,
                 )?
@@ -1554,10 +1996,12 @@ fn eval_object_numeric_expr(
         }
         Expr::Abs(inner) => Ok(eval_object_numeric_expr(
             program,
+            event,
             current_object,
             source,
             inner,
             item,
+            selected,
             systematic,
             model_outputs,
         )?
@@ -1565,10 +2009,12 @@ fn eval_object_numeric_expr(
         Expr::Sqrt(inner) => Ok(NumericValue::F64(
             eval_object_numeric_expr(
                 program,
+                event,
                 current_object,
                 source,
                 inner,
                 item,
+                selected,
                 systematic,
                 model_outputs,
             )?
@@ -1581,8 +2027,182 @@ fn eval_object_numeric_expr(
     }
 }
 
+fn jet_id_tight_run2024(
+    program: &KirProgram,
+    event: &Event,
+    current_object: &str,
+    source: &str,
+    item: &ObjectView<'_>,
+    systematic: &str,
+    model_outputs: &ModelOutputs,
+) -> Result<bool> {
+    let eta = read_object_attr(
+        program,
+        event,
+        current_object,
+        source,
+        item,
+        "eta",
+        systematic,
+        model_outputs,
+    )?
+    .as_f64()
+    .abs();
+    let ch_hef = read_object_attr(
+        program,
+        event,
+        current_object,
+        source,
+        item,
+        "chHEF",
+        systematic,
+        model_outputs,
+    )?
+    .as_f64();
+    let ne_hef = read_object_attr(
+        program,
+        event,
+        current_object,
+        source,
+        item,
+        "neHEF",
+        systematic,
+        model_outputs,
+    )?
+    .as_f64();
+    let ne_em_ef = read_object_attr(
+        program,
+        event,
+        current_object,
+        source,
+        item,
+        "neEmEF",
+        systematic,
+        model_outputs,
+    )?
+    .as_f64();
+    let ch_mult = read_object_attr(
+        program,
+        event,
+        current_object,
+        source,
+        item,
+        "chMultiplicity",
+        systematic,
+        model_outputs,
+    )?
+    .as_f64();
+    let ne_mult = read_object_attr(
+        program,
+        event,
+        current_object,
+        source,
+        item,
+        "neMultiplicity",
+        systematic,
+        model_outputs,
+    )?
+    .as_f64();
+
+    Ok(if eta <= 2.6 {
+        ne_hef < 0.99 && ne_em_ef < 0.9 && ch_mult + ne_mult > 1.0 && ch_hef > 0.01 && ch_mult > 0.0
+    } else if eta <= 2.7 {
+        ne_hef < 0.90 && ne_em_ef < 0.99
+    } else if eta < 3.0 {
+        ne_hef < 0.99
+    } else {
+        ne_mult >= 2.0 && ne_em_ef < 0.4
+    })
+}
+
+fn jet_veto_map_run2024(
+    program: &KirProgram,
+    event: &Event,
+    current_object: &str,
+    source: &str,
+    item: &ObjectView<'_>,
+    systematic: &str,
+    model_outputs: &ModelOutputs,
+) -> Result<f64> {
+    let eta = read_object_attr(
+        program,
+        event,
+        current_object,
+        source,
+        item,
+        "eta",
+        systematic,
+        model_outputs,
+    )?
+    .as_f64()
+    .clamp(-5.18, 5.18);
+    let phi = read_object_attr(
+        program,
+        event,
+        current_object,
+        source,
+        item,
+        "phi",
+        systematic,
+        model_outputs,
+    )?
+    .as_f64()
+    .clamp(-std::f64::consts::PI, std::f64::consts::PI);
+    jet_veto_map_run2024_value(eta, phi)
+}
+
+fn jet_veto_map_run2024_value(eta: f64, phi: f64) -> Result<f64> {
+    static CORRECTION: OnceLock<std::result::Result<nano_corrections::Correction, String>> =
+        OnceLock::new();
+    let correction = CORRECTION
+        .get_or_init(|| {
+            let set = nano_corrections::CorrectionSet::from_path(crate::JET_VETO_MAP_RUN2024_FILE)
+                .map_err(|error| error.to_string())?;
+            set.correction(crate::JET_VETO_MAP_RUN2024_CORRECTION)
+                .cloned()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| {
+            InterpretError::Unsupported(format!(
+                "Run2024 jet veto map payload is unavailable: {error}"
+            ))
+        })?;
+    correction
+        .evaluate(&[
+            CorrectionValue::from(crate::JET_VETO_MAP_TYPE),
+            CorrectionValue::Real(eta),
+            CorrectionValue::Real(phi),
+        ])
+        .map_err(|error| {
+            InterpretError::Unsupported(format!("Run2024 jet veto map evaluation failed: {error}"))
+        })
+}
+
+fn index_not_in(
+    selected: &SelectedObjects,
+    object: &str,
+    attr: &str,
+    source_index: usize,
+) -> Result<bool> {
+    let objects = selected
+        .get(object)
+        .ok_or_else(|| InterpretError::MissingObject(object.to_string()))?;
+    let index = source_index as f64;
+    Ok(objects.iter().all(|selected_object| {
+        selected_object
+            .leading_values
+            .get(attr)
+            .copied()
+            .map(|value| (value.as_f64() - index).abs() > f64::EPSILON)
+            .unwrap_or(true)
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn read_object_attr(
     program: &KirProgram,
+    event: &Event,
     collection: &str,
     source: &str,
     item: &ObjectView<'_>,
@@ -1603,6 +2223,15 @@ fn read_object_attr(
                 ))
             });
     }
+
+    if let Some(correction) = program
+        .object_corrections
+        .iter()
+        .find(|correction| correction.collection == collection && correction.attr == attr)
+    {
+        return evaluate_object_correction(program, event, source, item, correction);
+    }
+
     let branch_type = program
         .read_branches
         .iter()
@@ -1621,7 +2250,7 @@ fn read_object_attr(
         BranchType::VecU64 => Ok(NumericValue::U64(item.get::<u64>(attr)?)),
         BranchType::VecF32 => {
             let value = item.get::<f32>(attr)?;
-            let factor = shape_factor(program, collection, source, item, attr, systematic)?;
+            let factor = shape_factor(program, event, collection, source, item, attr, systematic)?;
             Ok(NumericValue::F64(f64::from(
                 (f64::from(value) * factor) as f32,
             )))
@@ -1634,8 +2263,213 @@ fn read_object_attr(
     }
 }
 
+fn evaluate_object_correction(
+    program: &KirProgram,
+    event: &Event,
+    source: &str,
+    item: &ObjectView<'_>,
+    correction: &KirObjectCorrection,
+) -> Result<NumericValue> {
+    let cache_attr = format!("__nano_object_correction:{}", correction.name);
+    if let Ok(cached) = item.extra::<NumericValue>(&cache_attr) {
+        return Ok(*cached);
+    }
+
+    match &correction.payload {
+        KirObjectCorrectionPayload::JecNominal {
+            file,
+            correction: payload_name,
+            raw_factor_attr,
+            inputs,
+        } => {
+            let source_pt = f64::from(item.get::<f32>(&correction.source_attr)?);
+            let raw_factor = f64::from(item.get::<f32>(raw_factor_attr)?);
+            let raw_pt = source_pt * (1.0 - raw_factor);
+            let set = correction_set_from_path(file)?;
+            let payload = set.correction_ref(payload_name).map_err(|error| {
+                InterpretError::Correction(format!(
+                    "JEC nominal correction `{}` payload lookup failed: {error}",
+                    correction.name
+                ))
+            })?;
+            let mut values = Vec::with_capacity(payload.inputs().len());
+            for payload_input in payload.inputs() {
+                let input = inputs
+                    .iter()
+                    .find(|input| input.name == payload_input.name)
+                    .ok_or_else(|| {
+                        InterpretError::Correction(format!(
+                            "JEC nominal correction `{}` is missing input `{}`",
+                            correction.name, payload_input.name
+                        ))
+                    })?;
+                values.push(correction_input_value(
+                    program,
+                    event,
+                    &correction.collection,
+                    source,
+                    item,
+                    input,
+                    Some(("raw_pt", CorrectionValue::Real(raw_pt))),
+                )?);
+            }
+            let factor = payload.evaluate(&set, &values).map_err(|error| {
+                InterpretError::Correction(format!(
+                    "JEC nominal correction `{}` evaluation failed: {error}",
+                    correction.name
+                ))
+            })?;
+            let value = NumericValue::F64(f64::from((raw_pt * factor) as f32));
+            item.set(cache_attr, value);
+            Ok(value)
+        }
+        KirObjectCorrectionPayload::JerNominal {
+            scale_factor_file,
+            scale_factor_correction,
+            scale_factor_inputs,
+            resolution_file,
+            resolution_correction,
+            resolution_inputs,
+            gen_jet_index_attr,
+            gen_jet_pt_branch,
+        } => {
+            let source_pt = correction_input_real(
+                program,
+                event,
+                &correction.collection,
+                source,
+                item,
+                &correction.source_attr,
+            )?;
+            let scale_factor = evaluate_object_correction_payload(
+                program,
+                event,
+                &correction.collection,
+                source,
+                item,
+                scale_factor_file,
+                scale_factor_correction,
+                scale_factor_inputs,
+                &correction.name,
+                "JER scale-factor",
+            )?;
+            let pt_resolution = evaluate_object_correction_payload(
+                program,
+                event,
+                &correction.collection,
+                source,
+                item,
+                resolution_file,
+                resolution_correction,
+                resolution_inputs,
+                &correction.name,
+                "JER resolution",
+            )?;
+            let gen_jet_index_branch = format!("{source}_{gen_jet_index_attr}");
+            let gen_jet_index_type = branch_type(program, &gen_jet_index_branch)?;
+            let gen_jet_index = match object_correction_value(
+                item,
+                gen_jet_index_attr,
+                &gen_jet_index_branch,
+                gen_jet_index_type,
+            )? {
+                CorrectionValue::Int(value) => value,
+                other => {
+                    return Err(InterpretError::Correction(format!(
+                        "JER correction `{}` GenJet index input evaluated to {other:?}, expected int",
+                        correction.name
+                    )));
+                }
+            };
+            let gen_jet_pts = event.vector_ref::<f32>(gen_jet_pt_branch)?;
+            let matched = gen_jet_index >= 0
+                && gen_jet_pts
+                    .get(gen_jet_index as usize)
+                    .is_some_and(|gen_pt| {
+                        (source_pt - f64::from(*gen_pt)) / source_pt < 3.0 * pt_resolution
+                    });
+            let scale = if matched {
+                let gen_pt = f64::from(gen_jet_pts[gen_jet_index as usize]);
+                let pt_diff_rel = (source_pt - gen_pt) / source_pt;
+                (1.0 + (scale_factor - 1.0) * pt_diff_rel).max(0.0)
+            } else {
+                1.0
+            };
+            let value = NumericValue::F64(f64::from((source_pt * scale) as f32));
+            item.set(cache_attr, value);
+            Ok(value)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_object_correction_payload(
+    program: &KirProgram,
+    event: &Event,
+    collection: &str,
+    source: &str,
+    item: &ObjectView<'_>,
+    file: &str,
+    payload_name: &str,
+    inputs: &[crate::ScaleFactorInputDef],
+    correction_name: &str,
+    label: &str,
+) -> Result<f64> {
+    let set = correction_set_from_path(file)?;
+    let payload = set.correction_ref(payload_name).map_err(|error| {
+        InterpretError::Correction(format!(
+            "{label} correction `{correction_name}` payload lookup failed: {error}"
+        ))
+    })?;
+    let mut values = Vec::with_capacity(payload.inputs().len());
+    for payload_input in payload.inputs() {
+        let input = inputs
+            .iter()
+            .find(|input| input.name == payload_input.name)
+            .ok_or_else(|| {
+                InterpretError::Correction(format!(
+                    "{label} correction `{correction_name}` is missing input `{}`",
+                    payload_input.name
+                ))
+            })?;
+        values.push(correction_input_value(
+            program, event, collection, source, item, input, None,
+        )?);
+    }
+    payload.evaluate(&set, &values).map_err(|error| {
+        InterpretError::Correction(format!(
+            "{label} correction `{correction_name}` evaluation failed: {error}"
+        ))
+    })
+}
+
+fn correction_input_real(
+    program: &KirProgram,
+    event: &Event,
+    collection: &str,
+    source: &str,
+    item: &ObjectView<'_>,
+    attr: &str,
+) -> Result<f64> {
+    if let Some(correction) = program
+        .object_corrections
+        .iter()
+        .find(|correction| correction.collection == collection && correction.attr == attr)
+    {
+        return Ok(evaluate_object_correction(program, event, source, item, correction)?.as_f64());
+    }
+    let branch = format!("{source}_{attr}");
+    let branch_type = branch_type(program, &branch)?;
+    object_correction_value(item, attr, &branch, branch_type).map(|value| match value {
+        CorrectionValue::Real(value) => value,
+        CorrectionValue::Int(value) => value as f64,
+        CorrectionValue::Str(value) => value.parse::<f64>().unwrap_or(0.0),
+    })
+}
+
 fn shape_factor(
     program: &KirProgram,
+    event: &Event,
     collection: &str,
     source: &str,
     item: &ObjectView<'_>,
@@ -1646,12 +2480,15 @@ fn shape_factor(
         .shape_corrections
         .iter()
         .find(|correction| correction.collection == collection && correction.attr == attr)
-        .map(|correction| shape_correction_factor(program, source, item, correction, systematic))
+        .map(|correction| {
+            shape_correction_factor(program, event, source, item, correction, systematic)
+        })
         .unwrap_or(Ok(1.0))
 }
 
 fn shape_correction_factor(
     program: &KirProgram,
+    event: &Event,
     source: &str,
     item: &ObjectView<'_>,
     correction: &KirShapeCorrection,
@@ -1665,9 +2502,9 @@ fn shape_correction_factor(
         }),
         KirShapeCorrectionPayload::Jes { .. } => {
             if systematic == interpreted_variant_name(&correction.name, "Up") {
-                Ok(1.0 + evaluate_jes_uncertainty(program, source, item, correction)?)
+                Ok(1.0 + evaluate_jes_uncertainty(program, event, source, item, correction)?)
             } else if systematic == interpreted_variant_name(&correction.name, "Down") {
-                Ok(1.0 - evaluate_jes_uncertainty(program, source, item, correction)?)
+                Ok(1.0 - evaluate_jes_uncertainty(program, event, source, item, correction)?)
             } else {
                 Ok(1.0)
             }
@@ -1677,6 +2514,7 @@ fn shape_correction_factor(
 
 fn evaluate_jes_uncertainty(
     program: &KirProgram,
+    event: &Event,
     source: &str,
     item: &ObjectView<'_>,
     correction: &KirShapeCorrection,
@@ -1689,20 +2527,15 @@ fn evaluate_jes_uncertainty(
     else {
         return Ok(0.0);
     };
-    let set = nano_corrections::CorrectionSet::from_path(file).map_err(|error| {
-        InterpretError::Correction(format!(
-            "JES correction `{}` failed to load `{}`: {error}",
-            correction.name, file
-        ))
-    })?;
-    let payload = set.correction(payload_name).map_err(|error| {
+    let set = correction_set_from_path(file)?;
+    let payload = set.correction_ref(payload_name).map_err(|error| {
         InterpretError::Correction(format!(
             "JES correction `{}` payload lookup failed: {error}",
             correction.name
         ))
     })?;
-    let mut values = Vec::with_capacity(payload.inputs.len());
-    for payload_input in &payload.inputs {
+    let mut values = Vec::with_capacity(payload.inputs().len());
+    for payload_input in payload.inputs() {
         let input = inputs
             .iter()
             .find(|input| input.name == payload_input.name)
@@ -1712,9 +2545,17 @@ fn evaluate_jes_uncertainty(
                     correction.name, payload_input.name
                 ))
             })?;
-        values.push(jes_input_value(program, source, item, input)?);
+        values.push(correction_input_value(
+            program,
+            event,
+            &correction.collection,
+            source,
+            item,
+            input,
+            None,
+        )?);
     }
-    payload.evaluate(&values).map_err(|error| {
+    payload.evaluate(&set, &values).map_err(|error| {
         InterpretError::Correction(format!(
             "JES correction `{}` evaluation failed: {error}",
             correction.name
@@ -1722,20 +2563,49 @@ fn evaluate_jes_uncertainty(
     })
 }
 
-fn jes_input_value(
+fn correction_input_value(
     program: &KirProgram,
+    event: &Event,
+    collection: &str,
     source: &str,
     item: &ObjectView<'_>,
     input: &crate::ScaleFactorInputDef,
+    pseudo: Option<(&str, CorrectionValue)>,
 ) -> Result<CorrectionValue> {
-    let crate::ScaleFactorInputSource::From(attr) = &input.source else {
-        return Err(InterpretError::Correction(format!(
-            "JES correction input `{}` must use an object attribute",
-            input.name
-        )));
-    };
-    let branch = format!("{source}_{attr}");
-    let branch_type = branch_type(program, &branch)?;
+    match &input.source {
+        crate::ScaleFactorInputSource::Literal(value) => Ok(scale_factor_literal_value(value)),
+        crate::ScaleFactorInputSource::From(attr) => {
+            if let Some((name, value)) = pseudo {
+                if attr == name {
+                    return Ok(value);
+                }
+            }
+            if let Some(correction) = program
+                .object_corrections
+                .iter()
+                .find(|correction| correction.collection == collection && correction.attr == *attr)
+            {
+                return Ok(CorrectionValue::Real(
+                    evaluate_object_correction(program, event, source, item, correction)?.as_f64(),
+                ));
+            }
+            let branch = format!("{source}_{attr}");
+            if program.read_branches.iter().any(|spec| spec.name == branch) {
+                let branch_type = branch_type(program, &branch)?;
+                return object_correction_value(item, attr, &branch, branch_type);
+            }
+            let branch_type = branch_type(program, attr)?;
+            scalar_correction_value(event, attr, branch_type)
+        }
+    }
+}
+
+fn object_correction_value(
+    item: &ObjectView<'_>,
+    attr: &str,
+    branch: &str,
+    branch_type: BranchType,
+) -> Result<CorrectionValue> {
     match branch_type {
         BranchType::VecI8 => Ok(CorrectionValue::Int(i64::from(item.get::<i8>(attr)?))),
         BranchType::VecU8 => Ok(CorrectionValue::Int(i64::from(item.get::<u8>(attr)?))),
@@ -1748,12 +2618,12 @@ fn jes_input_value(
             .map(CorrectionValue::Int)
             .map_err(|error| {
                 InterpretError::NumericConversion(format!(
-                    "unsigned JES input `{attr}` cannot fit into i64: {error}"
+                    "unsigned correction input `{attr}` cannot fit into i64: {error}"
                 ))
             }),
         BranchType::VecF32 => Ok(CorrectionValue::Real(f64::from(item.get::<f32>(attr)?))),
         other => Err(InterpretError::TypeMismatch {
-            branch,
+            branch: branch.to_string(),
             branch_type: other,
             expected: "numeric vector branch",
         }),
@@ -1937,6 +2807,7 @@ fn scalar_correction_value(
 
 fn shape_factor_for_source(
     program: &KirProgram,
+    event: &Event,
     source: &str,
     attr: &str,
     item: &ObjectView<'_>,
@@ -1952,7 +2823,9 @@ fn shape_factor_for_source(
                     .iter()
                     .any(|object| object.name == correction.collection && object.source == source)
         })
-        .map(|correction| shape_correction_factor(program, source, item, correction, systematic))
+        .map(|correction| {
+            shape_correction_factor(program, event, source, item, correction, systematic)
+        })
         .try_fold(1.0, |product, factor| factor.map(|factor| product * factor))
 }
 
@@ -1965,7 +2838,13 @@ fn expr_has_missing_value(
         Expr::Attr { object, .. } if derived.contains_key(object) => {
             Ok(derived_object(derived, object)?.is_none())
         }
-        Expr::Attr { .. } | Expr::Literal(_) | Expr::Count(_) | Expr::SumAttr { .. } => Ok(false),
+        Expr::Attr { .. }
+        | Expr::Literal(_)
+        | Expr::Count(_)
+        | Expr::SumAttr { .. }
+        | Expr::IndexNotIn { .. }
+        | Expr::JetIdTightRun2024 { .. }
+        | Expr::JetVetoMapRun2024 { .. } => Ok(false),
         Expr::EventScalar(_) => Ok(false),
         Expr::Binary { lhs, rhs, .. } => Ok(expr_has_missing_value(lhs, selected, derived)?
             || expr_has_missing_value(rhs, selected, derived)?),
@@ -1977,6 +2856,32 @@ fn expr_has_missing_value(
         Expr::ClosestMass { left, right, .. } | Expr::OtherMass { left, right, .. } => {
             Ok(derived_object(derived, left)?.is_none()
                 || derived_object(derived, right)?.is_none())
+        }
+        Expr::ZepVv { system, dijet, .. } => {
+            Ok(derived_object(derived, system)?.is_none()
+                || derived_object(derived, dijet)?.is_none())
+        }
+        Expr::SystemMetEta { system, .. } | Expr::SystemMetPt { system, .. } => {
+            Ok(derived_object(derived, system)?.is_none())
+        }
+        Expr::SystemPairMetPt { system, pair, .. } => Ok(derived_object(derived, system)?
+            .is_none()
+            || derived_object(derived, pair)?.is_none()),
+        Expr::SystemPairPtBalance { system, pair, .. } => Ok(derived_object(derived, system)?
+            .is_none()
+            || derived_object(derived, pair)?.is_none()),
+        Expr::MetType1Pt { .. } | Expr::MetType1Phi { .. } | Expr::LeadingType1Mt { .. } => {
+            Ok(false)
+        }
+        Expr::SystemDeltaPhi { left, right } => {
+            Ok(derived_object(derived, left)?.is_none()
+                || derived_object(derived, right)?.is_none())
+        }
+        Expr::LegacyLeptonRpt { dijet, .. } => Ok(derived_object(derived, dijet)?.is_none()),
+        Expr::PairConstituentAttr { pair, .. } => Ok(derived_object(derived, pair)?.is_none()),
+        Expr::ZepMax { system, dijet } => {
+            Ok(derived_object(derived, system)?.is_none()
+                || derived_object(derived, dijet)?.is_none())
         }
         Expr::LeadingAttr { object, attr } => Ok(leading_value(selected, object, attr)?.is_none()),
         Expr::PairDeltaR
@@ -1992,6 +2897,7 @@ fn eval_output_expr(
     expr: &Expr,
     selected: &SelectedObjects,
     derived: &DerivedObjects,
+    event: &Event,
 ) -> Result<Option<Value>> {
     match expr {
         Expr::Count(object) => {
@@ -2006,8 +2912,9 @@ fn eval_output_expr(
             })?;
             Ok(Some(Value::U32(count)))
         }
-        Expr::EventScalar(_) => Err(InterpretError::Unsupported(
-            "event scalar outputs are not supported by the interpreter".to_string(),
+        Expr::EventScalar(branch) => Ok(Some(read_event_scalar_value(event, branch)?)),
+        Expr::Literal(_) | Expr::Binary { .. } | Expr::Abs(_) | Expr::Sqrt(_) => Ok(Some(
+            Value::F64(eval_numeric_expr(expr, selected, derived, None, Some(event))?.as_f64()),
         )),
         Expr::CountWhere { object, predicate } => {
             let count = count_where(selected, derived, object, predicate)?;
@@ -2021,11 +2928,7 @@ fn eval_output_expr(
             Ok(Some(match value {
                 NumericValue::F64(value) => Value::F64(value),
                 NumericValue::I64(value) => Value::I64(value),
-                NumericValue::U64(value) => Value::I64(i64::try_from(value).map_err(|error| {
-                    InterpretError::NumericConversion(format!(
-                        "leading({object}).{attr} cannot fit into i64: {error}"
-                    ))
-                })?),
+                NumericValue::U64(value) => Value::U64(value),
             }))
         }
         Expr::Attr { object, attr } => {
@@ -2035,7 +2938,19 @@ fn eval_output_expr(
             match attr.as_str() {
                 "mass" => Ok(Some(Value::F64(candidate.mass))),
                 "pt" => Ok(Some(Value::F64(candidate.pt))),
+                "eta" => Ok(Some(Value::F64(candidate.eta))),
+                "phi" => Ok(Some(Value::F64(candidate.phi))),
                 "min_delta_r" | "dR" | "dr" => Ok(Some(Value::F64(candidate.min_delta_r))),
+                "delta_eta" => Ok(Some(Value::F64(candidate.delta_eta))),
+                "delta_phi" => Ok(Some(Value::F64(candidate.delta_phi))),
+                "leading_pt" => Ok(Some(Value::F64(candidate.leading_pt))),
+                "subleading_pt" => Ok(Some(Value::F64(candidate.subleading_pt))),
+                "leading_eta" => Ok(Some(Value::F64(candidate.leading_eta))),
+                "subleading_eta" => Ok(Some(Value::F64(candidate.subleading_eta))),
+                "leading_phi" => Ok(Some(Value::F64(candidate.leading_phi))),
+                "subleading_phi" => Ok(Some(Value::F64(candidate.subleading_phi))),
+                "leading_mass" => Ok(Some(Value::F64(candidate.leading_mass))),
+                "subleading_mass" => Ok(Some(Value::F64(candidate.subleading_mass))),
                 other => Err(InterpretError::InvalidExpression(format!(
                     "derived object `{object}` has no interpreted attribute `{other}`"
                 ))),
@@ -2081,6 +2996,86 @@ fn eval_output_expr(
             target.value,
             false,
         )?))),
+        Expr::ZepVv {
+            system,
+            met_pt,
+            met_phi,
+            dijet,
+        } => Ok(Some(Value::F64(zep_vv(
+            event, derived, system, met_pt, met_phi, dijet,
+        )?))),
+        Expr::SystemMetEta {
+            system,
+            met_pt,
+            met_phi,
+        } => Ok(Some(Value::F64(system_met_eta(
+            event, derived, system, met_pt, met_phi,
+        )?))),
+        Expr::SystemMetPt {
+            system,
+            met_pt,
+            met_phi,
+        } => Ok(Some(Value::F64(system_met_pt(
+            event, derived, system, met_pt, met_phi,
+        )?))),
+        Expr::SystemPairMetPt {
+            system,
+            met_pt,
+            met_phi,
+            pair,
+        } => Ok(Some(Value::F64(system_pair_met_pt(
+            event, derived, system, met_pt, met_phi, pair,
+        )?))),
+        Expr::SystemPairPtBalance {
+            system,
+            met_pt,
+            met_phi,
+            pair,
+        } => Ok(Some(Value::F64(system_pair_pt_balance(
+            event, derived, system, met_pt, met_phi, pair,
+        )?))),
+        Expr::MetType1Pt {
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => Ok(Some(Value::F64(met_type1_pt(
+            event, selected, jets, met_pt, met_phi, nominal_pt, shifted_pt,
+        )?))),
+        Expr::MetType1Phi {
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => Ok(Some(Value::F64(met_type1_phi(
+            event, selected, jets, met_pt, met_phi, nominal_pt, shifted_pt,
+        )?))),
+        Expr::LeadingType1Mt {
+            object,
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => Ok(Some(Value::F64(leading_type1_mt(
+            event, selected, object, jets, met_pt, met_phi, nominal_pt, shifted_pt,
+        )?))),
+        Expr::SystemDeltaPhi { left, right } => {
+            Ok(Some(Value::F64(system_delta_phi(derived, left, right)?)))
+        }
+        Expr::LegacyLeptonRpt {
+            muons,
+            electrons,
+            dijet,
+        } => Ok(Some(Value::F64(legacy_lepton_rpt(
+            selected, derived, muons, electrons, dijet,
+        )?))),
+        Expr::PairConstituentAttr { pair, attr, rank } => Ok(Some(Value::F64(
+            pair_constituent_attr(derived, pair, attr, *rank)?,
+        ))),
+        Expr::ZepMax { system, dijet } => Ok(Some(Value::F64(zep_max(derived, system, dijet)?))),
         other => Err(InterpretError::Unsupported(format!(
             "output expression `{other}` is not supported by the interpreter"
         ))),
@@ -2092,11 +3087,17 @@ fn eval_numeric_expr(
     selected: &SelectedObjects,
     derived: &DerivedObjects,
     current: Option<(&str, &SelectedObject)>,
+    event: Option<&Event>,
 ) -> Result<NumericValue> {
     match expr {
-        Expr::EventScalar(_) => Err(InterpretError::InvalidExpression(
-            "event scalar branches are only supported as boolean requirements".to_string(),
-        )),
+        Expr::EventScalar(branch) => {
+            let event = event.ok_or_else(|| {
+                InterpretError::InvalidExpression(format!(
+                    "expression `{expr}` requires event scalar access"
+                ))
+            })?;
+            read_event_scalar_numeric(event, branch)
+        }
         Expr::Attr { object, attr } => {
             if let Some((current_object, selected_object)) = current {
                 if object != current_object {
@@ -2122,7 +3123,19 @@ fn eval_numeric_expr(
             match attr.as_str() {
                 "mass" => Ok(NumericValue::F64(candidate.mass)),
                 "pt" => Ok(NumericValue::F64(candidate.pt)),
+                "eta" => Ok(NumericValue::F64(candidate.eta)),
+                "phi" => Ok(NumericValue::F64(candidate.phi)),
                 "min_delta_r" | "dR" | "dr" => Ok(NumericValue::F64(candidate.min_delta_r)),
+                "delta_eta" => Ok(NumericValue::F64(candidate.delta_eta)),
+                "delta_phi" => Ok(NumericValue::F64(candidate.delta_phi)),
+                "leading_pt" => Ok(NumericValue::F64(candidate.leading_pt)),
+                "subleading_pt" => Ok(NumericValue::F64(candidate.subleading_pt)),
+                "leading_eta" => Ok(NumericValue::F64(candidate.leading_eta)),
+                "subleading_eta" => Ok(NumericValue::F64(candidate.subleading_eta)),
+                "leading_phi" => Ok(NumericValue::F64(candidate.leading_phi)),
+                "subleading_phi" => Ok(NumericValue::F64(candidate.subleading_phi)),
+                "leading_mass" => Ok(NumericValue::F64(candidate.leading_mass)),
+                "subleading_mass" => Ok(NumericValue::F64(candidate.subleading_mass)),
                 other => Err(InterpretError::InvalidExpression(format!(
                     "derived object `{object}` has no interpreted attribute `{other}`"
                 ))),
@@ -2130,13 +3143,13 @@ fn eval_numeric_expr(
         }
         Expr::Literal(value) => Ok(NumericValue::F64(*value)),
         Expr::Binary { op, lhs, rhs } => {
-            let lhs = eval_numeric_expr(lhs, selected, derived, current)?.as_f64();
-            let rhs = eval_numeric_expr(rhs, selected, derived, current)?.as_f64();
+            let lhs = eval_numeric_expr(lhs, selected, derived, current, event)?.as_f64();
+            let rhs = eval_numeric_expr(rhs, selected, derived, current, event)?.as_f64();
             Ok(NumericValue::F64(eval_arithmetic(*op, lhs, rhs)))
         }
-        Expr::Abs(inner) => Ok(eval_numeric_expr(inner, selected, derived, current)?.abs()),
+        Expr::Abs(inner) => Ok(eval_numeric_expr(inner, selected, derived, current, event)?.abs()),
         Expr::Sqrt(inner) => Ok(NumericValue::F64(
-            eval_numeric_expr(inner, selected, derived, current)?
+            eval_numeric_expr(inner, selected, derived, current, event)?
                 .as_f64()
                 .sqrt(),
         )),
@@ -2165,6 +3178,25 @@ fn eval_numeric_expr(
                 0
             },
         )),
+        Expr::IndexNotIn { object, attr } => {
+            let Some((_, current)) = current else {
+                return Err(InterpretError::InvalidExpression(format!(
+                    "expression `{expr}` requires a current selected object"
+                )));
+            };
+            Ok(NumericValue::U64(u64::from(index_not_in(
+                selected,
+                object,
+                attr,
+                current.source_index,
+            )?)))
+        }
+        Expr::JetIdTightRun2024 { .. } => Err(InterpretError::InvalidExpression(format!(
+            "expression `{expr}` requires a current object item"
+        ))),
+        Expr::JetVetoMapRun2024 { .. } => Err(InterpretError::InvalidExpression(format!(
+            "expression `{expr}` requires a current object item"
+        ))),
         Expr::EitherPairPt {
             left,
             right,
@@ -2199,6 +3231,142 @@ fn eval_numeric_expr(
             target.value,
             false,
         )?)),
+        Expr::ZepVv {
+            system,
+            met_pt,
+            met_phi,
+            dijet,
+        } => {
+            let event = event.ok_or_else(|| {
+                InterpretError::InvalidExpression(format!(
+                    "expression `{expr}` requires event scalar access"
+                ))
+            })?;
+            Ok(NumericValue::F64(zep_vv(
+                event, derived, system, met_pt, met_phi, dijet,
+            )?))
+        }
+        Expr::SystemMetEta {
+            system,
+            met_pt,
+            met_phi,
+        } => {
+            let event = event.ok_or_else(|| {
+                InterpretError::InvalidExpression(format!(
+                    "expression `{expr}` requires event scalar access"
+                ))
+            })?;
+            Ok(NumericValue::F64(system_met_eta(
+                event, derived, system, met_pt, met_phi,
+            )?))
+        }
+        Expr::SystemMetPt {
+            system,
+            met_pt,
+            met_phi,
+        } => {
+            let event = event.ok_or_else(|| {
+                InterpretError::InvalidExpression(format!(
+                    "expression `{expr}` requires event scalar access"
+                ))
+            })?;
+            Ok(NumericValue::F64(system_met_pt(
+                event, derived, system, met_pt, met_phi,
+            )?))
+        }
+        Expr::SystemPairMetPt {
+            system,
+            met_pt,
+            met_phi,
+            pair,
+        } => {
+            let event = event.ok_or_else(|| {
+                InterpretError::InvalidExpression(format!(
+                    "expression `{expr}` requires event scalar access"
+                ))
+            })?;
+            Ok(NumericValue::F64(system_pair_met_pt(
+                event, derived, system, met_pt, met_phi, pair,
+            )?))
+        }
+        Expr::SystemPairPtBalance {
+            system,
+            met_pt,
+            met_phi,
+            pair,
+        } => {
+            let event = event.ok_or_else(|| {
+                InterpretError::InvalidExpression(format!(
+                    "expression `{expr}` requires event scalar access"
+                ))
+            })?;
+            Ok(NumericValue::F64(system_pair_pt_balance(
+                event, derived, system, met_pt, met_phi, pair,
+            )?))
+        }
+        Expr::MetType1Pt {
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => {
+            let event = event.ok_or_else(|| {
+                InterpretError::InvalidExpression(format!(
+                    "expression `{expr}` requires event scalar access"
+                ))
+            })?;
+            Ok(NumericValue::F64(met_type1_pt(
+                event, selected, jets, met_pt, met_phi, nominal_pt, shifted_pt,
+            )?))
+        }
+        Expr::MetType1Phi {
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => {
+            let event = event.ok_or_else(|| {
+                InterpretError::InvalidExpression(format!(
+                    "expression `{expr}` requires event scalar access"
+                ))
+            })?;
+            Ok(NumericValue::F64(met_type1_phi(
+                event, selected, jets, met_pt, met_phi, nominal_pt, shifted_pt,
+            )?))
+        }
+        Expr::LeadingType1Mt {
+            object,
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => {
+            let event = event.ok_or_else(|| {
+                InterpretError::InvalidExpression(format!(
+                    "expression `{expr}` requires event scalar access"
+                ))
+            })?;
+            Ok(NumericValue::F64(leading_type1_mt(
+                event, selected, object, jets, met_pt, met_phi, nominal_pt, shifted_pt,
+            )?))
+        }
+        Expr::SystemDeltaPhi { left, right } => {
+            Ok(NumericValue::F64(system_delta_phi(derived, left, right)?))
+        }
+        Expr::LegacyLeptonRpt {
+            muons,
+            electrons,
+            dijet,
+        } => Ok(NumericValue::F64(legacy_lepton_rpt(
+            selected, derived, muons, electrons, dijet,
+        )?)),
+        Expr::PairConstituentAttr { pair, attr, rank } => Ok(NumericValue::F64(
+            pair_constituent_attr(derived, pair, attr, *rank)?,
+        )),
+        Expr::ZepMax { system, dijet } => Ok(NumericValue::F64(zep_max(derived, system, dijet)?)),
         Expr::LeadingAttr { object, attr } => {
             leading_value(selected, object, attr)?.ok_or_else(|| {
                 InterpretError::InvalidExpression(format!(
@@ -2239,7 +3407,7 @@ fn pair_pt(
         .ok_or_else(|| InterpretError::MissingObject(object.to_string()))?;
     let mut pts = objects
         .iter()
-        .map(|selected_object| attr_f64(selected_object, "pt"))
+        .map(|selected_object| selected_object.p4.pt)
         .collect::<Vec<_>>();
     pts.sort_by(|left, right| right.total_cmp(left));
     Ok(
@@ -2270,6 +3438,335 @@ fn ordered_mass(
         (true, true) | (false, false) => left_mass,
         (true, false) | (false, true) => right_mass,
     })
+}
+
+fn read_event_scalar_value(event: &Event, branch: &str) -> Result<Value> {
+    let branch_type = event
+        .schema()
+        .find(branch)
+        .map(|info| info.branch_type)
+        .ok_or_else(|| InterpretError::MissingBranch(branch.to_string()))?;
+    match branch_type {
+        BranchType::Bool => Ok(Value::Bool(event.scalar::<bool>(branch)?)),
+        BranchType::I8 => Ok(Value::I64(i64::from(event.scalar::<i8>(branch)?))),
+        BranchType::U8 => Ok(Value::I64(i64::from(event.scalar::<u8>(branch)?))),
+        BranchType::I16 => Ok(Value::I64(i64::from(event.scalar::<i16>(branch)?))),
+        BranchType::U16 => Ok(Value::I64(i64::from(event.scalar::<u16>(branch)?))),
+        BranchType::I32 => Ok(Value::I64(i64::from(event.scalar::<i32>(branch)?))),
+        BranchType::U32 => Ok(Value::U32(event.scalar::<u32>(branch)?)),
+        BranchType::I64 => Ok(Value::I64(event.scalar::<i64>(branch)?)),
+        BranchType::U64 => Ok(Value::U64(event.scalar::<u64>(branch)?)),
+        BranchType::F32 => Ok(Value::F64(f64::from(event.scalar::<f32>(branch)?))),
+        other => Err(InterpretError::TypeMismatch {
+            branch: branch.to_string(),
+            branch_type: other,
+            expected: "scalar bool or numeric",
+        }),
+    }
+}
+
+fn read_event_scalar_numeric(event: &Event, branch: &str) -> Result<NumericValue> {
+    let branch_type = event
+        .schema()
+        .find(branch)
+        .map(|info| info.branch_type)
+        .ok_or_else(|| InterpretError::MissingBranch(branch.to_string()))?;
+    match branch_type {
+        BranchType::I8 => Ok(NumericValue::I64(i64::from(event.scalar::<i8>(branch)?))),
+        BranchType::U8 => Ok(NumericValue::U64(u64::from(event.scalar::<u8>(branch)?))),
+        BranchType::I16 => Ok(NumericValue::I64(i64::from(event.scalar::<i16>(branch)?))),
+        BranchType::U16 => Ok(NumericValue::U64(u64::from(event.scalar::<u16>(branch)?))),
+        BranchType::I32 => Ok(NumericValue::I64(i64::from(event.scalar::<i32>(branch)?))),
+        BranchType::U32 => Ok(NumericValue::U64(u64::from(event.scalar::<u32>(branch)?))),
+        BranchType::I64 => Ok(NumericValue::I64(event.scalar::<i64>(branch)?)),
+        BranchType::U64 => Ok(NumericValue::U64(event.scalar::<u64>(branch)?)),
+        BranchType::F32 => Ok(NumericValue::F64(f64::from(event.scalar::<f32>(branch)?))),
+        other => Err(InterpretError::TypeMismatch {
+            branch: branch.to_string(),
+            branch_type: other,
+            expected: "numeric scalar",
+        }),
+    }
+}
+
+fn system_met_components(
+    event: &Event,
+    derived: &DerivedObjects,
+    system: &str,
+    met_pt: &str,
+    met_phi: &str,
+) -> Result<(f64, f64, f64)> {
+    let system = derived_object(derived, system)?.ok_or_else(|| {
+        InterpretError::InvalidExpression(format!("derived object `{system}` has no candidate"))
+    })?;
+    let met_pt = f64::from(event.scalar::<f32>(met_pt)?);
+    let met_phi = f64::from(event.scalar::<f32>(met_phi)?);
+    Ok((
+        system.px + met_pt * met_phi.cos(),
+        system.py + met_pt * met_phi.sin(),
+        system.pz,
+    ))
+}
+
+fn system_met_eta(
+    event: &Event,
+    derived: &DerivedObjects,
+    system: &str,
+    met_pt: &str,
+    met_phi: &str,
+) -> Result<f64> {
+    let (px, py, pz) = system_met_components(event, derived, system, met_pt, met_phi)?;
+    Ok(vector_eta(px, py, pz))
+}
+
+fn system_met_pt(
+    event: &Event,
+    derived: &DerivedObjects,
+    system: &str,
+    met_pt: &str,
+    met_phi: &str,
+) -> Result<f64> {
+    let (px, py, _) = system_met_components(event, derived, system, met_pt, met_phi)?;
+    Ok((px * px + py * py).sqrt())
+}
+
+fn system_pair_met_pt(
+    event: &Event,
+    derived: &DerivedObjects,
+    system: &str,
+    met_pt: &str,
+    met_phi: &str,
+    pair: &str,
+) -> Result<f64> {
+    let (px, py, _) = system_met_components(event, derived, system, met_pt, met_phi)?;
+    let pair = derived_object(derived, pair)?.ok_or_else(|| {
+        InterpretError::InvalidExpression(format!("derived object `{pair}` has no candidate"))
+    })?;
+    Ok(((px + pair.px).powi(2) + (py + pair.py).powi(2)).sqrt())
+}
+
+fn system_pair_pt_balance(
+    event: &Event,
+    derived: &DerivedObjects,
+    system: &str,
+    met_pt: &str,
+    met_phi: &str,
+    pair: &str,
+) -> Result<f64> {
+    let vv_pt = system_met_pt(event, derived, system, met_pt, met_phi)?;
+    let pair = derived_object(derived, pair)?.ok_or_else(|| {
+        InterpretError::InvalidExpression(format!("derived object `{pair}` has no candidate"))
+    })?;
+    Ok((vv_pt - pair.pt) / pair.pt)
+}
+
+fn met_type1_components(
+    event: &Event,
+    selected: &SelectedObjects,
+    jets: &str,
+    met_pt: &str,
+    met_phi: &str,
+    nominal_pt: &str,
+    shifted_pt: &str,
+) -> Result<(f64, f64)> {
+    let met_pt = f64::from(event.scalar::<f32>(met_pt)?);
+    let met_phi = f64::from(event.scalar::<f32>(met_phi)?);
+    let mut px = met_pt * met_phi.cos();
+    let mut py = met_pt * met_phi.sin();
+    let objects = selected
+        .get(jets)
+        .ok_or_else(|| InterpretError::MissingObject(jets.to_string()))?;
+
+    for jet in objects {
+        let ch_em_ef = required_attr_f64(jet, jets, "chEmEF")?;
+        let ne_em_ef = required_attr_f64(jet, jets, "neEmEF")?;
+        if ch_em_ef + ne_em_ef >= 0.9 {
+            continue;
+        }
+        let muon_subtr = required_attr_f64(jet, jets, "muonSubtrFactor")?;
+        let nominal = required_attr_f64(jet, jets, nominal_pt)? * (1.0 - muon_subtr);
+        if nominal < 15.0 {
+            continue;
+        }
+        let shifted = required_attr_f64(jet, jets, shifted_pt)? * (1.0 - muon_subtr);
+        let phi = required_attr_f64(jet, jets, "phi")?;
+        px += (nominal - shifted) * phi.cos();
+        py += (nominal - shifted) * phi.sin();
+    }
+    Ok((px, py))
+}
+
+fn met_type1_pt(
+    event: &Event,
+    selected: &SelectedObjects,
+    jets: &str,
+    met_pt: &str,
+    met_phi: &str,
+    nominal_pt: &str,
+    shifted_pt: &str,
+) -> Result<f64> {
+    let (px, py) = met_type1_components(
+        event, selected, jets, met_pt, met_phi, nominal_pt, shifted_pt,
+    )?;
+    Ok(px.hypot(py))
+}
+
+fn met_type1_phi(
+    event: &Event,
+    selected: &SelectedObjects,
+    jets: &str,
+    met_pt: &str,
+    met_phi: &str,
+    nominal_pt: &str,
+    shifted_pt: &str,
+) -> Result<f64> {
+    let (px, py) = met_type1_components(
+        event, selected, jets, met_pt, met_phi, nominal_pt, shifted_pt,
+    )?;
+    Ok(vector_phi(px, py))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn leading_type1_mt(
+    event: &Event,
+    selected: &SelectedObjects,
+    object: &str,
+    jets: &str,
+    met_pt: &str,
+    met_phi: &str,
+    nominal_pt: &str,
+    shifted_pt: &str,
+) -> Result<f64> {
+    let lepton = selected
+        .get(object)
+        .and_then(|objects| objects.first())
+        .ok_or_else(|| {
+            InterpretError::InvalidExpression(format!(
+                "`leading_type1_mt({object}, ...)` has no selected object"
+            ))
+        })?;
+    let lepton_pt = required_attr_f64(lepton, object, "pt")?;
+    let lepton_phi = required_attr_f64(lepton, object, "phi")?;
+    let (met_px, met_py) = met_type1_components(
+        event, selected, jets, met_pt, met_phi, nominal_pt, shifted_pt,
+    )?;
+    let corrected_met_pt = met_px.hypot(met_py);
+    let corrected_met_phi = vector_phi(met_px, met_py);
+    Ok((2.0
+        * lepton_pt
+        * corrected_met_pt
+        * (1.0 - delta_phi(lepton_phi, corrected_met_phi).cos()))
+    .sqrt())
+}
+
+fn system_delta_phi(derived: &DerivedObjects, left: &str, right: &str) -> Result<f64> {
+    let left = derived_object(derived, left)?.ok_or_else(|| {
+        InterpretError::InvalidExpression(format!("derived object `{left}` has no candidate"))
+    })?;
+    let right = derived_object(derived, right)?.ok_or_else(|| {
+        InterpretError::InvalidExpression(format!("derived object `{right}` has no candidate"))
+    })?;
+    Ok(delta_phi(left.phi, right.phi))
+}
+
+fn legacy_lepton_rpt(
+    selected: &SelectedObjects,
+    derived: &DerivedObjects,
+    muons: &str,
+    electrons: &str,
+    dijet: &str,
+) -> Result<f64> {
+    let dijet = derived_object(derived, dijet)?.ok_or_else(|| {
+        InterpretError::InvalidExpression(format!("derived object `{dijet}` has no candidate"))
+    })?;
+    let mut lepton_pts = Vec::new();
+    for object in [muons, electrons] {
+        let objects = selected
+            .get(object)
+            .ok_or_else(|| InterpretError::MissingObject(object.to_string()))?;
+        for item in objects {
+            lepton_pts.push(item.p4.pt);
+        }
+    }
+    if lepton_pts.len() < 2 {
+        return Ok(1.0);
+    }
+    Ok((lepton_pts[0] * lepton_pts[1]) / (dijet.leading_pt * dijet.subleading_pt))
+}
+
+fn pair_constituent_attr(
+    derived: &DerivedObjects,
+    pair: &str,
+    attr: &str,
+    rank: PairConstituentRank,
+) -> Result<f64> {
+    let pair_object = derived_object(derived, pair)?.ok_or_else(|| {
+        InterpretError::InvalidExpression(format!("derived object `{pair}` has no candidate"))
+    })?;
+    let mut constituents = pair_object.constituents.iter().collect::<Vec<_>>();
+    constituents.sort_by(|left, right| right.pt.as_f64().total_cmp(&left.pt.as_f64()));
+    let index = match rank {
+        PairConstituentRank::Leading => 0,
+        PairConstituentRank::Subleading => 1,
+    };
+    let rank_label = match rank {
+        PairConstituentRank::Leading => "leading",
+        PairConstituentRank::Subleading => "subleading",
+    };
+    let Some(constituent) = constituents.get(index) else {
+        return Err(InterpretError::InvalidExpression(format!(
+            "derived pair `{pair}` has no {rank_label} constituent"
+        )));
+    };
+    constituent
+        .values
+        .get(attr)
+        .copied()
+        .map(NumericValue::as_f64)
+        .ok_or_else(|| {
+            InterpretError::InvalidExpression(format!(
+                "attribute `{attr}` was not materialized for derived pair `{pair}`"
+            ))
+        })
+}
+
+fn zep_vv(
+    event: &Event,
+    derived: &DerivedObjects,
+    system: &str,
+    met_pt: &str,
+    met_phi: &str,
+    dijet: &str,
+) -> Result<f64> {
+    let dijet = derived_object(derived, dijet)?.ok_or_else(|| {
+        InterpretError::InvalidExpression(format!("derived object `{dijet}` has no candidate"))
+    })?;
+    if dijet.delta_eta <= 0.0 {
+        return Ok(f64::INFINITY);
+    }
+
+    let vv_eta = system_met_eta(event, derived, system, met_pt, met_phi)?;
+    let jet_midpoint = (dijet.leading_eta + dijet.subleading_eta) / 2.0;
+
+    Ok((vv_eta - jet_midpoint).abs() / dijet.delta_eta)
+}
+
+fn zep_max(derived: &DerivedObjects, system: &str, dijet: &str) -> Result<f64> {
+    let system = derived_object(derived, system)?.ok_or_else(|| {
+        InterpretError::InvalidExpression(format!("derived object `{system}` has no candidate"))
+    })?;
+    let dijet = derived_object(derived, dijet)?.ok_or_else(|| {
+        InterpretError::InvalidExpression(format!("derived object `{dijet}` has no candidate"))
+    })?;
+    if dijet.delta_eta <= 0.0 {
+        return Ok(f64::INFINITY);
+    }
+    let jet_midpoint = (dijet.leading_eta + dijet.subleading_eta) / 2.0;
+    Ok(system
+        .constituents
+        .iter()
+        .map(|constituent| (constituent.eta.as_f64() - jet_midpoint).abs() / dijet.delta_eta)
+        .fold(0.0_f64, f64::max))
 }
 
 fn leading_value(
@@ -2387,6 +3884,7 @@ fn eval_collection_predicate(
         selected,
         derived,
         Some((object, selected_object)),
+        None,
     )?;
     Ok(compare(lhs.as_f64(), predicate.op, predicate.rhs.value))
 }
@@ -2440,7 +3938,93 @@ mod tests {
     use crate::{validate, AnalysisSpec, Catalogue};
 
     const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
+    const NANOV15_CATALOGUE: &str = include_str!("../../../configs/branches/nanov15.yaml");
     const MUON_SPEC_TOML: &str = include_str!("../examples/muon.toml");
+    const JEC_NOMINAL_SPEC_TOML: &str = r#"
+[analysis]
+name = "jec_nominal_runtime"
+year = "Run2024"
+
+[[correction]]
+name = "jet_pt_jec"
+kind = "jec_nominal"
+file = "../nano-spec/tests/data/jec_nominal.json"
+correction = "synthetic_jec_nominal"
+collection = "good_jet"
+attr = "ptJec"
+source_attr = "pt"
+raw_factor_attr = "rawFactor"
+inputs = [
+  { name = "JetA", from = "area" },
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "raw_pt" },
+  { name = "Rho", from = "Rho_fixedGridRhoFastjetAll" },
+  { name = "JetPhi", from = "phi" },
+]
+
+[objects.good_jet]
+source = "Jet"
+kinematics = { pt = "ptJec" }
+cuts = ["ptJec > 90 GeV"]
+
+[[outputs]]
+name = "lead_jec_pt"
+expr = "leading(good_jet).ptJec"
+"#;
+    const JER_NOMINAL_SPEC_TOML: &str = r#"
+[analysis]
+name = "jer_nominal_runtime"
+year = "Run2024"
+
+[[correction]]
+name = "jet_pt_jec"
+kind = "jec_nominal"
+file = "../nano-spec/tests/data/jec_nominal.json"
+correction = "synthetic_jec_nominal"
+collection = "good_jet"
+attr = "ptJec"
+source_attr = "pt"
+raw_factor_attr = "rawFactor"
+inputs = [
+  { name = "JetA", from = "area" },
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "raw_pt" },
+  { name = "Rho", from = "Rho_fixedGridRhoFastjetAll" },
+  { name = "JetPhi", from = "phi" },
+]
+
+[[correction]]
+name = "jet_pt_def"
+kind = "jer_nominal"
+collection = "good_jet"
+attr = "ptDef"
+source_attr = "ptJec"
+scale_factor_file = "../nano-spec/tests/data/jer_nominal.json"
+scale_factor_correction = "synthetic_jer_scale_factor"
+scale_factor_inputs = [
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "ptJec" },
+  { name = "systematic", value = "nom" },
+]
+resolution_file = "../nano-spec/tests/data/jer_nominal.json"
+resolution_correction = "synthetic_jer_resolution"
+resolution_inputs = [
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "ptJec" },
+  { name = "Rho", from = "Rho_fixedGridRhoFastjetAll" },
+]
+gen_jet_index_attr = "genJetIdx"
+gen_jet_pt_branch = "GenJet_pt"
+
+[objects.good_jet]
+source = "Jet"
+kinematics = { pt = "ptDef" }
+cuts = ["ptDef > 90 GeV"]
+
+[[outputs]]
+name = "lead_def_pt"
+expr = "leading(good_jet).ptDef"
+"#;
 
     #[test]
     fn interpret_muon_plan_matches_handwritten_muon_producer() {
@@ -2461,6 +4045,42 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(interpreted, handwritten);
+    }
+
+    #[test]
+    fn interpret_jec_nominal_virtual_object_attribute() {
+        let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV15_CATALOGUE, "v15")
+            .expect("parse nanov15 catalogue");
+        let spec =
+            AnalysisSpec::from_toml_str(JEC_NOMINAL_SPEC_TOML).expect("parse JEC nominal spec");
+        let plan = validate(&spec, &catalogue).expect("validate JEC nominal spec");
+
+        let row = interpret(&plan, &jec_nominal_event())
+            .expect("interpret")
+            .expect("event selected");
+
+        assert_eq!(
+            row.values,
+            vec![("lead_jec_pt".to_string(), Value::F64(99.0))]
+        );
+    }
+
+    #[test]
+    fn interpret_jer_nominal_virtual_object_attribute() {
+        let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV15_CATALOGUE, "v15")
+            .expect("parse nanov15 catalogue");
+        let spec =
+            AnalysisSpec::from_toml_str(JER_NOMINAL_SPEC_TOML).expect("parse JER nominal spec");
+        let plan = validate(&spec, &catalogue).expect("validate JER nominal spec");
+
+        let row = interpret(&plan, &jer_nominal_event())
+            .expect("interpret")
+            .expect("event selected");
+
+        let Some(Value::F64(value)) = row.get("lead_def_pt") else {
+            panic!("missing lead_def_pt output: {:?}", row.values);
+        };
+        assert!((value - 100.8).abs() < 1.0e-5, "value={value}");
     }
 
     #[test]
@@ -2550,6 +4170,371 @@ range = [0.0, 100.0]
     }
 
     #[test]
+    fn interpret_pair_geometry_outputs_vbs_observables() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "vbs_pair_geometry"
+year = "Run2018"
+
+[objects.vbs_jet]
+source = "Jet"
+cuts = ["pt > 50 GeV", "abs(eta) < 4.7"]
+
+[derived.vbs_jj]
+kind = "pair"
+object = "vbs_jet"
+selection = "leading_pt"
+
+[regions.signal]
+require = ["vbs_jj.mass > 500 GeV", "vbs_jj.delta_eta > 2.5"]
+
+[[outputs]]
+name = "vbs_mjj"
+expr = "vbs_jj.mass"
+
+[[outputs]]
+name = "vbs_detajj"
+expr = "vbs_jj.delta_eta"
+
+[[outputs]]
+name = "vbs_dphijj"
+expr = "vbs_jj.delta_phi"
+
+[[outputs]]
+name = "vbs_phij1"
+expr = "vbs_jj.leading_phi"
+
+[[outputs]]
+name = "vbs_phij2"
+expr = "vbs_jj.subleading_phi"
+
+[[outputs]]
+name = "vbs_massj1"
+expr = "vbs_jj.leading_mass"
+
+[[outputs]]
+name = "vbs_massj2"
+expr = "vbs_jj.subleading_mass"
+"#,
+        )
+        .expect("parse VBS pair spec");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+        let plan = validate(&spec, &catalogue).expect("validate VBS pair spec");
+        let event = vbs_pair_event();
+        let row = interpret(&plan, &event)
+            .expect("interpret VBS pair event")
+            .expect("selected VBS pair event");
+
+        let Value::F64(mjj) = row.get("vbs_mjj").expect("vbs_mjj") else {
+            panic!("unexpected vbs_mjj value")
+        };
+        let Value::F64(detajj) = row.get("vbs_detajj").expect("vbs_detajj") else {
+            panic!("unexpected vbs_detajj value")
+        };
+        let Value::F64(dphijj) = row.get("vbs_dphijj").expect("vbs_dphijj") else {
+            panic!("unexpected vbs_dphijj value")
+        };
+        let Value::F64(phij1) = row.get("vbs_phij1").expect("vbs_phij1") else {
+            panic!("unexpected vbs_phij1 value")
+        };
+        let Value::F64(phij2) = row.get("vbs_phij2").expect("vbs_phij2") else {
+            panic!("unexpected vbs_phij2 value")
+        };
+        let Value::F64(massj1) = row.get("vbs_massj1").expect("vbs_massj1") else {
+            panic!("unexpected vbs_massj1 value")
+        };
+        let Value::F64(massj2) = row.get("vbs_massj2").expect("vbs_massj2") else {
+            panic!("unexpected vbs_massj2 value")
+        };
+
+        assert!(mjj > 500.0);
+        assert!((detajj - 6.0).abs() < 1.0e-6);
+        assert!((dphijj - 1.0).abs() < 1.0e-6);
+        assert!((phij1 - 0.5).abs() < 1.0e-6);
+        assert!((phij2 + 0.5).abs() < 1.0e-6);
+        assert!((massj1 - 20.0).abs() < 1.0e-6);
+        assert!((massj2 - 30.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn interpret_zep_vv_uses_met_and_vbs_pair_geometry() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "vbs_zepvv"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[objects.vbs_jet]
+source = "Jet"
+cuts = ["pt > 50 GeV", "abs(eta) < 4.7"]
+
+[derived.dilepton]
+kind = "pair"
+object = "good_muon"
+selection = "leading_pt"
+
+[derived.vbs_jj]
+kind = "pair"
+object = "vbs_jet"
+selection = "leading_pt"
+
+[regions.signal]
+require = [
+  "PuppiMET_pt > 30 GeV",
+  "zep_vv(dilepton, PuppiMET_pt, PuppiMET_phi, vbs_jj) < 1.0",
+]
+
+[[outputs]]
+name = "met_pt"
+expr = "PuppiMET_pt"
+
+[[outputs]]
+name = "vbs_zepvv"
+expr = "zep_vv(dilepton, PuppiMET_pt, PuppiMET_phi, vbs_jj)"
+
+[[outputs]]
+name = "vbs_ptvv"
+expr = "system_met_pt(dilepton, PuppiMET_pt, PuppiMET_phi)"
+
+[[outputs]]
+name = "vbs_ptjj"
+expr = "vbs_jj.pt"
+
+[[outputs]]
+name = "vbs_pttot"
+expr = "system_pair_met_pt(dilepton, PuppiMET_pt, PuppiMET_phi, vbs_jj)"
+
+[[outputs]]
+name = "vbs_ptbalance"
+expr = "system_pair_pt_balance(dilepton, PuppiMET_pt, PuppiMET_phi, vbs_jj)"
+
+[[outputs]]
+name = "vbs_dphijjll"
+expr = "system_delta_phi(vbs_jj, dilepton)"
+
+[[outputs]]
+name = "vv_eta"
+expr = "system_met_eta(dilepton, PuppiMET_pt, PuppiMET_phi)"
+
+[[outputs]]
+name = "vbs_detavvj1"
+expr = "abs(system_met_eta(dilepton, PuppiMET_pt, PuppiMET_phi) - vbs_jj.leading_eta)"
+
+[[outputs]]
+name = "vbs_detavvj2"
+expr = "abs(system_met_eta(dilepton, PuppiMET_pt, PuppiMET_phi) - vbs_jj.subleading_eta)"
+
+[[outputs]]
+name = "vbs_zepmax"
+expr = "zep_max(dilepton, vbs_jj)"
+"#,
+        )
+        .expect("parse VBS zep spec");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+        let plan = validate(&spec, &catalogue).expect("validate VBS zep spec");
+        let event = vbs_zep_event();
+        let row = interpret(&plan, &event)
+            .expect("interpret VBS zep event")
+            .expect("selected VBS zep event");
+
+        let Value::F64(zepvv) = row.get("vbs_zepvv").expect("vbs_zepvv") else {
+            panic!("unexpected vbs_zepvv value")
+        };
+        let Value::F64(met_pt) = row.get("met_pt").expect("met_pt") else {
+            panic!("unexpected met_pt value")
+        };
+        let Value::F64(ptvv) = row.get("vbs_ptvv").expect("vbs_ptvv") else {
+            panic!("unexpected vbs_ptvv value")
+        };
+        let Value::F64(ptjj) = row.get("vbs_ptjj").expect("vbs_ptjj") else {
+            panic!("unexpected vbs_ptjj value")
+        };
+        let Value::F64(pttot) = row.get("vbs_pttot").expect("vbs_pttot") else {
+            panic!("unexpected vbs_pttot value")
+        };
+        let Value::F64(ptbalance) = row.get("vbs_ptbalance").expect("vbs_ptbalance") else {
+            panic!("unexpected vbs_ptbalance value")
+        };
+        let Value::F64(dphijjll) = row.get("vbs_dphijjll").expect("vbs_dphijjll") else {
+            panic!("unexpected vbs_dphijjll value")
+        };
+        let Value::F64(vv_eta) = row.get("vv_eta").expect("vv_eta") else {
+            panic!("unexpected vv_eta value")
+        };
+        let Value::F64(detavvj1) = row.get("vbs_detavvj1").expect("vbs_detavvj1") else {
+            panic!("unexpected vbs_detavvj1 value")
+        };
+        let Value::F64(detavvj2) = row.get("vbs_detavvj2").expect("vbs_detavvj2") else {
+            panic!("unexpected vbs_detavvj2 value")
+        };
+        let Value::F64(zepmax) = row.get("vbs_zepmax").expect("vbs_zepmax") else {
+            panic!("unexpected vbs_zepmax value")
+        };
+        assert!(zepvv < 1.0);
+        assert!((met_pt - 40.0).abs() < 1.0e-6);
+        assert!(ptvv > 0.0);
+        let jj_px = f64::from(120.0_f32) * f64::from(0.5_f32).cos()
+            + f64::from(100.0_f32) * f64::from(-0.5_f32).cos();
+        let jj_py = f64::from(120.0_f32) * f64::from(0.5_f32).sin()
+            + f64::from(100.0_f32) * f64::from(-0.5_f32).sin();
+        let ll_px = f64::from(45.0_f32) * f64::from(0.2_f32).cos()
+            + f64::from(40.0_f32) * f64::from(-0.2_f32).cos();
+        let ll_py = f64::from(45.0_f32) * f64::from(0.2_f32).sin()
+            + f64::from(40.0_f32) * f64::from(-0.2_f32).sin();
+        let met_px = f64::from(40.0_f32) * f64::from(1.2_f32).cos();
+        let met_py = f64::from(40.0_f32) * f64::from(1.2_f32).sin();
+        assert!((pttot - (jj_px + ll_px + met_px).hypot(jj_py + ll_py + met_py)).abs() < 1.0e-6);
+        assert!((ptbalance - ((ptvv - ptjj) / ptjj)).abs() < 1.0e-6);
+        assert!((dphijjll - delta_phi(jj_py.atan2(jj_px), ll_py.atan2(ll_px))).abs() < 1.0e-6);
+        assert!((detavvj1 - (vv_eta - 3.0).abs()).abs() < 1.0e-6);
+        assert!((detavvj2 - (vv_eta + 3.0).abs()).abs() < 1.0e-6);
+        assert!((zepmax - (0.1_f64 / 6.0)).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn interpret_legacy_lepton_rpt_uses_muon_then_electron_order() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "legacy_rpt"
+year = "Run2018"
+
+[objects.fake_muon]
+source = "Muon"
+cuts = []
+
+[objects.fake_electron]
+source = "Electron"
+cuts = []
+
+[objects.vbs_jet]
+source = "Jet"
+cuts = ["pt > 40 GeV"]
+
+[derived.vbs_jj]
+kind = "pair"
+object = "vbs_jet"
+selection = "leading_pt"
+
+[regions.signal]
+require = ["count(fake_muon) == 1", "count(fake_electron) == 2"]
+
+[[outputs]]
+name = "vbs_rpt"
+expr = "legacy_lepton_rpt(fake_muon, fake_electron, vbs_jj)"
+"#,
+        )
+        .expect("parse legacy rpt spec");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+        let plan = validate(&spec, &catalogue).expect("validate legacy rpt spec");
+        let row = interpret(&plan, &legacy_rpt_event())
+            .expect("interpret legacy rpt event")
+            .expect("selected legacy rpt event");
+
+        let Value::F64(rpt) = row.get("vbs_rpt").expect("vbs_rpt") else {
+            panic!("unexpected vbs_rpt value")
+        };
+        assert!((rpt - (45.0 * 30.0 / (100.0 * 50.0))).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn interpret_pair_constituent_attr_reads_selected_source_attribute() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "pair_constituent_attr"
+year = "Run2024"
+
+[objects.vbs_jet]
+source = "Jet"
+cuts = ["pt > 40 GeV"]
+
+[derived.vbs_jj]
+kind = "pair"
+object = "vbs_jet"
+selection = "leading_pt"
+
+[regions.signal]
+require = ["count(vbs_jet) >= 2"]
+
+[[outputs]]
+name = "vbs_btagj1"
+expr = "pair_leading_attr(vbs_jj, btagUParTAK4B)"
+
+[[outputs]]
+name = "vbs_btagj2"
+expr = "pair_subleading_attr(vbs_jj, btagUParTAK4B)"
+"#,
+        )
+        .expect("parse pair constituent attr spec");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(NANOV15_CATALOGUE, "v15").expect("parse catalogue");
+        let plan = validate(&spec, &catalogue).expect("validate pair constituent attr spec");
+        let row = interpret(&plan, &pair_constituent_attr_event())
+            .expect("interpret pair constituent attr event")
+            .expect("selected pair constituent attr event");
+
+        let Value::F64(btagj1) = row.get("vbs_btagj1").expect("vbs_btagj1") else {
+            panic!("unexpected vbs_btagj1 value")
+        };
+        let Value::F64(btagj2) = row.get("vbs_btagj2").expect("vbs_btagj2") else {
+            panic!("unexpected vbs_btagj2 value")
+        };
+        assert!((btagj1 - 0.7).abs() < 1.0e-6);
+        assert!((btagj2 - 0.2).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn interpret_met_type1_applies_legacy_shift() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "met_type1"
+year = "Run2024"
+
+[objects.clean_jet]
+source = "Jet"
+cuts = ["pt > 10 GeV"]
+
+[regions.signal]
+require = ["count(clean_jet) >= 1"]
+
+[[outputs]]
+name = "met_pt_def"
+expr = "met_type1_pt(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, mass)"
+
+[[outputs]]
+name = "met_phi_def"
+expr = "met_type1_phi(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, mass)"
+"#,
+        )
+        .expect("parse Type-1 MET spec");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(NANOV15_CATALOGUE, "v15").expect("parse catalogue");
+        let plan = validate(&spec, &catalogue).expect("validate Type-1 MET spec");
+        let row = interpret(&plan, &met_type1_event())
+            .expect("interpret Type-1 MET event")
+            .expect("selected Type-1 MET event");
+
+        let Value::F64(met_pt) = row.get("met_pt_def").expect("met_pt_def") else {
+            panic!("unexpected met_pt_def value")
+        };
+        let Value::F64(met_phi) = row.get("met_phi_def").expect("met_phi_def") else {
+            panic!("unexpected met_phi_def value")
+        };
+        assert!((met_pt - 130.0).abs() < 1.0e-6);
+        assert!(met_phi.abs() < 1.0e-6);
+    }
+
+    #[test]
     fn interpret_rejects_non_mock_model_provider() {
         let spec = AnalysisSpec::from_toml_str(
             r#"
@@ -2626,6 +4611,217 @@ expr = "count(good_muon)"
                 ("Muon_mass", BranchColumn::VecF32(vec![vec![0.105, 0.105]])),
                 ("Muon_phi", BranchColumn::VecF32(vec![vec![0.3, -0.4]])),
                 ("Muon_pt", BranchColumn::VecF32(vec![vec![40.0, 35.0]])),
+            ],
+            0,
+        )
+        .expect("event")
+    }
+
+    fn jec_nominal_event() -> Event {
+        let schema = BranchSchema::new([
+            BranchSpec::new("nJet", BranchType::U32),
+            BranchSpec::new("Jet_area", BranchType::VecF32),
+            BranchSpec::new("Jet_eta", BranchType::VecF32),
+            BranchSpec::new("Jet_phi", BranchType::VecF32),
+            BranchSpec::new("Jet_pt", BranchType::VecF32),
+            BranchSpec::new("Jet_rawFactor", BranchType::VecF32),
+            BranchSpec::new("Rho_fixedGridRhoFastjetAll", BranchType::F32),
+        ])
+        .expect("schema");
+        Event::from_columns(
+            schema,
+            [
+                ("nJet", BranchColumn::U32(vec![1])),
+                ("Jet_area", BranchColumn::VecF32(vec![vec![0.5]])),
+                ("Jet_eta", BranchColumn::VecF32(vec![vec![0.2]])),
+                ("Jet_phi", BranchColumn::VecF32(vec![vec![1.0]])),
+                ("Jet_pt", BranchColumn::VecF32(vec![vec![100.0]])),
+                ("Jet_rawFactor", BranchColumn::VecF32(vec![vec![0.1]])),
+                ("Rho_fixedGridRhoFastjetAll", BranchColumn::F32(vec![20.0])),
+            ],
+            0,
+        )
+        .expect("event")
+    }
+
+    fn jer_nominal_event() -> Event {
+        let schema = BranchSchema::new([
+            BranchSpec::new("nJet", BranchType::U32),
+            BranchSpec::new("Jet_area", BranchType::VecF32),
+            BranchSpec::new("Jet_eta", BranchType::VecF32),
+            BranchSpec::new("Jet_genJetIdx", BranchType::VecI16),
+            BranchSpec::new("Jet_phi", BranchType::VecF32),
+            BranchSpec::new("Jet_pt", BranchType::VecF32),
+            BranchSpec::new("Jet_rawFactor", BranchType::VecF32),
+            BranchSpec::new("GenJet_pt", BranchType::VecF32),
+            BranchSpec::new("Rho_fixedGridRhoFastjetAll", BranchType::F32),
+        ])
+        .expect("schema");
+        Event::from_columns(
+            schema,
+            [
+                ("nJet", BranchColumn::U32(vec![1])),
+                ("Jet_area", BranchColumn::VecF32(vec![vec![0.5]])),
+                ("Jet_eta", BranchColumn::VecF32(vec![vec![0.2]])),
+                ("Jet_genJetIdx", BranchColumn::VecI16(vec![vec![0]])),
+                ("Jet_phi", BranchColumn::VecF32(vec![vec![1.0]])),
+                ("Jet_pt", BranchColumn::VecF32(vec![vec![100.0]])),
+                ("Jet_rawFactor", BranchColumn::VecF32(vec![vec![0.1]])),
+                ("GenJet_pt", BranchColumn::VecF32(vec![vec![90.0]])),
+                ("Rho_fixedGridRhoFastjetAll", BranchColumn::F32(vec![20.0])),
+            ],
+            0,
+        )
+        .expect("event")
+    }
+
+    fn vbs_pair_event() -> Event {
+        let schema = BranchSchema::new([
+            BranchSpec::new("nJet", BranchType::U32),
+            BranchSpec::new("Jet_pt", BranchType::VecF32),
+            BranchSpec::new("Jet_eta", BranchType::VecF32),
+            BranchSpec::new("Jet_phi", BranchType::VecF32),
+            BranchSpec::new("Jet_mass", BranchType::VecF32),
+        ])
+        .expect("schema");
+        Event::from_columns(
+            schema,
+            [
+                ("nJet", BranchColumn::U32(vec![2])),
+                ("Jet_pt", BranchColumn::VecF32(vec![vec![120.0, 100.0]])),
+                ("Jet_eta", BranchColumn::VecF32(vec![vec![3.0, -3.0]])),
+                ("Jet_phi", BranchColumn::VecF32(vec![vec![0.5, -0.5]])),
+                ("Jet_mass", BranchColumn::VecF32(vec![vec![20.0, 30.0]])),
+            ],
+            0,
+        )
+        .expect("event")
+    }
+
+    fn vbs_zep_event() -> Event {
+        let schema = BranchSchema::new([
+            BranchSpec::new("nMuon", BranchType::U32),
+            BranchSpec::new("Muon_pt", BranchType::VecF32),
+            BranchSpec::new("Muon_eta", BranchType::VecF32),
+            BranchSpec::new("Muon_phi", BranchType::VecF32),
+            BranchSpec::new("Muon_mass", BranchType::VecF32),
+            BranchSpec::new("nJet", BranchType::U32),
+            BranchSpec::new("Jet_pt", BranchType::VecF32),
+            BranchSpec::new("Jet_eta", BranchType::VecF32),
+            BranchSpec::new("Jet_phi", BranchType::VecF32),
+            BranchSpec::new("Jet_mass", BranchType::VecF32),
+            BranchSpec::new("PuppiMET_pt", BranchType::F32),
+            BranchSpec::new("PuppiMET_phi", BranchType::F32),
+        ])
+        .expect("schema");
+        Event::from_columns(
+            schema,
+            [
+                ("nMuon", BranchColumn::U32(vec![2])),
+                ("Muon_pt", BranchColumn::VecF32(vec![vec![45.0, 40.0]])),
+                ("Muon_eta", BranchColumn::VecF32(vec![vec![0.1, -0.1]])),
+                ("Muon_phi", BranchColumn::VecF32(vec![vec![0.2, -0.2]])),
+                ("Muon_mass", BranchColumn::VecF32(vec![vec![0.105, 0.105]])),
+                ("nJet", BranchColumn::U32(vec![2])),
+                ("Jet_pt", BranchColumn::VecF32(vec![vec![120.0, 100.0]])),
+                ("Jet_eta", BranchColumn::VecF32(vec![vec![3.0, -3.0]])),
+                ("Jet_phi", BranchColumn::VecF32(vec![vec![0.5, -0.5]])),
+                ("Jet_mass", BranchColumn::VecF32(vec![vec![20.0, 20.0]])),
+                ("PuppiMET_pt", BranchColumn::F32(vec![40.0])),
+                ("PuppiMET_phi", BranchColumn::F32(vec![1.2])),
+            ],
+            0,
+        )
+        .expect("event")
+    }
+
+    fn legacy_rpt_event() -> Event {
+        let schema = BranchSchema::new([
+            BranchSpec::new("nMuon", BranchType::U32),
+            BranchSpec::new("Muon_pt", BranchType::VecF32),
+            BranchSpec::new("nElectron", BranchType::U32),
+            BranchSpec::new("Electron_pt", BranchType::VecF32),
+            BranchSpec::new("nJet", BranchType::U32),
+            BranchSpec::new("Jet_pt", BranchType::VecF32),
+            BranchSpec::new("Jet_eta", BranchType::VecF32),
+            BranchSpec::new("Jet_phi", BranchType::VecF32),
+            BranchSpec::new("Jet_mass", BranchType::VecF32),
+        ])
+        .expect("schema");
+        Event::from_columns(
+            schema,
+            [
+                ("nMuon", BranchColumn::U32(vec![1])),
+                ("Muon_pt", BranchColumn::VecF32(vec![vec![45.0]])),
+                ("nElectron", BranchColumn::U32(vec![2])),
+                ("Electron_pt", BranchColumn::VecF32(vec![vec![30.0, 20.0]])),
+                ("nJet", BranchColumn::U32(vec![2])),
+                ("Jet_pt", BranchColumn::VecF32(vec![vec![100.0, 50.0]])),
+                ("Jet_eta", BranchColumn::VecF32(vec![vec![3.0, -3.0]])),
+                ("Jet_phi", BranchColumn::VecF32(vec![vec![0.5, -0.5]])),
+                ("Jet_mass", BranchColumn::VecF32(vec![vec![20.0, 20.0]])),
+            ],
+            0,
+        )
+        .expect("event")
+    }
+
+    fn pair_constituent_attr_event() -> Event {
+        let schema = BranchSchema::new([
+            BranchSpec::new("nJet", BranchType::U32),
+            BranchSpec::new("Jet_pt", BranchType::VecF32),
+            BranchSpec::new("Jet_eta", BranchType::VecF32),
+            BranchSpec::new("Jet_phi", BranchType::VecF32),
+            BranchSpec::new("Jet_mass", BranchType::VecF32),
+            BranchSpec::new("Jet_btagUParTAK4B", BranchType::VecF32),
+        ])
+        .expect("schema");
+        Event::from_columns(
+            schema,
+            [
+                ("nJet", BranchColumn::U32(vec![2])),
+                ("Jet_pt", BranchColumn::VecF32(vec![vec![100.0, 50.0]])),
+                ("Jet_eta", BranchColumn::VecF32(vec![vec![3.0, -3.0]])),
+                ("Jet_phi", BranchColumn::VecF32(vec![vec![0.5, -0.5]])),
+                ("Jet_mass", BranchColumn::VecF32(vec![vec![20.0, 20.0]])),
+                (
+                    "Jet_btagUParTAK4B",
+                    BranchColumn::VecF32(vec![vec![0.7, 0.2]]),
+                ),
+            ],
+            0,
+        )
+        .expect("event")
+    }
+
+    fn met_type1_event() -> Event {
+        let schema = BranchSchema::new([
+            BranchSpec::new("nJet", BranchType::U32),
+            BranchSpec::new("Jet_pt", BranchType::VecF32),
+            BranchSpec::new("Jet_mass", BranchType::VecF32),
+            BranchSpec::new("Jet_phi", BranchType::VecF32),
+            BranchSpec::new("Jet_muonSubtrFactor", BranchType::VecF32),
+            BranchSpec::new("Jet_chEmEF", BranchType::VecF32),
+            BranchSpec::new("Jet_neEmEF", BranchType::VecF32),
+            BranchSpec::new("PuppiMET_pt", BranchType::F32),
+            BranchSpec::new("PuppiMET_phi", BranchType::F32),
+        ])
+        .expect("schema");
+        Event::from_columns(
+            schema,
+            [
+                ("nJet", BranchColumn::U32(vec![2])),
+                ("Jet_pt", BranchColumn::VecF32(vec![vec![50.0, 60.0]])),
+                ("Jet_mass", BranchColumn::VecF32(vec![vec![20.0, 10.0]])),
+                ("Jet_phi", BranchColumn::VecF32(vec![vec![0.0, 1.0]])),
+                (
+                    "Jet_muonSubtrFactor",
+                    BranchColumn::VecF32(vec![vec![0.0, 0.0]]),
+                ),
+                ("Jet_chEmEF", BranchColumn::VecF32(vec![vec![0.1, 0.5]])),
+                ("Jet_neEmEF", BranchColumn::VecF32(vec![vec![0.1, 0.4]])),
+                ("PuppiMET_pt", BranchColumn::F32(vec![100.0])),
+                ("PuppiMET_phi", BranchColumn::F32(vec![0.0])),
             ],
             0,
         )

@@ -1,0 +1,52 @@
+[analysis]
+name = "wz_vbs_smoke"
+year = "Run2024"
+
+[objects.fake_muon]
+source = "Muon"
+cuts = [
+  "pt > 10 GeV",
+  "abs(eta) < 2.4",
+  "abs(dxy) < 0.05",
+  "abs(dz) < 0.10",
+  "pfIsoId >= 1",
+  "jetRelIso < 0.5",
+]
+
+[objects.fake_electron]
+source = "Electron"
+cuts = [
+  "pt > 10 GeV",
+  "abs(eta) < 2.5",
+  "abs(dxy) < 0.05",
+  "abs(dz) < 0.10",
+  "cutBased >= 2",
+  "jetRelIso < 0.5",
+]
+
+[objects.vbs_jet]
+source = "Jet"
+cuts = ["pt > 50 GeV", "abs(eta) < 4.7"]
+
+[objects.good_tau]
+source = "Tau"
+cuts = ["pt > 20 GeV", "abs(eta) < 2.5"]
+
+[regions.smoke]
+require = ["count(fake_muon) >= 0"]
+
+[[outputs]]
+name = "n_fake_muon"
+expr = "count(fake_muon)"
+
+[[outputs]]
+name = "n_fake_electron"
+expr = "count(fake_electron)"
+
+[[outputs]]
+name = "n_vbs_jet"
+expr = "count(vbs_jet)"
+
+[[outputs]]
+name = "n_good_tau"
+expr = "count(good_tau)"

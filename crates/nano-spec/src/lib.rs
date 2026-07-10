@@ -6,6 +6,7 @@
 
 use nano_core::{BranchSchema, BranchSpec, BranchType};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -33,9 +34,11 @@ pub struct AnalysisSpec {
     pub histograms: Vec<HistogramDef>,
     pub weight: WeightDef,
     pub systematics: Vec<SystematicDef>,
+    pub object_corrections: Vec<ObjectCorrectionDef>,
     pub shape_corrections: Vec<ShapeCorrectionDef>,
     pub scale_factor_corrections: Vec<ScaleFactorCorrectionDef>,
     pub channels: Vec<ChannelDef>,
+    pub validation: Option<ValidationDef>,
 }
 
 impl AnalysisSpec {
@@ -95,6 +98,16 @@ impl AnalysisSpec {
     /// The declared collection-attribute shape corrections.
     pub fn shape_corrections(&self) -> &[ShapeCorrectionDef] {
         &self.shape_corrections
+    }
+
+    /// The declared nominal virtual object attributes.
+    pub fn object_corrections(&self) -> &[ObjectCorrectionDef] {
+        &self.object_corrections
+    }
+
+    /// Whether selected objects expose nominal corrected virtual attributes.
+    pub fn has_object_correction(&self) -> bool {
+        !self.object_corrections.is_empty()
     }
 
     /// Whether any systematic variation changes selected object kinematics.
@@ -165,6 +178,9 @@ pub enum Year {
     Run2016,
     Run2017,
     Run2018,
+    Run2022,
+    Run2023,
+    Run2024,
     Other(String),
 }
 
@@ -174,6 +190,9 @@ impl Year {
             "Run2016" => Self::Run2016,
             "Run2017" => Self::Run2017,
             "Run2018" => Self::Run2018,
+            "Run2022" => Self::Run2022,
+            "Run2023" => Self::Run2023,
+            "Run2024" => Self::Run2024,
             other => Self::Other(other.to_string()),
         }
     }
@@ -184,7 +203,65 @@ impl Year {
 pub struct ObjectDef {
     pub name: String,
     pub source: String,
+    #[serde(default)]
+    pub kinematics: ObjectKinematics,
     pub cuts: Vec<Cut>,
+}
+
+/// Object-level four-vector attribute mapping.
+///
+/// By default, selected objects use the standard NanoAOD `pt`, `eta`, `phi`,
+/// and `mass` branches. Analyses that define corrected kinematics can point
+/// individual components at reviewed attributes such as `ptDef` while keeping
+/// branch reads and derived-object validation explicit in the spec.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ObjectKinematics {
+    #[serde(default = "default_pt_attr")]
+    pub pt: String,
+    #[serde(default = "default_eta_attr")]
+    pub eta: String,
+    #[serde(default = "default_phi_attr")]
+    pub phi: String,
+    #[serde(default = "default_mass_attr")]
+    pub mass: String,
+}
+
+impl Default for ObjectKinematics {
+    fn default() -> Self {
+        Self {
+            pt: default_pt_attr(),
+            eta: default_eta_attr(),
+            phi: default_phi_attr(),
+            mass: default_mass_attr(),
+        }
+    }
+}
+
+impl ObjectKinematics {
+    pub fn component_attrs(&self) -> [(&'static str, &str); 4] {
+        [
+            ("pt", self.pt.as_str()),
+            ("eta", self.eta.as_str()),
+            ("phi", self.phi.as_str()),
+            ("mass", self.mass.as_str()),
+        ]
+    }
+}
+
+fn default_pt_attr() -> String {
+    "pt".to_string()
+}
+
+fn default_eta_attr() -> String {
+    "eta".to_string()
+}
+
+fn default_phi_attr() -> String {
+    "phi".to_string()
+}
+
+fn default_mass_attr() -> String {
+    "mass".to_string()
 }
 
 /// Derived object definition, such as a selected dimuon pair built from muons.
@@ -291,6 +368,31 @@ pub enum ModelProviderKind {
     Remote,
     Managed,
     Other(String),
+}
+
+/// Optional validation policy carried by a physics-facing spec.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ValidationDef {
+    pub compare: Option<ValidationCompareDef>,
+}
+
+/// Golden-output comparison policy for `nano compare`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ValidationCompareDef {
+    pub tree: Option<String>,
+    pub rtol: Option<f64>,
+    pub atol: Option<f64>,
+    pub branch_tolerances: Vec<ValidationBranchToleranceDef>,
+}
+
+/// Branch-local tolerance override for known stochastic legacy outputs.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ValidationBranchToleranceDef {
+    pub branch: String,
+    pub rtol: f64,
+    pub atol: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// A value with an explicit or dimensionless unit.
@@ -407,6 +509,12 @@ pub enum ArithOp {
     Pow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PairConstituentRank {
+    Leading,
+    Subleading,
+}
+
 /// Expression nodes for the semantic selection IR.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Expr {
@@ -456,6 +564,84 @@ pub enum Expr {
         right: String,
         target: Quantity,
     },
+    ZepVv {
+        system: String,
+        met_pt: String,
+        met_phi: String,
+        dijet: String,
+    },
+    SystemMetEta {
+        system: String,
+        met_pt: String,
+        met_phi: String,
+    },
+    SystemMetPt {
+        system: String,
+        met_pt: String,
+        met_phi: String,
+    },
+    SystemPairMetPt {
+        system: String,
+        met_pt: String,
+        met_phi: String,
+        pair: String,
+    },
+    SystemPairPtBalance {
+        system: String,
+        met_pt: String,
+        met_phi: String,
+        pair: String,
+    },
+    MetType1Pt {
+        jets: String,
+        met_pt: String,
+        met_phi: String,
+        nominal_pt: String,
+        shifted_pt: String,
+    },
+    MetType1Phi {
+        jets: String,
+        met_pt: String,
+        met_phi: String,
+        nominal_pt: String,
+        shifted_pt: String,
+    },
+    LeadingType1Mt {
+        object: String,
+        jets: String,
+        met_pt: String,
+        met_phi: String,
+        nominal_pt: String,
+        shifted_pt: String,
+    },
+    SystemDeltaPhi {
+        left: String,
+        right: String,
+    },
+    LegacyLeptonRpt {
+        muons: String,
+        electrons: String,
+        dijet: String,
+    },
+    PairConstituentAttr {
+        pair: String,
+        attr: String,
+        rank: PairConstituentRank,
+    },
+    ZepMax {
+        system: String,
+        dijet: String,
+    },
+    IndexNotIn {
+        object: String,
+        attr: String,
+    },
+    JetIdTightRun2024 {
+        object: String,
+    },
+    JetVetoMapRun2024 {
+        object: String,
+    },
     LeadingAttr {
         object: String,
         attr: String,
@@ -499,6 +685,17 @@ pub struct RegionDef {
 pub struct OutputDef {
     pub name: String,
     pub expr: Expr,
+    pub dtype: Option<OutputDType>,
+}
+
+/// Requested output branch dtype for interpreted skim materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OutputDType {
+    F32,
+    F64,
+    I32,
+    U32,
+    U64,
 }
 
 /// Histogram terminal requested by the spec.
@@ -533,6 +730,102 @@ pub struct WeightSystematicDef {
     pub name: String,
     pub up: f64,
     pub down: f64,
+}
+
+/// A nominal virtual attribute on a selected collection.
+///
+/// Supported payloads cover legacy nominal jet pT stages. Specs may bind the
+/// JEC correctionlib pT input as `from = "raw_pt"` and may feed JER from a
+/// previous virtual attribute such as `ptJec`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ObjectCorrectionDef {
+    pub name: String,
+    pub collection: String,
+    pub attr: String,
+    pub source_attr: String,
+    pub payload: ObjectCorrectionPayload,
+}
+
+/// Source of a nominal virtual object attribute.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObjectCorrectionPayload {
+    JecNominal {
+        file: String,
+        correction: String,
+        raw_factor_attr: String,
+        inputs: Vec<ScaleFactorInputDef>,
+    },
+    JerNominal {
+        scale_factor_file: String,
+        scale_factor_correction: String,
+        scale_factor_inputs: Vec<ScaleFactorInputDef>,
+        resolution_file: String,
+        resolution_correction: String,
+        resolution_inputs: Vec<ScaleFactorInputDef>,
+        gen_jet_index_attr: String,
+        gen_jet_pt_branch: String,
+    },
+}
+
+impl ObjectCorrectionDef {
+    #[allow(clippy::too_many_arguments)]
+    pub fn jec_nominal(
+        name: String,
+        collection: String,
+        attr: String,
+        source_attr: String,
+        raw_factor_attr: String,
+        file: String,
+        correction: String,
+        inputs: Vec<ScaleFactorInputDef>,
+    ) -> Self {
+        Self {
+            name,
+            collection,
+            attr,
+            source_attr,
+            payload: ObjectCorrectionPayload::JecNominal {
+                file,
+                correction,
+                raw_factor_attr,
+                inputs,
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn jer_nominal(
+        name: String,
+        collection: String,
+        attr: String,
+        source_attr: String,
+        scale_factor_file: String,
+        scale_factor_correction: String,
+        scale_factor_inputs: Vec<ScaleFactorInputDef>,
+        resolution_file: String,
+        resolution_correction: String,
+        resolution_inputs: Vec<ScaleFactorInputDef>,
+        gen_jet_index_attr: String,
+        gen_jet_pt_branch: String,
+    ) -> Self {
+        Self {
+            name,
+            collection,
+            attr,
+            source_attr,
+            payload: ObjectCorrectionPayload::JerNominal {
+                scale_factor_file,
+                scale_factor_correction,
+                scale_factor_inputs,
+                resolution_file,
+                resolution_correction,
+                resolution_inputs,
+                gen_jet_index_attr,
+                gen_jet_pt_branch,
+            },
+        }
+    }
 }
 
 /// A two-sided shape correction that scales one selected collection attribute.
@@ -683,9 +976,11 @@ impl ChannelDef {
             histograms: parent.histograms.clone(),
             weight: parent.weight.clone(),
             systematics: parent.systematics.clone(),
+            object_corrections: parent.object_corrections.clone(),
             shape_corrections: parent.shape_corrections.clone(),
             scale_factor_corrections: parent.scale_factor_corrections.clone(),
             channels: Vec::new(),
+            validation: parent.validation.clone(),
         }
     }
 }
@@ -735,7 +1030,9 @@ pub fn load_analysis_spec(path: impl AsRef<Path>) -> Result<AnalysisSpec, ParseE
         path: path.to_path_buf(),
         source,
     })?;
-    parse_analysis_spec_with_format(&input, format)
+    let mut spec = parse_analysis_spec_with_format(&input, format)?;
+    resolve_relative_spec_file_paths(&mut spec, path);
+    Ok(spec)
 }
 
 /// Parse the physics-facing YAML spec into typed IR.
@@ -759,6 +1056,80 @@ pub fn parse_analysis_spec_with_format(
             ParseError::InvalidSpec(format!("failed to parse JSON spec: {error}"))
         }),
         SpecFormat::Adl => adl::parse_adl(input),
+    }
+}
+
+fn resolve_relative_spec_file_paths(spec: &mut AnalysisSpec, spec_path: &Path) {
+    let roots = spec_path_roots(spec_path);
+    if let Some(mask) = &mut spec.lumi_mask {
+        resolve_relative_file_string(&mut mask.file, &roots);
+    }
+    for model in &mut spec.models {
+        if let Some(path) = &mut model.provider.onnx_path {
+            resolve_relative_file_string(path, &roots);
+        }
+    }
+    for correction in &mut spec.object_corrections {
+        match &mut correction.payload {
+            ObjectCorrectionPayload::JecNominal { file, .. } => {
+                resolve_relative_file_string(file, &roots);
+            }
+            ObjectCorrectionPayload::JerNominal {
+                scale_factor_file,
+                resolution_file,
+                ..
+            } => {
+                resolve_relative_file_string(scale_factor_file, &roots);
+                resolve_relative_file_string(resolution_file, &roots);
+            }
+        }
+    }
+    for correction in &mut spec.shape_corrections {
+        if let ShapeCorrectionPayload::Jes { file, .. } = &mut correction.payload {
+            resolve_relative_file_string(file, &roots);
+        }
+    }
+    for correction in &mut spec.scale_factor_corrections {
+        resolve_relative_file_string(&mut correction.file, &roots);
+    }
+}
+
+fn spec_path_roots(spec_path: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(parent) = spec_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        push_unique_path(&mut roots, parent.to_path_buf());
+        for ancestor in parent.ancestors() {
+            if ancestor.join("Cargo.toml").is_file() {
+                push_unique_path(&mut roots, ancestor.to_path_buf());
+            }
+        }
+    }
+    if let Ok(current_dir) = env::current_dir() {
+        push_unique_path(&mut roots, current_dir);
+    }
+    roots
+}
+
+fn resolve_relative_file_string(path: &mut String, roots: &[PathBuf]) {
+    let current = Path::new(path);
+    if current.is_absolute() {
+        return;
+    }
+    if let Some(resolved) = roots
+        .iter()
+        .map(|root| root.join(current))
+        .find(|path| path.exists())
+    {
+        *path = resolved.to_string_lossy().into_owned();
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|current| current == &path) {
+        paths.push(path);
     }
 }
 
@@ -786,7 +1157,8 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
     let outputs = output_defs_from_raw(&raw.outputs)?;
     let histograms = histogram_defs_from_raw(&raw.histograms)?;
     let weight = raw.weight.map(weight_def_from_raw).unwrap_or_default();
-    let (shape_corrections, scale_factor_corrections) = correction_defs_from_raw(raw.corrections)?;
+    let (object_corrections, shape_corrections, scale_factor_corrections) =
+        correction_defs_from_raw(raw.corrections)?;
     let mut systematics = raw
         .systematics
         .iter()
@@ -819,6 +1191,7 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
         .into_iter()
         .map(channel_def_from_raw)
         .collect::<Result<Vec<_>, _>>()?;
+    let validation = raw.validation.map(validation_def_from_raw).transpose()?;
 
     Ok(AnalysisSpec {
         name: raw.analysis.name,
@@ -832,9 +1205,11 @@ fn analysis_spec_from_raw(raw: RawAnalysisSpec) -> Result<AnalysisSpec, ParseErr
         histograms,
         weight,
         systematics,
+        object_corrections,
         shape_corrections,
         scale_factor_corrections,
         channels,
+        validation,
     })
 }
 
@@ -892,6 +1267,11 @@ fn validate_flat(
         .iter()
         .map(|object| (object.name.as_str(), object.source.as_str()))
         .collect::<HashMap<_, _>>();
+    let object_defs = spec
+        .objects
+        .iter()
+        .map(|object| (object.name.as_str(), object))
+        .collect::<HashMap<_, _>>();
     let derived_objects = spec
         .derived_objects
         .iter()
@@ -908,7 +1288,9 @@ fn validate_flat(
         let mut ctx = ValidationContext {
             catalogue,
             object_sources: &object_sources,
+            object_defs: &object_defs,
             derived_objects: &derived_objects,
+            object_corrections: &spec.object_corrections,
             model_outputs: &model_outputs,
             required: &mut required,
             errors: &mut errors,
@@ -916,11 +1298,15 @@ fn validate_flat(
 
         for object in &spec.objects {
             ctx.required.require_counter(&object.source);
+            if object.kinematics != ObjectKinematics::default() {
+                validate_object_kinematics(object, &mut ctx);
+            }
             for (index, cut) in object.cuts.iter().enumerate() {
                 validate_cut(object, index, cut, &mut ctx);
             }
         }
 
+        validate_object_corrections(spec, &mut ctx);
         validate_shape_corrections(spec, &mut ctx);
         validate_scale_factor_corrections(spec, &mut ctx);
 
@@ -1206,15 +1592,40 @@ impl<'a> CoreLowerer<'a> {
         match expr {
             Expr::EventScalar(branch) => self.event_scalar_node(branch, context),
             Expr::Attr { object, attr } => self.attr_node(object, attr, context),
-            Expr::Literal(value) => {
-                self.registry_call("literal", &[], context)?;
-                Some(self.builder.add_expr(
-                    core::ExprKind::Literal(*value),
-                    core::Type::Quantity(Dimension::Dimensionless),
-                    BTreeSet::new(),
-                ))
-            }
+            Expr::Literal(value) => self.literal_node(*value, Dimension::Dimensionless, context),
             Expr::Binary { op, lhs, rhs } => {
+                if matches!(op, ArithOp::Add | ArithOp::Sub) {
+                    if let Expr::Literal(value) = **rhs {
+                        let lhs = self.lower_expr(lhs, context)?;
+                        let dimension = self
+                            .builder
+                            .expr(lhs)
+                            .ty
+                            .numeric_dimension()
+                            .unwrap_or(Dimension::Dimensionless);
+                        let rhs = self.literal_node(value, dimension, context)?;
+                        return self.call(
+                            core::primitive_name_for_arithmetic(*op),
+                            vec![lhs, rhs],
+                            context,
+                        );
+                    }
+                    if let Expr::Literal(value) = **lhs {
+                        let rhs = self.lower_expr(rhs, context)?;
+                        let dimension = self
+                            .builder
+                            .expr(rhs)
+                            .ty
+                            .numeric_dimension()
+                            .unwrap_or(Dimension::Dimensionless);
+                        let lhs = self.literal_node(value, dimension, context)?;
+                        return self.call(
+                            core::primitive_name_for_arithmetic(*op),
+                            vec![lhs, rhs],
+                            context,
+                        );
+                    }
+                }
                 let lhs = self.lower_expr(lhs, context)?;
                 let rhs = self.lower_expr(rhs, context)?;
                 self.call(
@@ -1291,6 +1702,179 @@ impl<'a> CoreLowerer<'a> {
                 let target = self.quantity_node(target);
                 self.call("other_mass", vec![left, right, target], context)
             }
+            Expr::ZepVv {
+                system,
+                met_pt,
+                met_phi,
+                dijet,
+            } => {
+                let system = self.candidate_ref(system, context)?;
+                let met_pt = self.numeric_event_scalar_node(met_pt);
+                let met_phi = self.numeric_event_scalar_node(met_phi);
+                let dijet = self.candidate_ref(dijet, context)?;
+                self.call("zep_vv", vec![system, met_pt, met_phi, dijet], context)
+            }
+            Expr::SystemMetEta {
+                system,
+                met_pt,
+                met_phi,
+            } => {
+                let system = self.candidate_ref(system, context)?;
+                let met_pt = self.numeric_event_scalar_node(met_pt);
+                let met_phi = self.numeric_event_scalar_node(met_phi);
+                self.call("system_met_eta", vec![system, met_pt, met_phi], context)
+            }
+            Expr::SystemMetPt {
+                system,
+                met_pt,
+                met_phi,
+            } => {
+                let system = self.candidate_ref(system, context)?;
+                let met_pt = self.numeric_event_scalar_node(met_pt);
+                let met_phi = self.numeric_event_scalar_node(met_phi);
+                self.call("system_met_pt", vec![system, met_pt, met_phi], context)
+            }
+            Expr::SystemPairMetPt {
+                system,
+                met_pt,
+                met_phi,
+                pair,
+            } => {
+                let system = self.candidate_ref(system, context)?;
+                let met_pt = self.numeric_event_scalar_node(met_pt);
+                let met_phi = self.numeric_event_scalar_node(met_phi);
+                let pair = self.candidate_ref(pair, context)?;
+                self.call(
+                    "system_pair_met_pt",
+                    vec![system, met_pt, met_phi, pair],
+                    context,
+                )
+            }
+            Expr::SystemPairPtBalance {
+                system,
+                met_pt,
+                met_phi,
+                pair,
+            } => {
+                let system = self.candidate_ref(system, context)?;
+                let met_pt = self.numeric_event_scalar_node(met_pt);
+                let met_phi = self.numeric_event_scalar_node(met_phi);
+                let pair = self.candidate_ref(pair, context)?;
+                self.call(
+                    "system_pair_pt_balance",
+                    vec![system, met_pt, met_phi, pair],
+                    context,
+                )
+            }
+            Expr::MetType1Pt {
+                jets,
+                met_pt,
+                met_phi,
+                nominal_pt,
+                shifted_pt,
+            } => {
+                let jets_ref = self.object_ref(jets, context)?;
+                let met_pt = self.numeric_event_scalar_node(met_pt);
+                let met_phi = self.numeric_event_scalar_node(met_phi);
+                let nominal_pt = self.attr_node(jets, nominal_pt, context)?;
+                let shifted_pt = self.attr_node(jets, shifted_pt, context)?;
+                self.call(
+                    "met_type1_pt",
+                    vec![jets_ref, met_pt, met_phi, nominal_pt, shifted_pt],
+                    context,
+                )
+            }
+            Expr::MetType1Phi {
+                jets,
+                met_pt,
+                met_phi,
+                nominal_pt,
+                shifted_pt,
+            } => {
+                let jets_ref = self.object_ref(jets, context)?;
+                let met_pt = self.numeric_event_scalar_node(met_pt);
+                let met_phi = self.numeric_event_scalar_node(met_phi);
+                let nominal_pt = self.attr_node(jets, nominal_pt, context)?;
+                let shifted_pt = self.attr_node(jets, shifted_pt, context)?;
+                self.call(
+                    "met_type1_phi",
+                    vec![jets_ref, met_pt, met_phi, nominal_pt, shifted_pt],
+                    context,
+                )
+            }
+            Expr::LeadingType1Mt {
+                object,
+                jets,
+                met_pt,
+                met_phi,
+                nominal_pt,
+                shifted_pt,
+            } => {
+                let object_ref = self.object_ref(object, context)?;
+                let jets_ref = self.object_ref(jets, context)?;
+                let met_pt = self.numeric_event_scalar_node(met_pt);
+                let met_phi = self.numeric_event_scalar_node(met_phi);
+                let nominal_pt = self.attr_node(jets, nominal_pt, context)?;
+                let shifted_pt = self.attr_node(jets, shifted_pt, context)?;
+                self.call(
+                    "leading_type1_mt",
+                    vec![
+                        object_ref, jets_ref, met_pt, met_phi, nominal_pt, shifted_pt,
+                    ],
+                    context,
+                )
+            }
+            Expr::SystemDeltaPhi { left, right } => {
+                let left = self.candidate_ref(left, context)?;
+                let right = self.candidate_ref(right, context)?;
+                self.call("system_delta_phi", vec![left, right], context)
+            }
+            Expr::LegacyLeptonRpt {
+                muons,
+                electrons,
+                dijet,
+            } => {
+                let muons = self.object_ref(muons, context)?;
+                let electrons = self.object_ref(electrons, context)?;
+                let dijet = self.candidate_ref(dijet, context)?;
+                self.call("legacy_lepton_rpt", vec![muons, electrons, dijet], context)
+            }
+            Expr::PairConstituentAttr { pair, attr, rank } => {
+                let pair_ref = self.candidate_ref(pair, context)?;
+                let source_object = self.pair_source_object(pair, context)?.to_string();
+                let attr_ref = self.attr_node(&source_object, attr, context)?;
+                let primitive = match rank {
+                    PairConstituentRank::Leading => "pair_leading_attr",
+                    PairConstituentRank::Subleading => "pair_subleading_attr",
+                };
+                self.call(primitive, vec![pair_ref, attr_ref], context)
+            }
+            Expr::ZepMax { system, dijet } => {
+                let system = self.candidate_ref(system, context)?;
+                let dijet = self.candidate_ref(dijet, context)?;
+                self.call("zep_max", vec![system, dijet], context)
+            }
+            Expr::IndexNotIn { object, attr } => {
+                let object_ref = self.object_ref(object, context)?;
+                let attr = self.attr_node(object, attr, context)?;
+                self.call("index_not_in", vec![object_ref, attr], context)
+            }
+            Expr::JetIdTightRun2024 { object } => {
+                let object_ref = self.object_ref(object, context)?;
+                let mut args = vec![object_ref];
+                for attr in JET_ID_TIGHT_RUN2024_ATTRS {
+                    args.push(self.attr_node(object, attr, context)?);
+                }
+                self.call("jet_id_tight_run2024", args, context)
+            }
+            Expr::JetVetoMapRun2024 { object } => {
+                let object_ref = self.object_ref(object, context)?;
+                let mut args = vec![object_ref];
+                for attr in JET_VETO_MAP_RUN2024_ATTRS {
+                    args.push(self.attr_node(object, attr, context)?);
+                }
+                self.call("jet_veto_map_run2024", args, context)
+            }
             Expr::LeadingAttr { object, attr } => {
                 let object_ref = self.object_ref(object, context)?;
                 let attr = self.attr_node(object, attr, context)?;
@@ -1303,6 +1887,20 @@ impl<'a> CoreLowerer<'a> {
             Expr::CandidateLeadingPt => self.filter_call("candidate_leading_pt", context),
             Expr::CandidateSubleadingPt => self.filter_call("candidate_subleading_pt", context),
         }
+    }
+
+    fn literal_node(
+        &mut self,
+        value: f64,
+        dimension: Dimension,
+        context: &str,
+    ) -> Option<core::ExprId> {
+        self.registry_call("literal", &[], context)?;
+        Some(self.builder.add_expr(
+            core::ExprKind::Literal(value),
+            core::Type::Quantity(dimension),
+            BTreeSet::new(),
+        ))
     }
 
     fn lower_cut_expr(&mut self, cut: &Cut, context: &str) -> Option<core::ExprId> {
@@ -1331,6 +1929,29 @@ impl<'a> CoreLowerer<'a> {
             BTreeSet::new(),
             context,
         )
+    }
+
+    fn pair_source_object(&mut self, pair_name: &str, context: &str) -> Option<&str> {
+        let Some(derived) = self
+            .spec
+            .derived_objects
+            .iter()
+            .find(|derived| derived.name == pair_name)
+        else {
+            self.errors.push(SpecError::UndefinedObject {
+                context: context.to_string(),
+                object: pair_name.to_string(),
+            });
+            return None;
+        };
+        let DerivedSource::Pair(pair) = &derived.source else {
+            self.errors.push(SpecError::InvalidExpression {
+                context: context.to_string(),
+                detail: format!("derived object `{pair_name}` is not a pair"),
+            });
+            return None;
+        };
+        Some(&pair.object)
     }
 
     fn lookup_object(&mut self, object: &str, context: &str) -> Option<core::ObjectId> {
@@ -1364,11 +1985,24 @@ impl<'a> CoreLowerer<'a> {
 
     fn attr_node(&mut self, object: &str, attr: &str, context: &str) -> Option<core::ExprId> {
         let object_id = self.lookup_object(object, context)?;
-        let branch = self
+        let source_branch = self
             .object_sources
             .get(object)
             .map(|source| format!("{source}_{attr}"));
-        let ty = if let Some(branch) = branch.as_deref() {
+        let virtual_dimension = self
+            .spec
+            .object_corrections
+            .iter()
+            .find(|correction| correction.collection == object && correction.attr == attr)
+            .map(|_| self.object_attr_dimension(object, attr, &mut BTreeSet::new()));
+        let branch = if virtual_dimension.is_some() {
+            None
+        } else {
+            source_branch.clone()
+        };
+        let ty = if let Some(dimension) = virtual_dimension {
+            core::Type::Quantity(dimension)
+        } else if let Some(branch) = source_branch.as_deref() {
             self.model_outputs
                 .by_branch
                 .get(branch)
@@ -1382,7 +2016,7 @@ impl<'a> CoreLowerer<'a> {
             .filter(|branch| !self.model_outputs.by_branch.contains_key(branch.as_str()))
             .map(|branch| BTreeSet::from([core::Effect::ReadsBranch(branch.clone())]))
             .unwrap_or_default();
-        let kind = if branch.is_some() {
+        let kind = if self.object_sources.contains_key(object) {
             core::ExprKind::Attr {
                 object: object_id,
                 attr: attr.to_string(),
@@ -1395,6 +2029,26 @@ impl<'a> CoreLowerer<'a> {
             }
         };
         Some(self.builder.add_expr(kind, ty, effects))
+    }
+
+    fn object_attr_dimension(
+        &self,
+        object: &str,
+        attr: &str,
+        seen: &mut BTreeSet<String>,
+    ) -> Dimension {
+        if !seen.insert(attr.to_string()) {
+            return attribute_dimension(attr);
+        }
+        if let Some(correction) = self
+            .spec
+            .object_corrections
+            .iter()
+            .find(|correction| correction.collection == object && correction.attr == attr)
+        {
+            return self.object_attr_dimension(object, &correction.source_attr, seen);
+        }
+        attribute_dimension(attr)
     }
 
     fn quantity_node(&mut self, quantity: &Quantity) -> core::ExprId {
@@ -1410,13 +2064,28 @@ impl<'a> CoreLowerer<'a> {
     }
 
     fn event_scalar_node(&mut self, branch: &str, _context: &str) -> Option<core::ExprId> {
+        let ty = if is_likely_bool_event_branch(branch) {
+            core::Type::Bool
+        } else {
+            core::Type::Quantity(event_scalar_dimension(branch))
+        };
         Some(self.builder.add_expr(
             core::ExprKind::EventScalar {
                 branch: branch.to_string(),
             },
-            core::Type::Bool,
+            ty,
             BTreeSet::from([core::Effect::ReadsBranch(branch.to_string())]),
         ))
+    }
+
+    fn numeric_event_scalar_node(&mut self, branch: &str) -> core::ExprId {
+        self.builder.add_expr(
+            core::ExprKind::EventScalar {
+                branch: branch.to_string(),
+            },
+            core::Type::Quantity(event_scalar_dimension(branch)),
+            BTreeSet::from([core::Effect::ReadsBranch(branch.to_string())]),
+        )
     }
 
     fn filter_call(&mut self, primitive: &'static str, context: &str) -> Option<core::ExprId> {
@@ -1494,7 +2163,9 @@ impl<'a> CoreLowerer<'a> {
 fn derived_attribute_dimension(attr: &str) -> Dimension {
     match attr {
         "mass" | "pt" => Dimension::Momentum,
-        "min_delta_r" | "dR" | "dr" => Dimension::Dimensionless,
+        "min_delta_r" | "dR" | "dr" | "eta" | "phi" | "delta_eta" | "delta_phi" | "leading_eta"
+        | "subleading_eta" | "leading_phi" | "subleading_phi" => Dimension::Dimensionless,
+        "leading_pt" | "subleading_pt" | "leading_mass" | "subleading_mass" => Dimension::Momentum,
         _ => attribute_dimension(attr),
     }
 }
@@ -1603,6 +2274,424 @@ fn validate_histogram(histogram: &HistogramDef, ctx: &mut ValidationContext<'_>)
     }
 }
 
+fn validate_object_corrections(spec: &AnalysisSpec, ctx: &mut ValidationContext<'_>) {
+    let mut seen = BTreeSet::new();
+    for correction in &spec.object_corrections {
+        let context = format!("object correction `{}`", correction.name);
+        if !seen.insert((correction.collection.as_str(), correction.attr.as_str())) {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.clone(),
+                detail: format!(
+                    "duplicate virtual attribute `{}.{}`",
+                    correction.collection, correction.attr
+                ),
+            });
+            continue;
+        }
+
+        let Some(source) = ctx.object_sources.get(correction.collection.as_str()) else {
+            ctx.errors.push(SpecError::UndefinedObject {
+                context,
+                object: correction.collection.clone(),
+            });
+            continue;
+        };
+        ctx.required.require_counter(source);
+
+        let virtual_branch = format!("{source}_{}", correction.attr);
+        if ctx.catalogue.branch(&virtual_branch).is_some() {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.clone(),
+                detail: format!(
+                    "virtual attribute `{}` collides with existing branch `{virtual_branch}`",
+                    correction.attr
+                ),
+            });
+            continue;
+        }
+        if ctx.model_outputs.by_branch.contains_key(&virtual_branch) {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.clone(),
+                detail: format!(
+                    "virtual attribute `{}` collides with model output `{virtual_branch}`",
+                    correction.attr
+                ),
+            });
+            continue;
+        }
+
+        match &correction.payload {
+            ObjectCorrectionPayload::JecNominal {
+                file,
+                correction: payload_name,
+                raw_factor_attr,
+                inputs,
+            } => validate_jec_nominal_object_correction(
+                correction,
+                source,
+                file,
+                payload_name,
+                raw_factor_attr,
+                inputs,
+                &context,
+                ctx,
+            ),
+            ObjectCorrectionPayload::JerNominal {
+                scale_factor_file,
+                scale_factor_correction,
+                scale_factor_inputs,
+                resolution_file,
+                resolution_correction,
+                resolution_inputs,
+                gen_jet_index_attr,
+                gen_jet_pt_branch,
+            } => validate_jer_nominal_object_correction(
+                correction,
+                source,
+                scale_factor_file,
+                scale_factor_correction,
+                scale_factor_inputs,
+                resolution_file,
+                resolution_correction,
+                resolution_inputs,
+                gen_jet_index_attr,
+                gen_jet_pt_branch,
+                &context,
+                ctx,
+            ),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_jec_nominal_object_correction(
+    correction: &ObjectCorrectionDef,
+    collection_source: &str,
+    file: &str,
+    payload_name: &str,
+    raw_factor_attr: &str,
+    inputs: &[ScaleFactorInputDef],
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    if correction.source_attr != "pt" {
+        ctx.errors.push(SpecError::InvalidExpression {
+            context: context.to_string(),
+            detail: format!(
+                "JEC nominal source_attr `{}` is unsupported; expected `pt`",
+                correction.source_attr
+            ),
+        });
+        return;
+    }
+    require_attr_branch_type(
+        collection_source,
+        &correction.source_attr,
+        BranchType::VecF32,
+        "f32 vector branch for JEC source pT",
+        context,
+        ctx,
+    );
+    require_attr_branch_type(
+        collection_source,
+        raw_factor_attr,
+        BranchType::VecF32,
+        "f32 vector branch for JEC raw-factor attribute",
+        context,
+        ctx,
+    );
+
+    let set = match nano_corrections::CorrectionSet::from_path(file) {
+        Ok(set) => set,
+        Err(error) => {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.to_string(),
+                detail: format!("failed to load correctionlib payload `{file}`: {error}"),
+            });
+            return;
+        }
+    };
+    let payload = match set.correction_ref(payload_name) {
+        Ok(payload) => payload,
+        Err(error) => {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.to_string(),
+                detail: error.to_string(),
+            });
+            return;
+        }
+    };
+    if payload.output().kind != nano_corrections::InputType::Real {
+        ctx.errors.push(SpecError::InvalidExpression {
+            context: context.to_string(),
+            detail: format!(
+                "JEC nominal correction `{}` output has correctionlib type {:?}, expected real",
+                correction.name,
+                payload.output().kind
+            ),
+        });
+    }
+    let declared = inputs
+        .iter()
+        .map(|input| input.name.as_str())
+        .collect::<Vec<_>>();
+    let expected = payload
+        .inputs()
+        .iter()
+        .map(|input| input.name.as_str())
+        .collect::<Vec<_>>();
+    if declared != expected {
+        ctx.errors.push(SpecError::InvalidExpression {
+            context: context.to_string(),
+            detail: format!(
+                "declared inputs [{}] do not match correctionlib inputs [{}]",
+                declared.join(", "),
+                expected.join(", ")
+            ),
+        });
+        return;
+    }
+    for input in inputs {
+        let Some(payload_input) = payload
+            .inputs()
+            .iter()
+            .find(|payload_input| payload_input.name == input.name)
+        else {
+            unreachable!("input names were checked above");
+        };
+        validate_object_correction_input_source(
+            context,
+            &correction.collection,
+            collection_source,
+            input,
+            payload_input.kind,
+            ctx,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_jer_nominal_object_correction(
+    correction: &ObjectCorrectionDef,
+    collection_source: &str,
+    scale_factor_file: &str,
+    scale_factor_payload_name: &str,
+    scale_factor_inputs: &[ScaleFactorInputDef],
+    resolution_file: &str,
+    resolution_payload_name: &str,
+    resolution_inputs: &[ScaleFactorInputDef],
+    gen_jet_index_attr: &str,
+    gen_jet_pt_branch: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    require_object_attr_type(
+        &correction.collection,
+        collection_source,
+        &correction.source_attr,
+        BranchType::VecF32,
+        "f32 vector branch or virtual attribute for JER source pT",
+        context,
+        ctx,
+    );
+    require_int_vector_attr_branch_type(
+        collection_source,
+        gen_jet_index_attr,
+        "integer vector branch for JER GenJet index",
+        context,
+        ctx,
+    );
+    require_event_branch_type(
+        gen_jet_pt_branch,
+        BranchType::VecF32,
+        "f32 vector branch for JER GenJet pT",
+        context,
+        ctx,
+    );
+
+    validate_nominal_object_correction_payload(
+        correction,
+        collection_source,
+        scale_factor_file,
+        scale_factor_payload_name,
+        scale_factor_inputs,
+        "JER scale-factor",
+        context,
+        ctx,
+    );
+    validate_nominal_object_correction_payload(
+        correction,
+        collection_source,
+        resolution_file,
+        resolution_payload_name,
+        resolution_inputs,
+        "JER resolution",
+        context,
+        ctx,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_nominal_object_correction_payload(
+    correction: &ObjectCorrectionDef,
+    collection_source: &str,
+    file: &str,
+    payload_name: &str,
+    inputs: &[ScaleFactorInputDef],
+    label: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    let set = match nano_corrections::CorrectionSet::from_path(file) {
+        Ok(set) => set,
+        Err(error) => {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.to_string(),
+                detail: format!("failed to load correctionlib payload `{file}`: {error}"),
+            });
+            return;
+        }
+    };
+    let payload = match set.correction_ref(payload_name) {
+        Ok(payload) => payload,
+        Err(error) => {
+            ctx.errors.push(SpecError::InvalidExpression {
+                context: context.to_string(),
+                detail: error.to_string(),
+            });
+            return;
+        }
+    };
+    if payload.output().kind != nano_corrections::InputType::Real {
+        ctx.errors.push(SpecError::InvalidExpression {
+            context: context.to_string(),
+            detail: format!(
+                "{label} correction `{}` output has correctionlib type {:?}, expected real",
+                correction.name,
+                payload.output().kind
+            ),
+        });
+    }
+    let declared = inputs
+        .iter()
+        .map(|input| input.name.as_str())
+        .collect::<Vec<_>>();
+    let expected = payload
+        .inputs()
+        .iter()
+        .map(|input| input.name.as_str())
+        .collect::<Vec<_>>();
+    if declared != expected {
+        ctx.errors.push(SpecError::InvalidExpression {
+            context: context.to_string(),
+            detail: format!(
+                "{label} declared inputs [{}] do not match correctionlib inputs [{}]",
+                declared.join(", "),
+                expected.join(", ")
+            ),
+        });
+        return;
+    }
+    for input in inputs {
+        let Some(payload_input) = payload
+            .inputs()
+            .iter()
+            .find(|payload_input| payload_input.name == input.name)
+        else {
+            unreachable!("input names were checked above");
+        };
+        validate_object_correction_input_source(
+            context,
+            &correction.collection,
+            collection_source,
+            input,
+            payload_input.kind,
+            ctx,
+        );
+    }
+}
+
+fn validate_object_correction_input_source(
+    context: &str,
+    collection_name: &str,
+    collection_source: &str,
+    input: &ScaleFactorInputDef,
+    input_type: nano_corrections::InputType,
+    ctx: &mut ValidationContext<'_>,
+) {
+    match &input.source {
+        ScaleFactorInputSource::Literal(value) => {
+            if !literal_matches_input_type(value, input_type) {
+                ctx.errors.push(SpecError::InvalidExpression {
+                    context: context.to_string(),
+                    detail: format!(
+                        "input `{}` literal has wrong type for correctionlib input {:?}",
+                        input.name, input_type
+                    ),
+                });
+            }
+        }
+        ScaleFactorInputSource::From(name) if name == "raw_pt" => {
+            if input_type != nano_corrections::InputType::Real {
+                ctx.errors.push(SpecError::InvalidExpression {
+                    context: context.to_string(),
+                    detail: format!(
+                        "input `{}` binds `raw_pt` but correctionlib type is {:?}, expected real",
+                        input.name, input_type
+                    ),
+                });
+            }
+        }
+        ScaleFactorInputSource::From(name) => {
+            if object_correction_for_attr(collection_name, name, ctx).is_some() {
+                if input_type != nano_corrections::InputType::Real {
+                    ctx.errors.push(SpecError::InvalidExpression {
+                        context: context.to_string(),
+                        detail: format!(
+                            "input `{}` binds virtual attribute `{name}` but correctionlib type is {:?}, expected real",
+                            input.name, input_type
+                        ),
+                    });
+                }
+                ctx.required.require_counter(collection_source);
+                return;
+            }
+
+            let attr_branch = format!("{collection_source}_{name}");
+            if let Some(entry) = ctx.catalogue.branch(&attr_branch) {
+                validate_scale_factor_branch_type(
+                    context,
+                    &attr_branch,
+                    entry.branch_type,
+                    &entry.raw_type,
+                    input_type,
+                    ctx,
+                );
+                ctx.required.require_counter(collection_source);
+                ctx.required.require_attr(collection_source, name);
+                return;
+            }
+
+            let Some(entry) = ctx.catalogue.branch(name) else {
+                ctx.errors.push(SpecError::MissingBranch {
+                    context: context.to_string(),
+                    branch: attr_branch,
+                });
+                return;
+            };
+            validate_scale_factor_branch_type(
+                context,
+                name,
+                entry.branch_type,
+                &entry.raw_type,
+                input_type,
+                ctx,
+            );
+            ctx.required.require_branch(name);
+        }
+    }
+}
+
 fn validate_shape_corrections(spec: &AnalysisSpec, ctx: &mut ValidationContext<'_>) {
     for correction in &spec.shape_corrections {
         let context = format!("correction `{}`", correction.name);
@@ -1669,7 +2758,7 @@ fn validate_jes_shape_correction(
             return;
         }
     };
-    let payload = match set.correction(payload_name) {
+    let payload = match set.correction_ref(payload_name) {
         Ok(payload) => payload,
         Err(error) => {
             ctx.errors.push(SpecError::InvalidExpression {
@@ -1679,12 +2768,13 @@ fn validate_jes_shape_correction(
             return;
         }
     };
-    if payload.output.kind != nano_corrections::InputType::Real {
+    if payload.output().kind != nano_corrections::InputType::Real {
         ctx.errors.push(SpecError::InvalidExpression {
             context: context.to_string(),
             detail: format!(
                 "JES correction `{}` output has correctionlib type {:?}, expected real",
-                correction.name, payload.output.kind
+                correction.name,
+                payload.output().kind
             ),
         });
     }
@@ -1693,7 +2783,7 @@ fn validate_jes_shape_correction(
         .map(|input| input.name.as_str())
         .collect::<Vec<_>>();
     let expected = payload
-        .inputs
+        .inputs()
         .iter()
         .map(|input| input.name.as_str())
         .collect::<Vec<_>>();
@@ -1710,7 +2800,7 @@ fn validate_jes_shape_correction(
     }
     for input in inputs {
         let Some(payload_input) = payload
-            .inputs
+            .inputs()
             .iter()
             .find(|payload_input| payload_input.name == input.name)
         else {
@@ -1944,10 +3034,32 @@ fn literal_matches_input_type(
 struct ValidationContext<'a> {
     catalogue: &'a Catalogue,
     object_sources: &'a HashMap<&'a str, &'a str>,
+    object_defs: &'a HashMap<&'a str, &'a ObjectDef>,
     derived_objects: &'a HashMap<&'a str, &'a DerivedObjectDef>,
+    object_corrections: &'a [ObjectCorrectionDef],
     model_outputs: &'a ModelOutputs,
     required: &'a mut RequiredBranches,
     errors: &'a mut Vec<SpecError>,
+}
+
+fn validate_object_kinematics(object: &ObjectDef, ctx: &mut ValidationContext<'_>) {
+    let context = format!("object `{}` kinematics", object.name);
+    for (component, attr) in object.kinematics.component_attrs() {
+        let expected = match component {
+            "pt" | "mass" => "f32 vector branch for four-vector momentum component",
+            "eta" | "phi" => "f32 vector branch for four-vector angular component",
+            _ => "f32 vector branch for four-vector component",
+        };
+        require_object_attr_type(
+            &object.name,
+            &object.source,
+            attr,
+            BranchType::VecF32,
+            expected,
+            &context,
+            ctx,
+        );
+    }
 }
 
 fn validate_cut(object: &ObjectDef, index: usize, cut: &Cut, ctx: &mut ValidationContext<'_>) {
@@ -2029,7 +3141,7 @@ fn validate_derived_object(derived: &DerivedObjectDef, ctx: &mut ValidationConte
     let context = format!("derived object `{}`", derived.name);
     match &derived.source {
         DerivedSource::Pair(pair) => {
-            let Some(source) = ctx.object_sources.get(pair.object.as_str()) else {
+            let Some(object) = ctx.object_defs.get(pair.object.as_str()) else {
                 ctx.errors.push(SpecError::UndefinedObject {
                     context,
                     object: pair.object.clone(),
@@ -2037,13 +3149,13 @@ fn validate_derived_object(derived: &DerivedObjectDef, ctx: &mut ValidationConte
                 return;
             };
 
-            ctx.required.require_counter(source);
-            require_four_vector(source, &context, ctx);
+            ctx.required.require_counter(&object.source);
+            require_four_vector_for_object(&pair.object, &context, ctx);
             for constraint in &pair.constraints {
                 match constraint {
                     PairConstraint::OppositeCharge => {
                         require_attr_branch_type(
-                            source,
+                            &object.source,
                             "charge",
                             BranchType::VecI32,
                             "i32 vector branch for opposite-charge pairing",
@@ -2149,33 +3261,30 @@ fn validate_pair_filter(
         return;
     };
     validate_quantity_unit(&context, &filter.lhs, dimension, &filter.rhs, ctx.errors);
-    let Some(source) = ctx.object_sources.get(pair.object.as_str()) else {
+    let Some(_object) = ctx.object_defs.get(pair.object.as_str()) else {
         return;
     };
     match filter.lhs {
         Expr::PairDeltaR => {
-            require_attr_branch_type(
-                source,
+            require_kinematic_component_for_object(
+                &pair.object,
                 "eta",
-                BranchType::VecF32,
                 "f32 vector branch for pair delta-R",
                 &context,
                 ctx,
             );
-            require_attr_branch_type(
-                source,
+            require_kinematic_component_for_object(
+                &pair.object,
                 "phi",
-                BranchType::VecF32,
                 "f32 vector branch for pair delta-R",
                 &context,
                 ctx,
             );
         }
         Expr::PairLeadingPt | Expr::PairSubleadingPt => {
-            require_attr_branch_type(
-                source,
+            require_kinematic_component_for_object(
+                &pair.object,
                 "pt",
-                BranchType::VecF32,
                 "f32 vector branch for pair pT filter",
                 &context,
                 ctx,
@@ -2201,9 +3310,9 @@ fn validate_candidate_filter(
 }
 
 fn validate_candidate_item(item: &str, context: &str, ctx: &mut ValidationContext<'_>) {
-    if let Some(source) = ctx.object_sources.get(item) {
-        ctx.required.require_counter(source);
-        require_four_vector(source, context, ctx);
+    if let Some(object) = ctx.object_defs.get(item) {
+        ctx.required.require_counter(&object.source);
+        require_four_vector_for_object(item, context, ctx);
     } else if let Some(derived) = ctx.derived_objects.get(item) {
         validate_derived_attr(derived, "mass", context, ctx);
     } else {
@@ -2222,18 +3331,32 @@ fn validate_expr(expr: &Expr, context: &str, ctx: &mut ValidationContext<'_>) ->
         Expr::Binary { op, lhs, rhs } => {
             let lhs_type = validate_expr(lhs, context, ctx);
             let rhs_type = validate_expr(rhs, context, ctx);
-            match (lhs_type, rhs_type) {
-                (Some(ExprType::Numeric(lhs)), Some(ExprType::Numeric(rhs))) => {
-                    validate_binary_dimension(*op, lhs, rhs, context, expr, ctx)
+            match (
+                lhs_type.and_then(expr_type_numeric_dimension),
+                rhs_type.and_then(expr_type_numeric_dimension),
+            ) {
+                (Some(lhs_dimension), Some(rhs_dimension)) => {
+                    if matches!(op, ArithOp::Add | ArithOp::Sub) {
+                        if matches!(**rhs, Expr::Literal(_))
+                            && rhs_dimension == Dimension::Dimensionless
+                        {
+                            return Some(ExprType::Numeric(lhs_dimension));
+                        }
+                        if matches!(**lhs, Expr::Literal(_))
+                            && lhs_dimension == Dimension::Dimensionless
+                        {
+                            return Some(ExprType::Numeric(rhs_dimension));
+                        }
+                    }
+                    validate_binary_dimension(*op, lhs_dimension, rhs_dimension, context, expr, ctx)
                 }
-                (Some(_), Some(_)) => {
+                (None, Some(_)) | (Some(_), None) | (None, None) => {
                     ctx.errors.push(SpecError::InvalidExpression {
                         context: context.to_string(),
                         detail: format!("arithmetic expression `{expr}` requires numeric operands"),
                     });
                     None
                 }
-                _ => None,
             }
         }
         Expr::Abs(inner) => match validate_expr(inner, context, ctx) {
@@ -2335,6 +3458,155 @@ fn validate_expr(expr: &Expr, context: &str, ctx: &mut ValidationContext<'_>) ->
             validate_quantity_unit(context, expr, Dimension::Momentum, target, ctx.errors);
             Some(ExprType::Numeric(Dimension::Momentum))
         }
+        Expr::ZepVv {
+            system,
+            met_pt,
+            met_phi,
+            dijet,
+        } => {
+            validate_derived_attr_by_name(system, "eta", context, ctx);
+            validate_derived_attr_by_name(dijet, "delta_eta", context, ctx);
+            validate_numeric_event_scalar(met_pt, context, ctx);
+            validate_numeric_event_scalar(met_phi, context, ctx);
+            Some(ExprType::Numeric(Dimension::Dimensionless))
+        }
+        Expr::SystemMetEta {
+            system,
+            met_pt,
+            met_phi,
+        } => {
+            validate_derived_attr_by_name(system, "eta", context, ctx);
+            validate_numeric_event_scalar(met_pt, context, ctx);
+            validate_numeric_event_scalar(met_phi, context, ctx);
+            Some(ExprType::Numeric(Dimension::Dimensionless))
+        }
+        Expr::SystemMetPt {
+            system,
+            met_pt,
+            met_phi,
+        } => {
+            validate_derived_attr_by_name(system, "pt", context, ctx);
+            validate_numeric_event_scalar(met_pt, context, ctx);
+            validate_numeric_event_scalar(met_phi, context, ctx);
+            Some(ExprType::Numeric(Dimension::Momentum))
+        }
+        Expr::SystemPairMetPt {
+            system,
+            met_pt,
+            met_phi,
+            pair,
+        } => {
+            validate_derived_attr_by_name(system, "pt", context, ctx);
+            validate_derived_attr_by_name(pair, "pt", context, ctx);
+            validate_numeric_event_scalar(met_pt, context, ctx);
+            validate_numeric_event_scalar(met_phi, context, ctx);
+            Some(ExprType::Numeric(Dimension::Momentum))
+        }
+        Expr::SystemPairPtBalance {
+            system,
+            met_pt,
+            met_phi,
+            pair,
+        } => {
+            validate_derived_attr_by_name(system, "pt", context, ctx);
+            validate_derived_attr_by_name(pair, "pt", context, ctx);
+            validate_numeric_event_scalar(met_pt, context, ctx);
+            validate_numeric_event_scalar(met_phi, context, ctx);
+            Some(ExprType::Numeric(Dimension::Dimensionless))
+        }
+        Expr::MetType1Pt {
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => {
+            validate_met_type1(jets, met_pt, met_phi, nominal_pt, shifted_pt, context, ctx);
+            Some(ExprType::Numeric(Dimension::Momentum))
+        }
+        Expr::MetType1Phi {
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => {
+            validate_met_type1(jets, met_pt, met_phi, nominal_pt, shifted_pt, context, ctx);
+            Some(ExprType::Numeric(Dimension::Dimensionless))
+        }
+        Expr::LeadingType1Mt {
+            object,
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => {
+            require_kinematic_component_for_object(
+                object,
+                "pt",
+                "f32 vector branch for transverse-mass pT",
+                context,
+                ctx,
+            );
+            require_kinematic_component_for_object(
+                object,
+                "phi",
+                "f32 vector branch for transverse-mass phi",
+                context,
+                ctx,
+            );
+            validate_met_type1(jets, met_pt, met_phi, nominal_pt, shifted_pt, context, ctx);
+            Some(ExprType::Numeric(Dimension::Momentum))
+        }
+        Expr::SystemDeltaPhi { left, right } => {
+            validate_derived_attr_by_name(left, "phi", context, ctx);
+            validate_derived_attr_by_name(right, "phi", context, ctx);
+            Some(ExprType::Numeric(Dimension::Dimensionless))
+        }
+        Expr::LegacyLeptonRpt {
+            muons,
+            electrons,
+            dijet,
+        } => {
+            require_kinematic_component_for_object(
+                muons,
+                "pt",
+                "f32 vector branch for lepton RPT pT",
+                context,
+                ctx,
+            );
+            require_kinematic_component_for_object(
+                electrons,
+                "pt",
+                "f32 vector branch for lepton RPT pT",
+                context,
+                ctx,
+            );
+            validate_derived_attr_by_name(dijet, "leading_pt", context, ctx);
+            validate_derived_attr_by_name(dijet, "subleading_pt", context, ctx);
+            Some(ExprType::Numeric(Dimension::Dimensionless))
+        }
+        Expr::PairConstituentAttr { pair, attr, .. } => {
+            validate_pair_constituent_attr(pair, attr, context, ctx)
+        }
+        Expr::ZepMax { system, dijet } => {
+            validate_derived_attr_by_name(system, "eta", context, ctx);
+            validate_derived_attr_by_name(dijet, "delta_eta", context, ctx);
+            Some(ExprType::Numeric(Dimension::Dimensionless))
+        }
+        Expr::IndexNotIn { object, attr } => {
+            validate_attr(object, attr, context, ctx);
+            Some(ExprType::Numeric(Dimension::Dimensionless))
+        }
+        Expr::JetIdTightRun2024 { object } => {
+            validate_jet_id_tight_run2024(object, context, ctx);
+            Some(ExprType::Numeric(Dimension::Dimensionless))
+        }
+        Expr::JetVetoMapRun2024 { object } => {
+            validate_jet_veto_map_run2024(object, context, ctx);
+            Some(ExprType::Numeric(Dimension::Dimensionless))
+        }
         Expr::LeadingAttr { object, attr } => validate_attr(object, attr, context, ctx),
         Expr::PairDeltaR
         | Expr::PairLeadingPt
@@ -2378,21 +3650,59 @@ fn validate_pair_pt_object(
         subleading,
         ctx.errors,
     );
-    let Some(source) = ctx.object_sources.get(object) else {
-        ctx.errors.push(SpecError::UndefinedObject {
-            context: context.to_string(),
-            object: object.to_string(),
-        });
-        return;
-    };
-    require_attr_branch_type(
-        source,
+    require_kinematic_component_for_object(
+        object,
         "pt",
-        BranchType::VecF32,
         "f32 vector branch for leading/subleading pT",
         context,
         ctx,
     );
+}
+
+pub(crate) const JET_ID_TIGHT_RUN2024_ATTRS: &[&str] = &[
+    "eta",
+    "chHEF",
+    "neHEF",
+    "neEmEF",
+    "chMultiplicity",
+    "neMultiplicity",
+];
+
+pub(crate) const MET_TYPE1_JET_ATTRS: &[&str] = &["phi", "muonSubtrFactor", "chEmEF", "neEmEF"];
+pub(crate) const JET_VETO_MAP_RUN2024_ATTRS: &[&str] = &["eta", "phi"];
+pub(crate) const JET_VETO_MAP_RUN2024_FILE: &str =
+    "/cvmfs/cms-griddata.cern.ch/cat/metadata/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/latest/jetvetomaps.json.gz";
+pub(crate) const JET_VETO_MAP_RUN2024_CORRECTION: &str = "Summer24Prompt24_RunBCDEFGHI_V1";
+pub(crate) const JET_VETO_MAP_TYPE: &str = "jetvetomap";
+
+fn validate_jet_id_tight_run2024(object: &str, context: &str, ctx: &mut ValidationContext<'_>) {
+    for attr in JET_ID_TIGHT_RUN2024_ATTRS {
+        validate_attr(object, attr, context, ctx);
+    }
+}
+
+fn validate_jet_veto_map_run2024(object: &str, context: &str, ctx: &mut ValidationContext<'_>) {
+    for attr in JET_VETO_MAP_RUN2024_ATTRS {
+        validate_attr(object, attr, context, ctx);
+    }
+}
+
+fn validate_met_type1(
+    jets: &str,
+    met_pt: &str,
+    met_phi: &str,
+    nominal_pt: &str,
+    shifted_pt: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    for attr in MET_TYPE1_JET_ATTRS {
+        validate_attr(jets, attr, context, ctx);
+    }
+    validate_attr(jets, nominal_pt, context, ctx);
+    validate_attr(jets, shifted_pt, context, ctx);
+    validate_numeric_event_scalar(met_pt, context, ctx);
+    validate_numeric_event_scalar(met_phi, context, ctx);
 }
 
 fn validate_mass_order_object(object: &str, context: &str, ctx: &mut ValidationContext<'_>) {
@@ -2518,6 +3828,13 @@ fn validate_attr(
         return Some(ExprType::Numeric(output.dimension));
     }
 
+    if let Some(dimension) = object_correction_for_attr(object, attr, ctx)
+        .map(|_| validation_object_attr_dimension(object, attr, ctx, &mut BTreeSet::new()))
+    {
+        ctx.required.require_counter(source);
+        return Some(ExprType::Numeric(dimension));
+    }
+
     let Some(entry) = ctx.catalogue.branch(&branch) else {
         ctx.errors.push(SpecError::MissingBranch {
             context: context.to_string(),
@@ -2550,6 +3867,29 @@ fn validate_attr(
     Some(ExprType::Numeric(attribute_dimension(attr)))
 }
 
+fn validate_pair_constituent_attr(
+    pair_name: &str,
+    attr: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) -> Option<ExprType> {
+    let Some(derived) = ctx.derived_objects.get(pair_name) else {
+        ctx.errors.push(SpecError::UndefinedObject {
+            context: context.to_string(),
+            object: pair_name.to_string(),
+        });
+        return None;
+    };
+    let DerivedSource::Pair(pair) = &derived.source else {
+        ctx.errors.push(SpecError::InvalidExpression {
+            context: context.to_string(),
+            detail: format!("derived object `{pair_name}` is not a pair"),
+        });
+        return None;
+    };
+    validate_attr(&pair.object, attr, context, ctx)
+}
+
 fn validate_event_scalar(
     branch: &str,
     context: &str,
@@ -2570,21 +3910,81 @@ fn validate_event_scalar(
         });
         return None;
     };
-    match branch_type {
-        BranchType::Bool => {
-            ctx.required.require_branch(branch);
-            Some(ExprType::Bool)
-        }
-        branch_type => {
-            ctx.errors.push(SpecError::WrongBranchType {
-                context: context.to_string(),
-                branch: branch.to_string(),
-                expected: "event scalar bool branch".to_string(),
-                actual: branch_type,
-            });
-            None
-        }
+    ctx.required.require_branch(branch);
+    if branch_type == BranchType::Bool {
+        return Some(ExprType::Bool);
     }
+    if is_numeric_scalar_branch(branch_type) {
+        return Some(ExprType::Numeric(event_scalar_dimension(branch)));
+    }
+
+    ctx.errors.push(SpecError::WrongBranchType {
+        context: context.to_string(),
+        branch: branch.to_string(),
+        expected: "event scalar bool or numeric branch".to_string(),
+        actual: branch_type,
+    });
+    None
+}
+
+fn validate_numeric_event_scalar(
+    branch: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) -> Option<ExprType> {
+    let Some(entry) = ctx.catalogue.branch(branch) else {
+        ctx.errors.push(SpecError::MissingBranch {
+            context: context.to_string(),
+            branch: branch.to_string(),
+        });
+        return None;
+    };
+    let Some(branch_type) = entry.branch_type else {
+        ctx.errors.push(SpecError::UnsupportedBranchType {
+            context: context.to_string(),
+            branch: branch.to_string(),
+            raw_type: entry.raw_type.clone(),
+        });
+        return None;
+    };
+    if branch_type != BranchType::F32 {
+        ctx.errors.push(SpecError::WrongBranchType {
+            context: context.to_string(),
+            branch: branch.to_string(),
+            expected: "f32 event scalar branch".to_string(),
+            actual: branch_type,
+        });
+        return None;
+    }
+    ctx.required.require_branch(branch);
+    Some(ExprType::Numeric(event_scalar_dimension(branch)))
+}
+
+fn event_scalar_dimension(branch: &str) -> Dimension {
+    branch
+        .rsplit_once('_')
+        .map(|(_, attr)| attribute_dimension(attr))
+        .unwrap_or(Dimension::Dimensionless)
+}
+
+fn is_likely_bool_event_branch(branch: &str) -> bool {
+    branch.starts_with("Flag_") || branch.starts_with("HLT_") || branch.starts_with("L1_")
+}
+
+fn validate_derived_attr_by_name(
+    object: &str,
+    attr: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) -> Option<ExprType> {
+    let Some(derived) = ctx.derived_objects.get(object) else {
+        ctx.errors.push(SpecError::UndefinedObject {
+            context: context.to_string(),
+            object: object.to_string(),
+        });
+        return None;
+    };
+    validate_derived_attr(derived, attr, context, ctx)
 }
 
 fn validate_lumi_mask(
@@ -2660,7 +4060,7 @@ fn validate_derived_attr(
 ) -> Option<ExprType> {
     match &derived.source {
         DerivedSource::Pair(pair) => {
-            let Some(source) = ctx.object_sources.get(pair.object.as_str()) else {
+            let Some(_object) = ctx.object_defs.get(pair.object.as_str()) else {
                 ctx.errors.push(SpecError::UndefinedObject {
                     context: context.to_string(),
                     object: pair.object.clone(),
@@ -2670,22 +4070,20 @@ fn validate_derived_attr(
 
             match attr {
                 "mass" => {
-                    require_four_vector(source, context, ctx);
+                    require_four_vector_for_object(&pair.object, context, ctx);
                     Some(ExprType::Numeric(Dimension::Momentum))
                 }
                 "pt" => {
-                    require_attr_branch_type(
-                        source,
+                    require_kinematic_component_for_object(
+                        &pair.object,
                         "pt",
-                        BranchType::VecF32,
                         "f32 vector branch for pair pT",
                         context,
                         ctx,
                     );
-                    require_attr_branch_type(
-                        source,
+                    require_kinematic_component_for_object(
+                        &pair.object,
                         "phi",
-                        BranchType::VecF32,
                         "f32 vector branch for pair pT",
                         context,
                         ctx,
@@ -2693,29 +4091,81 @@ fn validate_derived_attr(
                     Some(ExprType::Numeric(Dimension::Momentum))
                 }
                 "min_delta_r" | "dR" | "dr" => {
-                    require_attr_branch_type(
-                        source,
+                    require_kinematic_component_for_object(
+                        &pair.object,
                         "eta",
-                        BranchType::VecF32,
                         "f32 vector branch for pair delta-R",
                         context,
                         ctx,
                     );
-                    require_attr_branch_type(
-                        source,
+                    require_kinematic_component_for_object(
+                        &pair.object,
                         "phi",
-                        BranchType::VecF32,
                         "f32 vector branch for pair delta-R",
                         context,
                         ctx,
                     );
                     Some(ExprType::Numeric(Dimension::Dimensionless))
                 }
+                "eta" => {
+                    require_four_vector_for_object(&pair.object, context, ctx);
+                    Some(ExprType::Numeric(Dimension::Dimensionless))
+                }
+                "phi" => {
+                    require_kinematic_component_for_object(
+                        &pair.object,
+                        "phi",
+                        "f32 vector branch for pair phi",
+                        context,
+                        ctx,
+                    );
+                    Some(ExprType::Numeric(Dimension::Dimensionless))
+                }
+                "delta_eta" | "leading_eta" | "subleading_eta" => {
+                    require_kinematic_component_for_object(
+                        &pair.object,
+                        "eta",
+                        "f32 vector branch for pair eta",
+                        context,
+                        ctx,
+                    );
+                    Some(ExprType::Numeric(Dimension::Dimensionless))
+                }
+                "delta_phi" | "leading_phi" | "subleading_phi" => {
+                    require_kinematic_component_for_object(
+                        &pair.object,
+                        "phi",
+                        "f32 vector branch for pair phi",
+                        context,
+                        ctx,
+                    );
+                    Some(ExprType::Numeric(Dimension::Dimensionless))
+                }
+                "leading_pt" | "subleading_pt" => {
+                    require_kinematic_component_for_object(
+                        &pair.object,
+                        "pt",
+                        "f32 vector branch for pair pT",
+                        context,
+                        ctx,
+                    );
+                    Some(ExprType::Numeric(Dimension::Momentum))
+                }
+                "leading_mass" | "subleading_mass" => {
+                    require_kinematic_component_for_object(
+                        &pair.object,
+                        "mass",
+                        "f32 vector branch for pair mass",
+                        context,
+                        ctx,
+                    );
+                    Some(ExprType::Numeric(Dimension::Momentum))
+                }
                 other => {
                     ctx.errors.push(SpecError::InvalidExpression {
                         context: context.to_string(),
                         detail: format!(
-                            "derived pair `{}` has no attribute `{other}`; supported attributes are `mass` and `pt`",
+                            "derived pair `{}` has no attribute `{other}`; supported attributes are `mass`, `pt`, `eta`, `phi`, `min_delta_r`, `delta_eta`, `delta_phi`, `leading_pt`, `subleading_pt`, `leading_eta`, `subleading_eta`, `leading_phi`, `subleading_phi`, `leading_mass`, and `subleading_mass`",
                             derived.name
                         ),
                     });
@@ -2726,12 +4176,14 @@ fn validate_derived_attr(
         DerivedSource::Candidate(_) => match attr {
             "mass" => Some(ExprType::Numeric(Dimension::Momentum)),
             "pt" => Some(ExprType::Numeric(Dimension::Momentum)),
-            "min_delta_r" | "dR" | "dr" => Some(ExprType::Numeric(Dimension::Dimensionless)),
+            "eta" | "phi" | "min_delta_r" | "dR" | "dr" => {
+                Some(ExprType::Numeric(Dimension::Dimensionless))
+            }
             other => {
                 ctx.errors.push(SpecError::InvalidExpression {
                     context: context.to_string(),
                     detail: format!(
-                        "derived candidate `{}` has no attribute `{other}`; supported attributes are `mass` and `pt`",
+                        "derived candidate `{}` has no attribute `{other}`; supported attributes are `mass`, `pt`, `eta`, `phi`, and `min_delta_r`",
                         derived.name
                     ),
                 });
@@ -2741,17 +4193,121 @@ fn validate_derived_attr(
     }
 }
 
-fn require_four_vector(source: &str, context: &str, ctx: &mut ValidationContext<'_>) {
-    for attr in ["pt", "eta", "phi", "mass"] {
-        require_attr_branch_type(
-            source,
+fn require_four_vector_for_object(
+    object_name: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    let Some(object) = ctx.object_defs.get(object_name) else {
+        ctx.errors.push(SpecError::UndefinedObject {
+            context: context.to_string(),
+            object: object_name.to_string(),
+        });
+        return;
+    };
+    for (component, attr) in object.kinematics.component_attrs() {
+        let expected = match component {
+            "pt" | "mass" => "f32 vector branch for four-vector momentum component",
+            "eta" | "phi" => "f32 vector branch for four-vector angular component",
+            _ => "f32 vector branch for four-vector component",
+        };
+        require_object_attr_type(
+            object_name,
+            &object.source,
             attr,
             BranchType::VecF32,
-            "f32 vector branch for pt/eta/phi/mass four-vector",
+            expected,
             context,
             ctx,
         );
     }
+}
+
+fn require_kinematic_component_for_object(
+    object_name: &str,
+    component: &str,
+    expected: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    let Some(object) = ctx.object_defs.get(object_name) else {
+        ctx.errors.push(SpecError::UndefinedObject {
+            context: context.to_string(),
+            object: object_name.to_string(),
+        });
+        return;
+    };
+    let Some((_, attr)) = object
+        .kinematics
+        .component_attrs()
+        .into_iter()
+        .find(|(name, _)| *name == component)
+    else {
+        ctx.errors.push(SpecError::InvalidExpression {
+            context: context.to_string(),
+            detail: format!("unknown kinematic component `{component}`"),
+        });
+        return;
+    };
+    require_object_attr_type(
+        object_name,
+        &object.source,
+        attr,
+        BranchType::VecF32,
+        expected,
+        context,
+        ctx,
+    );
+}
+
+fn require_object_attr_type(
+    object_name: &str,
+    source: &str,
+    attr: &str,
+    expected_type: BranchType,
+    expected: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    if object_correction_for_attr(object_name, attr, ctx).is_some() {
+        if expected_type != BranchType::VecF32 {
+            ctx.errors.push(SpecError::WrongBranchType {
+                context: context.to_string(),
+                branch: format!("{object_name}.{attr}"),
+                expected: expected.to_string(),
+                actual: BranchType::VecF32,
+            });
+            return;
+        }
+        ctx.required.require_counter(source);
+        return;
+    }
+    require_attr_branch_type(source, attr, expected_type, expected, context, ctx);
+}
+
+fn object_correction_for_attr<'a>(
+    object_name: &str,
+    attr: &str,
+    ctx: &'a ValidationContext<'_>,
+) -> Option<&'a ObjectCorrectionDef> {
+    ctx.object_corrections
+        .iter()
+        .find(|correction| correction.collection == object_name && correction.attr == attr)
+}
+
+fn validation_object_attr_dimension(
+    object_name: &str,
+    attr: &str,
+    ctx: &ValidationContext<'_>,
+    seen: &mut BTreeSet<String>,
+) -> Dimension {
+    if !seen.insert(attr.to_string()) {
+        return attribute_dimension(attr);
+    }
+    if let Some(correction) = object_correction_for_attr(object_name, attr, ctx) {
+        return validation_object_attr_dimension(object_name, &correction.source_attr, ctx, seen);
+    }
+    attribute_dimension(attr)
 }
 
 fn require_attr_branch_type(
@@ -2789,6 +4345,76 @@ fn require_attr_branch_type(
     }
     ctx.required.require_counter(source);
     ctx.required.require_attr(source, attr);
+}
+
+fn require_int_vector_attr_branch_type(
+    source: &str,
+    attr: &str,
+    expected: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    let branch = format!("{source}_{attr}");
+    let Some(entry) = ctx.catalogue.branch(&branch) else {
+        ctx.errors.push(SpecError::MissingBranch {
+            context: context.to_string(),
+            branch,
+        });
+        return;
+    };
+    let Some(branch_type) = entry.branch_type else {
+        ctx.errors.push(SpecError::UnsupportedBranchType {
+            context: context.to_string(),
+            branch,
+            raw_type: entry.raw_type.clone(),
+        });
+        return;
+    };
+    if !(branch_type.is_vector() && is_int_branch(branch_type)) {
+        ctx.errors.push(SpecError::WrongBranchType {
+            context: context.to_string(),
+            branch,
+            expected: expected.to_string(),
+            actual: branch_type,
+        });
+        return;
+    }
+    ctx.required.require_counter(source);
+    ctx.required.require_attr(source, attr);
+}
+
+fn require_event_branch_type(
+    branch: &str,
+    expected_type: BranchType,
+    expected: &str,
+    context: &str,
+    ctx: &mut ValidationContext<'_>,
+) {
+    let Some(entry) = ctx.catalogue.branch(branch) else {
+        ctx.errors.push(SpecError::MissingBranch {
+            context: context.to_string(),
+            branch: branch.to_string(),
+        });
+        return;
+    };
+    let Some(branch_type) = entry.branch_type else {
+        ctx.errors.push(SpecError::UnsupportedBranchType {
+            context: context.to_string(),
+            branch: branch.to_string(),
+            raw_type: entry.raw_type.clone(),
+        });
+        return;
+    };
+    if branch_type != expected_type {
+        ctx.errors.push(SpecError::WrongBranchType {
+            context: context.to_string(),
+            branch: branch.to_string(),
+            expected: expected.to_string(),
+            actual: branch_type,
+        });
+        return;
+    }
+    ctx.required.require_branch(branch);
 }
 
 fn validate_quantity_unit(
@@ -3056,6 +4682,14 @@ enum ExprType {
     Bool,
 }
 
+fn expr_type_numeric_dimension(expr_type: ExprType) -> Option<Dimension> {
+    match expr_type {
+        ExprType::Numeric(dimension) => Some(dimension),
+        ExprType::Count => Some(Dimension::Dimensionless),
+        ExprType::Bool => None,
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -3125,6 +4759,21 @@ fn is_numeric_vector(branch_type: BranchType) -> bool {
             | BranchType::VecI64
             | BranchType::VecU64
             | BranchType::VecF32
+    )
+}
+
+fn is_numeric_scalar_branch(branch_type: BranchType) -> bool {
+    matches!(
+        branch_type,
+        BranchType::I8
+            | BranchType::U8
+            | BranchType::I16
+            | BranchType::U16
+            | BranchType::I32
+            | BranchType::U32
+            | BranchType::I64
+            | BranchType::U64
+            | BranchType::F32
     )
 }
 
@@ -3646,6 +5295,285 @@ fn parse_expr_prec(
         return parse_mass_order_expr(input, inner, false);
     }
 
+    if let Some(inner) = input
+        .strip_prefix("zep_vv(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let args = split_top_level_args(inner);
+        if args.len() != 4 {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse zep_vv expression `{input}`; expected zep_vv(system, met_pt, met_phi, dijet)"
+            )));
+        }
+        let system = args[0].trim();
+        let met_pt = args[1].trim();
+        let met_phi = args[2].trim();
+        let dijet = args[3].trim();
+        validate_identifier(system, input)?;
+        validate_identifier(met_pt, input)?;
+        validate_identifier(met_phi, input)?;
+        validate_identifier(dijet, input)?;
+        return Ok(Expr::ZepVv {
+            system: system.to_string(),
+            met_pt: met_pt.to_string(),
+            met_phi: met_phi.to_string(),
+            dijet: dijet.to_string(),
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("system_met_eta(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (system, met_pt, met_phi) = parse_system_met_args(input, inner)?;
+        return Ok(Expr::SystemMetEta {
+            system,
+            met_pt,
+            met_phi,
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("system_met_pt(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (system, met_pt, met_phi) = parse_system_met_args(input, inner)?;
+        return Ok(Expr::SystemMetPt {
+            system,
+            met_pt,
+            met_phi,
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("system_pair_met_pt(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let args = split_top_level_args(inner);
+        if args.len() != 4 {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse system_pair_met_pt expression `{input}`; expected system_pair_met_pt(system, met_pt, met_phi, pair)"
+            )));
+        }
+        let system = args[0].trim();
+        let met_pt = args[1].trim();
+        let met_phi = args[2].trim();
+        let pair = args[3].trim();
+        validate_identifier(system, input)?;
+        validate_identifier(met_pt, input)?;
+        validate_identifier(met_phi, input)?;
+        validate_identifier(pair, input)?;
+        return Ok(Expr::SystemPairMetPt {
+            system: system.to_string(),
+            met_pt: met_pt.to_string(),
+            met_phi: met_phi.to_string(),
+            pair: pair.to_string(),
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("system_pair_pt_balance(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let args = split_top_level_args(inner);
+        if args.len() != 4 {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse system_pair_pt_balance expression `{input}`; expected system_pair_pt_balance(system, met_pt, met_phi, pair)"
+            )));
+        }
+        let system = args[0].trim();
+        let met_pt = args[1].trim();
+        let met_phi = args[2].trim();
+        let pair = args[3].trim();
+        validate_identifier(system, input)?;
+        validate_identifier(met_pt, input)?;
+        validate_identifier(met_phi, input)?;
+        validate_identifier(pair, input)?;
+        return Ok(Expr::SystemPairPtBalance {
+            system: system.to_string(),
+            met_pt: met_pt.to_string(),
+            met_phi: met_phi.to_string(),
+            pair: pair.to_string(),
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("met_type1_pt(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (jets, met_pt, met_phi, nominal_pt, shifted_pt) = parse_met_type1_args(input, inner)?;
+        return Ok(Expr::MetType1Pt {
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("met_type1_phi(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (jets, met_pt, met_phi, nominal_pt, shifted_pt) = parse_met_type1_args(input, inner)?;
+        return Ok(Expr::MetType1Phi {
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("leading_type1_mt(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (object, jets, met_pt, met_phi, nominal_pt, shifted_pt) =
+            parse_leading_type1_mt_args(input, inner)?;
+        return Ok(Expr::LeadingType1Mt {
+            object,
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("system_delta_phi(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let args = split_top_level_args(inner);
+        if args.len() != 2 {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse system_delta_phi expression `{input}`; expected system_delta_phi(left, right)"
+            )));
+        }
+        let left = args[0].trim();
+        let right = args[1].trim();
+        validate_identifier(left, input)?;
+        validate_identifier(right, input)?;
+        return Ok(Expr::SystemDeltaPhi {
+            left: left.to_string(),
+            right: right.to_string(),
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("legacy_lepton_rpt(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let args = split_top_level_args(inner);
+        if args.len() != 3 {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse legacy_lepton_rpt expression `{input}`; expected legacy_lepton_rpt(muons, electrons, dijet)"
+            )));
+        }
+        let muons = args[0].trim();
+        let electrons = args[1].trim();
+        let dijet = args[2].trim();
+        validate_identifier(muons, input)?;
+        validate_identifier(electrons, input)?;
+        validate_identifier(dijet, input)?;
+        return Ok(Expr::LegacyLeptonRpt {
+            muons: muons.to_string(),
+            electrons: electrons.to_string(),
+            dijet: dijet.to_string(),
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("pair_leading_attr(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (pair, attr) = parse_pair_attr_args(input, inner, "pair_leading_attr")?;
+        return Ok(Expr::PairConstituentAttr {
+            pair,
+            attr,
+            rank: PairConstituentRank::Leading,
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("pair_subleading_attr(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (pair, attr) = parse_pair_attr_args(input, inner, "pair_subleading_attr")?;
+        return Ok(Expr::PairConstituentAttr {
+            pair,
+            attr,
+            rank: PairConstituentRank::Subleading,
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("zep_max(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let args = split_top_level_args(inner);
+        if args.len() != 2 {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse zep_max expression `{input}`; expected zep_max(system, dijet)"
+            )));
+        }
+        let system = args[0].trim();
+        let dijet = args[1].trim();
+        validate_identifier(system, input)?;
+        validate_identifier(dijet, input)?;
+        return Ok(Expr::ZepMax {
+            system: system.to_string(),
+            dijet: dijet.to_string(),
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("index_not_in(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (object, attr) = parse_object_attr_arg(input, inner)?;
+        return Ok(Expr::IndexNotIn { object, attr });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("jet_id_tight_run2024(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        if !inner.trim().is_empty() {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse jet ID expression `{input}`; expected jet_id_tight_run2024() inside an object cut"
+            )));
+        }
+        let Some(object) = default_object else {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse jet ID expression `{input}` outside an object cut"
+            )));
+        };
+        return Ok(Expr::JetIdTightRun2024 {
+            object: object.to_string(),
+        });
+    }
+
+    if let Some(inner) = input
+        .strip_prefix("jet_veto_map_run2024(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        if !inner.trim().is_empty() {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse jet veto map expression `{input}`; expected jet_veto_map_run2024() inside an object cut"
+            )));
+        }
+        let Some(object) = default_object else {
+            return Err(ParseError::InvalidSpec(format!(
+                "could not parse jet veto map expression `{input}` outside an object cut"
+            )));
+        };
+        return Ok(Expr::JetVetoMapRun2024 {
+            object: object.to_string(),
+        });
+    }
+
     if let Some(rest) = input.strip_prefix("leading(") {
         let Some((object, attr)) = rest.split_once(").") else {
             return Err(ParseError::InvalidSpec(format!(
@@ -3693,6 +5621,114 @@ fn parse_expr_prec(
 
     validate_identifier(input, input)?;
     Ok(Expr::EventScalar(input.to_string()))
+}
+
+fn parse_system_met_args(input: &str, inner: &str) -> Result<(String, String, String), ParseError> {
+    let args = split_top_level_args(inner);
+    if args.len() != 3 {
+        return Err(ParseError::InvalidSpec(format!(
+            "could not parse system+MET expression `{input}`; expected (system, met_pt, met_phi)"
+        )));
+    }
+    let system = args[0].trim();
+    let met_pt = args[1].trim();
+    let met_phi = args[2].trim();
+    validate_identifier(system, input)?;
+    validate_identifier(met_pt, input)?;
+    validate_identifier(met_phi, input)?;
+    Ok((system.to_string(), met_pt.to_string(), met_phi.to_string()))
+}
+
+fn parse_met_type1_args(
+    input: &str,
+    inner: &str,
+) -> Result<(String, String, String, String, String), ParseError> {
+    let args = split_top_level_args(inner);
+    if args.len() != 5 {
+        return Err(ParseError::InvalidSpec(format!(
+            "could not parse Type-1 MET expression `{input}`; expected met_type1_(pt|phi)(jets, met_pt, met_phi, nominal_pt_attr, shifted_pt_attr)"
+        )));
+    }
+    let jets = args[0].trim();
+    let met_pt = args[1].trim();
+    let met_phi = args[2].trim();
+    let nominal_pt = args[3].trim();
+    let shifted_pt = args[4].trim();
+    validate_identifier(jets, input)?;
+    validate_identifier(met_pt, input)?;
+    validate_identifier(met_phi, input)?;
+    validate_identifier(nominal_pt, input)?;
+    validate_identifier(shifted_pt, input)?;
+    Ok((
+        jets.to_string(),
+        met_pt.to_string(),
+        met_phi.to_string(),
+        nominal_pt.to_string(),
+        shifted_pt.to_string(),
+    ))
+}
+
+fn parse_leading_type1_mt_args(
+    input: &str,
+    inner: &str,
+) -> Result<(String, String, String, String, String, String), ParseError> {
+    let args = split_top_level_args(inner);
+    if args.len() != 6 {
+        return Err(ParseError::InvalidSpec(format!(
+            "could not parse leading_type1_mt expression `{input}`; expected leading_type1_mt(object, jets, met_pt, met_phi, nominal_pt_attr, shifted_pt_attr)"
+        )));
+    }
+    let object = args[0].trim();
+    let jets = args[1].trim();
+    let met_pt = args[2].trim();
+    let met_phi = args[3].trim();
+    let nominal_pt = args[4].trim();
+    let shifted_pt = args[5].trim();
+    validate_identifier(object, input)?;
+    validate_identifier(jets, input)?;
+    validate_identifier(met_pt, input)?;
+    validate_identifier(met_phi, input)?;
+    validate_identifier(nominal_pt, input)?;
+    validate_identifier(shifted_pt, input)?;
+    Ok((
+        object.to_string(),
+        jets.to_string(),
+        met_pt.to_string(),
+        met_phi.to_string(),
+        nominal_pt.to_string(),
+        shifted_pt.to_string(),
+    ))
+}
+
+fn parse_object_attr_arg(input: &str, inner: &str) -> Result<(String, String), ParseError> {
+    let Some((object, attr)) = inner.trim().split_once('.') else {
+        return Err(ParseError::InvalidSpec(format!(
+            "could not parse object attribute expression `{input}`; expected object.attr"
+        )));
+    };
+    let object = object.trim();
+    let attr = attr.trim();
+    validate_identifier(object, input)?;
+    validate_identifier(attr, input)?;
+    Ok((object.to_string(), attr.to_string()))
+}
+
+fn parse_pair_attr_args(
+    input: &str,
+    inner: &str,
+    function: &str,
+) -> Result<(String, String), ParseError> {
+    let args = split_top_level_args(inner);
+    if args.len() != 2 {
+        return Err(ParseError::InvalidSpec(format!(
+            "could not parse {function} expression `{input}`; expected {function}(pair, attr)"
+        )));
+    }
+    let pair = args[0].trim();
+    let attr = args[1].trim();
+    validate_identifier(pair, input)?;
+    validate_identifier(attr, input)?;
+    Ok((pair.to_string(), attr.to_string()))
 }
 
 fn starts_with_call(input: &str, function: &str) -> bool {
@@ -3906,6 +5942,8 @@ struct RawAnalysisSpec {
     corrections: Vec<RawCorrection>,
     #[serde(default, rename = "channel")]
     channels: Vec<RawChannel>,
+    #[serde(default)]
+    validation: Option<RawValidation>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3917,6 +5955,8 @@ struct RawAnalysis {
 #[derive(Debug, serde::Deserialize)]
 struct RawObject {
     source: String,
+    #[serde(default)]
+    kinematics: ObjectKinematics,
     #[serde(default)]
     cuts: Vec<String>,
 }
@@ -3966,6 +6006,33 @@ struct RawModelProvider {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct RawValidation {
+    #[serde(default)]
+    compare: Option<RawValidationCompare>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawValidationCompare {
+    #[serde(default)]
+    tree: Option<String>,
+    #[serde(default)]
+    rtol: Option<f64>,
+    #[serde(default)]
+    atol: Option<f64>,
+    #[serde(default, rename = "branch_tolerance")]
+    branch_tolerances: Vec<RawValidationBranchTolerance>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawValidationBranchTolerance {
+    branch: String,
+    rtol: f64,
+    atol: f64,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct RawRegion {
     #[serde(default)]
     require: Vec<String>,
@@ -3980,6 +6047,8 @@ struct RawLumiMask {
 struct RawOutput {
     name: String,
     expr: String,
+    #[serde(default)]
+    dtype: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -4012,6 +6081,10 @@ struct RawCorrection {
     #[serde(default)]
     attr: Option<String>,
     #[serde(default)]
+    source_attr: Option<String>,
+    #[serde(default)]
+    raw_factor_attr: Option<String>,
+    #[serde(default)]
     up: Option<f64>,
     #[serde(default)]
     down: Option<f64>,
@@ -4021,6 +6094,22 @@ struct RawCorrection {
     correction: Option<String>,
     #[serde(default)]
     inputs: Vec<RawScaleFactorInput>,
+    #[serde(default)]
+    scale_factor_file: Option<String>,
+    #[serde(default)]
+    scale_factor_correction: Option<String>,
+    #[serde(default)]
+    scale_factor_inputs: Vec<RawScaleFactorInput>,
+    #[serde(default)]
+    resolution_file: Option<String>,
+    #[serde(default)]
+    resolution_correction: Option<String>,
+    #[serde(default)]
+    resolution_inputs: Vec<RawScaleFactorInput>,
+    #[serde(default)]
+    gen_jet_index_attr: Option<String>,
+    #[serde(default)]
+    gen_jet_pt_branch: Option<String>,
     #[serde(default)]
     systematic: Option<RawScaleFactorSystematic>,
 }
@@ -4061,6 +6150,12 @@ fn object_defs_from_raw(
 ) -> Result<Vec<ObjectDef>, ParseError> {
     let mut objects = Vec::with_capacity(raw_objects.len());
     for (name, object) in raw_objects {
+        for (component, attr) in object.kinematics.component_attrs() {
+            validate_branch_name(
+                attr,
+                &format!("object `{name}` kinematic component `{component}`"),
+            )?;
+        }
         let cuts = object
             .cuts
             .iter()
@@ -4069,10 +6164,75 @@ fn object_defs_from_raw(
         objects.push(ObjectDef {
             name,
             source: object.source,
+            kinematics: object.kinematics,
             cuts,
         });
     }
-    Ok(objects)
+    order_objects_by_cut_dependencies(objects)
+}
+
+fn order_objects_by_cut_dependencies(
+    mut objects: Vec<ObjectDef>,
+) -> Result<Vec<ObjectDef>, ParseError> {
+    let names = objects
+        .iter()
+        .map(|object| object.name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(objects.len());
+    let mut resolved = BTreeSet::new();
+
+    while !objects.is_empty() {
+        let before = objects.len();
+        let mut index = 0;
+        while index < objects.len() {
+            let current = objects[index].name.clone();
+            let deps = object_cut_dependencies(&objects[index])
+                .into_iter()
+                .filter(|dep| names.contains(dep) && dep != &current)
+                .collect::<Vec<_>>();
+            if deps.iter().all(|dep| resolved.contains(dep)) {
+                let object = objects.remove(index);
+                resolved.insert(object.name.clone());
+                ordered.push(object);
+            } else {
+                index += 1;
+            }
+        }
+        if objects.len() == before {
+            let blocked = objects
+                .iter()
+                .map(|object| object.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ParseError::InvalidSpec(format!(
+                "object cut dependencies are cyclic or unresolved among: {blocked}"
+            )));
+        }
+    }
+
+    Ok(ordered)
+}
+
+fn object_cut_dependencies(object: &ObjectDef) -> BTreeSet<String> {
+    let mut deps = BTreeSet::new();
+    for cut in &object.cuts {
+        collect_index_not_in_dependencies(&cut.lhs, &mut deps);
+    }
+    deps
+}
+
+fn collect_index_not_in_dependencies(expr: &Expr, deps: &mut BTreeSet<String>) {
+    match expr {
+        Expr::IndexNotIn { object, .. } => {
+            deps.insert(object.clone());
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_index_not_in_dependencies(lhs, deps);
+            collect_index_not_in_dependencies(rhs, deps);
+        }
+        Expr::Abs(inner) | Expr::Sqrt(inner) => collect_index_not_in_dependencies(inner, deps),
+        _ => {}
+    }
 }
 
 fn derived_defs_from_raw(
@@ -4113,9 +6273,32 @@ fn output_defs_from_raw(raw_outputs: &[RawOutput]) -> Result<Vec<OutputDef>, Par
             Ok(OutputDef {
                 name: output.name.clone(),
                 expr: parse_expr(&output.expr, None)?,
+                dtype: parse_output_dtype(output.dtype.as_deref(), &output.name)?,
             })
         })
         .collect::<Result<Vec<_>, ParseError>>()
+}
+
+fn parse_output_dtype(
+    value: Option<&str>,
+    output_name: &str,
+) -> Result<Option<OutputDType>, ParseError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let dtype = match value {
+        "F32" | "f32" | "float" | "Float" => OutputDType::F32,
+        "F64" | "f64" | "double" | "Double" => OutputDType::F64,
+        "I32" | "i32" | "int" | "Int" => OutputDType::I32,
+        "U32" | "u32" | "uint" | "UInt" => OutputDType::U32,
+        "U64" | "u64" | "ulong" | "ULong" => OutputDType::U64,
+        other => {
+            return Err(ParseError::InvalidSpec(format!(
+                "output `{output_name}` has unsupported dtype `{other}`; expected F32, F64, I32, U32, or U64"
+            )));
+        }
+    };
+    Ok(Some(dtype))
 }
 
 fn histogram_defs_from_raw(
@@ -4175,13 +6358,22 @@ fn weight_systematic_def_from_raw(raw: RawSystematic) -> Result<SystematicDef, P
     }))
 }
 
+type CorrectionDefs = (
+    Vec<ObjectCorrectionDef>,
+    Vec<ShapeCorrectionDef>,
+    Vec<ScaleFactorCorrectionDef>,
+);
+
 fn correction_defs_from_raw(
     raw_corrections: Vec<RawCorrection>,
-) -> Result<(Vec<ShapeCorrectionDef>, Vec<ScaleFactorCorrectionDef>), ParseError> {
+) -> Result<CorrectionDefs, ParseError> {
+    let mut object_corrections = Vec::new();
     let mut shape_corrections = Vec::new();
     let mut scale_factor_corrections = Vec::new();
     for raw in raw_corrections {
         match raw.kind.as_str() {
+            "jec_nominal" => object_corrections.push(jec_nominal_correction_def_from_raw(raw)?),
+            "jer_nominal" => object_corrections.push(jer_nominal_correction_def_from_raw(raw)?),
             "scale" => shape_corrections.push(shape_correction_def_from_raw(raw)?),
             "jes" => shape_corrections.push(jes_shape_correction_def_from_raw(raw)?),
             "scale_factor" => {
@@ -4189,13 +6381,192 @@ fn correction_defs_from_raw(
             }
             other => {
                 return Err(ParseError::InvalidSpec(format!(
-                    "correction `{}` has unsupported kind `{other}`; expected `scale`, `jes`, or `scale_factor`",
+                    "correction `{}` has unsupported kind `{other}`; expected `jec_nominal`, `jer_nominal`, `scale`, `jes`, or `scale_factor`",
                     raw.name
                 )));
             }
         }
     }
-    Ok((shape_corrections, scale_factor_corrections))
+    Ok((
+        object_corrections,
+        shape_corrections,
+        scale_factor_corrections,
+    ))
+}
+
+fn jec_nominal_correction_def_from_raw(
+    raw: RawCorrection,
+) -> Result<ObjectCorrectionDef, ParseError> {
+    validate_identifier(&raw.name, "correction name")?;
+    validate_identifier(&raw.collection, "correction collection")?;
+    let attr = raw.attr.ok_or_else(|| {
+        ParseError::InvalidSpec(format!(
+            "JEC nominal correction `{}` is missing `attr`",
+            raw.name
+        ))
+    })?;
+    let source_attr = raw.source_attr.ok_or_else(|| {
+        ParseError::InvalidSpec(format!(
+            "JEC nominal correction `{}` is missing `source_attr`",
+            raw.name
+        ))
+    })?;
+    let raw_factor_attr = raw.raw_factor_attr.ok_or_else(|| {
+        ParseError::InvalidSpec(format!(
+            "JEC nominal correction `{}` is missing `raw_factor_attr`",
+            raw.name
+        ))
+    })?;
+    validate_identifier(&attr, "correction attribute")?;
+    validate_identifier(&source_attr, "correction source attribute")?;
+    validate_identifier(&raw_factor_attr, "correction raw-factor attribute")?;
+    if source_attr != "pt" {
+        return Err(ParseError::InvalidSpec(format!(
+            "JEC nominal correction `{}` uses source_attr `{source_attr}`; this compiler slice only supports `pt`",
+            raw.name
+        )));
+    }
+    let file = required_raw_string(raw.file, &raw.name, "file")?;
+    let correction = required_raw_string(raw.correction, &raw.name, "correction")?;
+    if raw.inputs.is_empty() {
+        return Err(ParseError::InvalidSpec(format!(
+            "JEC nominal correction `{}` declares no inputs",
+            raw.name
+        )));
+    }
+    let inputs =
+        scale_factor_inputs_from_raw(raw.inputs, &raw.name, "JEC nominal correction", "JEC")?;
+    Ok(ObjectCorrectionDef::jec_nominal(
+        raw.name,
+        raw.collection,
+        attr,
+        source_attr,
+        raw_factor_attr,
+        file,
+        correction,
+        inputs,
+    ))
+}
+
+fn jer_nominal_correction_def_from_raw(
+    raw: RawCorrection,
+) -> Result<ObjectCorrectionDef, ParseError> {
+    validate_identifier(&raw.name, "correction name")?;
+    validate_identifier(&raw.collection, "correction collection")?;
+    let attr = raw.attr.ok_or_else(|| {
+        ParseError::InvalidSpec(format!(
+            "JER nominal correction `{}` is missing `attr`",
+            raw.name
+        ))
+    })?;
+    let source_attr = raw.source_attr.ok_or_else(|| {
+        ParseError::InvalidSpec(format!(
+            "JER nominal correction `{}` is missing `source_attr`",
+            raw.name
+        ))
+    })?;
+    let gen_jet_index_attr = raw.gen_jet_index_attr.ok_or_else(|| {
+        ParseError::InvalidSpec(format!(
+            "JER nominal correction `{}` is missing `gen_jet_index_attr`",
+            raw.name
+        ))
+    })?;
+    let gen_jet_pt_branch = raw.gen_jet_pt_branch.ok_or_else(|| {
+        ParseError::InvalidSpec(format!(
+            "JER nominal correction `{}` is missing `gen_jet_pt_branch`",
+            raw.name
+        ))
+    })?;
+    validate_identifier(&attr, "correction attribute")?;
+    validate_identifier(&source_attr, "correction source attribute")?;
+    validate_identifier(&gen_jet_index_attr, "correction GenJet index attribute")?;
+    validate_branch_name(&gen_jet_pt_branch, "correction GenJet pT branch")?;
+    let scale_factor_file =
+        required_raw_string(raw.scale_factor_file, &raw.name, "scale_factor_file")?;
+    let scale_factor_correction = required_raw_string(
+        raw.scale_factor_correction,
+        &raw.name,
+        "scale_factor_correction",
+    )?;
+    let resolution_file = required_raw_string(raw.resolution_file, &raw.name, "resolution_file")?;
+    let resolution_correction = required_raw_string(
+        raw.resolution_correction,
+        &raw.name,
+        "resolution_correction",
+    )?;
+    if raw.scale_factor_inputs.is_empty() {
+        return Err(ParseError::InvalidSpec(format!(
+            "JER nominal correction `{}` declares no scale_factor_inputs",
+            raw.name
+        )));
+    }
+    if raw.resolution_inputs.is_empty() {
+        return Err(ParseError::InvalidSpec(format!(
+            "JER nominal correction `{}` declares no resolution_inputs",
+            raw.name
+        )));
+    }
+    let scale_factor_inputs = scale_factor_inputs_from_raw(
+        raw.scale_factor_inputs,
+        &raw.name,
+        "JER nominal correction",
+        "JER scale-factor",
+    )?;
+    let resolution_inputs = scale_factor_inputs_from_raw(
+        raw.resolution_inputs,
+        &raw.name,
+        "JER nominal correction",
+        "JER resolution",
+    )?;
+    Ok(ObjectCorrectionDef::jer_nominal(
+        raw.name,
+        raw.collection,
+        attr,
+        source_attr,
+        scale_factor_file,
+        scale_factor_correction,
+        scale_factor_inputs,
+        resolution_file,
+        resolution_correction,
+        resolution_inputs,
+        gen_jet_index_attr,
+        gen_jet_pt_branch,
+    ))
+}
+
+fn scale_factor_inputs_from_raw(
+    raw_inputs: Vec<RawScaleFactorInput>,
+    correction_name: &str,
+    correction_label: &str,
+    input_label: &str,
+) -> Result<Vec<ScaleFactorInputDef>, ParseError> {
+    raw_inputs
+        .into_iter()
+        .map(|input| {
+            validate_identifier(&input.name, &format!("{input_label} input name"))?;
+            match (input.from, input.value) {
+                (Some(from), None) => {
+                    validate_identifier(&from, &format!("{input_label} input source"))?;
+                    Ok(ScaleFactorInputDef {
+                        name: input.name,
+                        source: ScaleFactorInputSource::From(from),
+                    })
+                }
+                (None, Some(value)) => Ok(ScaleFactorInputDef {
+                    name: input.name,
+                    source: ScaleFactorInputSource::Literal(value),
+                }),
+                (Some(_), Some(_)) => Err(ParseError::InvalidSpec(format!(
+                    "{correction_label} `{correction_name}` input `{}` cannot set both `from` and `value`",
+                    input.name
+                ))),
+                (None, None) => Err(ParseError::InvalidSpec(format!(
+                    "{correction_label} `{correction_name}` input `{}` must set `from` or `value`",
+                    input.name
+                ))),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn shape_correction_def_from_raw(raw: RawCorrection) -> Result<ShapeCorrectionDef, ParseError> {
@@ -4367,6 +6738,61 @@ fn required_raw_string(
 
 fn default_nominal_systematic_value() -> String {
     "nominal".to_string()
+}
+
+fn validation_def_from_raw(raw: RawValidation) -> Result<ValidationDef, ParseError> {
+    Ok(ValidationDef {
+        compare: raw
+            .compare
+            .map(validation_compare_def_from_raw)
+            .transpose()?,
+    })
+}
+
+fn validation_compare_def_from_raw(
+    raw: RawValidationCompare,
+) -> Result<ValidationCompareDef, ParseError> {
+    if let Some(rtol) = raw.rtol {
+        validate_tolerance_value("validation.compare.rtol", rtol)?;
+    }
+    if let Some(atol) = raw.atol {
+        validate_tolerance_value("validation.compare.atol", atol)?;
+    }
+    let branch_tolerances = raw
+        .branch_tolerances
+        .into_iter()
+        .map(validation_branch_tolerance_def_from_raw)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ValidationCompareDef {
+        tree: raw.tree,
+        rtol: raw.rtol,
+        atol: raw.atol,
+        branch_tolerances,
+    })
+}
+
+fn validation_branch_tolerance_def_from_raw(
+    raw: RawValidationBranchTolerance,
+) -> Result<ValidationBranchToleranceDef, ParseError> {
+    validate_branch_name(&raw.branch, "validation branch tolerance")?;
+    validate_tolerance_value("validation branch rtol", raw.rtol)?;
+    validate_tolerance_value("validation branch atol", raw.atol)?;
+    Ok(ValidationBranchToleranceDef {
+        branch: raw.branch,
+        rtol: raw.rtol,
+        atol: raw.atol,
+        reason: raw.reason,
+    })
+}
+
+fn validate_tolerance_value(context: &str, value: f64) -> Result<(), ParseError> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(ParseError::InvalidSpec(format!(
+            "{context} must be finite and >= 0"
+        )))
+    }
 }
 
 fn channel_def_from_raw(raw: RawChannel) -> Result<ChannelDef, ParseError> {
@@ -4763,6 +7189,92 @@ impl fmt::Display for Expr {
                 right,
                 target,
             } => write!(f, "other_mass({left}, {right}, {target})"),
+            Self::ZepVv {
+                system,
+                met_pt,
+                met_phi,
+                dijet,
+            } => write!(f, "zep_vv({system}, {met_pt}, {met_phi}, {dijet})"),
+            Self::SystemMetEta {
+                system,
+                met_pt,
+                met_phi,
+            } => write!(f, "system_met_eta({system}, {met_pt}, {met_phi})"),
+            Self::SystemMetPt {
+                system,
+                met_pt,
+                met_phi,
+            } => write!(f, "system_met_pt({system}, {met_pt}, {met_phi})"),
+            Self::SystemPairMetPt {
+                system,
+                met_pt,
+                met_phi,
+                pair,
+            } => write!(
+                f,
+                "system_pair_met_pt({system}, {met_pt}, {met_phi}, {pair})"
+            ),
+            Self::SystemPairPtBalance {
+                system,
+                met_pt,
+                met_phi,
+                pair,
+            } => write!(
+                f,
+                "system_pair_pt_balance({system}, {met_pt}, {met_phi}, {pair})"
+            ),
+            Self::MetType1Pt {
+                jets,
+                met_pt,
+                met_phi,
+                nominal_pt,
+                shifted_pt,
+            } => write!(
+                f,
+                "met_type1_pt({jets}, {met_pt}, {met_phi}, {nominal_pt}, {shifted_pt})"
+            ),
+            Self::MetType1Phi {
+                jets,
+                met_pt,
+                met_phi,
+                nominal_pt,
+                shifted_pt,
+            } => write!(
+                f,
+                "met_type1_phi({jets}, {met_pt}, {met_phi}, {nominal_pt}, {shifted_pt})"
+            ),
+            Self::LeadingType1Mt {
+                object,
+                jets,
+                met_pt,
+                met_phi,
+                nominal_pt,
+                shifted_pt,
+            } => write!(
+                f,
+                "leading_type1_mt({object}, {jets}, {met_pt}, {met_phi}, {nominal_pt}, {shifted_pt})"
+            ),
+            Self::SystemDeltaPhi { left, right } => {
+                write!(f, "system_delta_phi({left}, {right})")
+            }
+            Self::LegacyLeptonRpt {
+                muons,
+                electrons,
+                dijet,
+            } => write!(f, "legacy_lepton_rpt({muons}, {electrons}, {dijet})"),
+            Self::PairConstituentAttr { pair, attr, rank } => {
+                let function = match rank {
+                    PairConstituentRank::Leading => "pair_leading_attr",
+                    PairConstituentRank::Subleading => "pair_subleading_attr",
+                };
+                write!(f, "{function}({pair}, {attr})")
+            }
+            Self::ZepMax { system, dijet } => write!(f, "zep_max({system}, {dijet})"),
+            Self::IndexNotIn { object, attr } => write!(f, "index_not_in({object}.{attr})"),
+            Self::JetIdTightRun2024 { object } => write!(f, "jet_id_tight_run2024({object})"),
+            Self::JetVetoMapRun2024 { object } => {
+                write!(f, "jet_veto_map_run2024({object})")
+            }
             Self::LeadingAttr { object, attr } => write!(f, "leading({object}).{attr}"),
             Self::PairDeltaR => f.write_str("dR"),
             Self::PairLeadingPt => f.write_str("leading_pt"),
@@ -4906,6 +7418,97 @@ mod tests {
         ),
     ];
     const MUON_SPEC_YAML: &str = include_str!("../examples/muon.yaml");
+    const JEC_NOMINAL_SPEC_TOML: &str = r#"
+[analysis]
+name = "jec_nominal"
+year = "Run2024"
+
+[[correction]]
+name = "jet_pt_jec"
+kind = "jec_nominal"
+file = "../nano-spec/tests/data/jec_nominal.json"
+correction = "synthetic_jec_nominal"
+collection = "good_jet"
+attr = "ptJec"
+source_attr = "pt"
+raw_factor_attr = "rawFactor"
+inputs = [
+  { name = "JetA", from = "area" },
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "raw_pt" },
+  { name = "Rho", from = "Rho_fixedGridRhoFastjetAll" },
+  { name = "JetPhi", from = "phi" },
+]
+
+[objects.good_jet]
+source = "Jet"
+kinematics = { pt = "ptJec" }
+cuts = [
+  "ptJec > 30 GeV",
+  "abs(eta) < 5.0",
+]
+
+[[outputs]]
+name = "lead_jec_pt"
+expr = "leading(good_jet).ptJec"
+"#;
+    const JER_NOMINAL_SPEC_TOML: &str = r#"
+[analysis]
+name = "jer_nominal"
+year = "Run2024"
+
+[[correction]]
+name = "jet_pt_jec"
+kind = "jec_nominal"
+file = "../nano-spec/tests/data/jec_nominal.json"
+correction = "synthetic_jec_nominal"
+collection = "good_jet"
+attr = "ptJec"
+source_attr = "pt"
+raw_factor_attr = "rawFactor"
+inputs = [
+  { name = "JetA", from = "area" },
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "raw_pt" },
+  { name = "Rho", from = "Rho_fixedGridRhoFastjetAll" },
+  { name = "JetPhi", from = "phi" },
+]
+
+[[correction]]
+name = "jet_pt_def"
+kind = "jer_nominal"
+collection = "good_jet"
+attr = "ptDef"
+source_attr = "ptJec"
+scale_factor_file = "../nano-spec/tests/data/jer_nominal.json"
+scale_factor_correction = "synthetic_jer_scale_factor"
+scale_factor_inputs = [
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "ptJec" },
+  { name = "systematic", value = "nom" },
+]
+resolution_file = "../nano-spec/tests/data/jer_nominal.json"
+resolution_correction = "synthetic_jer_resolution"
+resolution_inputs = [
+  { name = "JetEta", from = "eta" },
+  { name = "JetPt", from = "ptJec" },
+  { name = "Rho", from = "Rho_fixedGridRhoFastjetAll" },
+]
+gen_jet_index_attr = "genJetIdx"
+gen_jet_pt_branch = "GenJet_pt"
+
+[objects.good_jet]
+source = "Jet"
+kinematics = { pt = "ptDef" }
+cuts = [
+  "ptDef > 30 GeV",
+  "abs(eta) < 5.0",
+]
+
+[[outputs]]
+name = "lead_def_pt"
+expr = "leading(good_jet).ptDef"
+"#;
     const MUON_SPEC_JSON: &str = r#"
 {
   "analysis": { "name": "muon_demo", "year": "Run2018" },
@@ -4925,11 +7528,16 @@ mod tests {
     { "name": "lead_muon_pt", "expr": "leading(good_muon).pt" }
   ]
 }
-"#;
+    "#;
     const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
+    const NANOV15_CATALOGUE: &str = include_str!("../../../configs/branches/nanov15.yaml");
 
     fn catalogue() -> Catalogue {
         Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse nanov9 catalogue")
+    }
+
+    fn catalogue_v15() -> Catalogue {
+        Catalogue::from_nanoaod_yaml_str(NANOV15_CATALOGUE, "v15").expect("parse nanov15 catalogue")
     }
 
     fn parse_muon_spec() -> AnalysisSpec {
@@ -4989,6 +7597,122 @@ mod tests {
     }
 
     #[test]
+    fn index_not_in_orders_object_dependencies_and_reads_index_branch() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "jet_cleaning"
+year = "Run2018"
+
+[objects.aaa_jet]
+source = "Jet"
+cuts = [
+  "pt > 20 GeV",
+  "index_not_in(good_muon.jetIdx) == 1",
+]
+
+[objects.good_muon]
+source = "Muon"
+cuts = ["pt > 10 GeV"]
+
+[[outputs]]
+name = "n_jet"
+expr = "count(aaa_jet)"
+"#,
+        )
+        .expect("parse index-cleaning spec");
+
+        assert_eq!(spec.objects[0].name, "good_muon");
+        assert_eq!(spec.objects[1].name, "aaa_jet");
+
+        let plan = validate(&spec, &catalogue()).expect("validate index-cleaning spec");
+        let read_branches = plan
+            .read_branches
+            .specs()
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(read_branches.contains(&"Muon_jetIdx"));
+        assert!(read_branches.contains(&"Jet_pt"));
+    }
+
+    #[test]
+    fn jet_id_tight_run2024_derives_formula_read_branches() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "jet_id_2024"
+year = "Run2024"
+
+[objects.clean_jet]
+source = "Jet"
+cuts = [
+  "pt > 10 GeV",
+  "jet_id_tight_run2024() == 1",
+]
+
+[[outputs]]
+name = "n_clean_jet"
+expr = "count(clean_jet)"
+"#,
+        )
+        .expect("parse jet-ID spec");
+        let plan = validate(&spec, &catalogue_v15()).expect("validate jet-ID spec");
+        let read_branches = plan
+            .read_branches
+            .specs()
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>();
+
+        for branch in [
+            "Jet_eta",
+            "Jet_chHEF",
+            "Jet_neHEF",
+            "Jet_neEmEF",
+            "Jet_chMultiplicity",
+            "Jet_neMultiplicity",
+        ] {
+            assert!(read_branches.contains(&branch));
+        }
+    }
+
+    #[test]
+    fn jet_veto_map_run2024_derives_formula_read_branches() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "jet_veto_2024"
+year = "Run2024"
+
+[objects.clean_jet]
+source = "Jet"
+cuts = [
+  "pt > 10 GeV",
+  "jet_veto_map_run2024() == 0",
+]
+
+[[outputs]]
+name = "n_clean_jet"
+expr = "count(clean_jet)"
+"#,
+        )
+        .expect("parse jet-veto spec");
+        let plan = validate(&spec, &catalogue_v15()).expect("validate jet-veto spec");
+        let read_branches = plan
+            .read_branches
+            .specs()
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(read_branches.contains(&"Jet_eta"));
+        assert!(read_branches.contains(&"Jet_phi"));
+        assert!(read_branches.contains(&"Jet_pt"));
+    }
+
+    #[test]
     fn parses_weight_systematic_surface() {
         let spec = AnalysisSpec::from_toml_str(include_str!(
             "../examples/muon_hist_weight_systematic.toml"
@@ -5039,6 +7763,87 @@ mod tests {
             Some(("scale_factors", "nominal", "systup", "systdown"))
         );
         assert!(spec.has_weight_systematic());
+    }
+
+    #[test]
+    fn validates_jec_nominal_virtual_object_attribute() {
+        let spec =
+            AnalysisSpec::from_toml_str(JEC_NOMINAL_SPEC_TOML).expect("parse JEC nominal spec");
+
+        assert_eq!(spec.object_corrections.len(), 1);
+        let correction = &spec.object_corrections[0];
+        assert_eq!(correction.name, "jet_pt_jec");
+        assert_eq!(correction.collection, "good_jet");
+        assert_eq!(correction.attr, "ptJec");
+        assert_eq!(correction.source_attr, "pt");
+
+        let plan = validate(&spec, &catalogue_v15()).expect("validate JEC nominal spec");
+        let read_branches = plan
+            .read_branches
+            .specs()
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>();
+
+        for branch in [
+            "nJet",
+            "Jet_area",
+            "Jet_eta",
+            "Jet_phi",
+            "Jet_pt",
+            "Jet_rawFactor",
+            "Rho_fixedGridRhoFastjetAll",
+        ] {
+            assert!(
+                read_branches.contains(&branch),
+                "missing required branch {branch}"
+            );
+        }
+        assert!(!read_branches.contains(&"Jet_ptJec"));
+    }
+
+    #[test]
+    fn validates_jer_nominal_virtual_object_attribute() {
+        let spec =
+            AnalysisSpec::from_toml_str(JER_NOMINAL_SPEC_TOML).expect("parse JER nominal spec");
+
+        assert_eq!(spec.object_corrections.len(), 2);
+        let correction = &spec.object_corrections[1];
+        assert_eq!(correction.name, "jet_pt_def");
+        assert_eq!(correction.collection, "good_jet");
+        assert_eq!(correction.attr, "ptDef");
+        assert_eq!(correction.source_attr, "ptJec");
+
+        let plan = validate(&spec, &catalogue_v15()).expect("validate JER nominal spec");
+        let read_branches = plan
+            .read_branches
+            .specs()
+            .iter()
+            .map(|branch| (branch.name.as_str(), branch.branch_type))
+            .collect::<Vec<_>>();
+
+        for (branch, branch_type) in [
+            ("nJet", BranchType::I32),
+            ("Jet_area", BranchType::VecF32),
+            ("Jet_eta", BranchType::VecF32),
+            ("Jet_genJetIdx", BranchType::VecI16),
+            ("Jet_phi", BranchType::VecF32),
+            ("Jet_pt", BranchType::VecF32),
+            ("Jet_rawFactor", BranchType::VecF32),
+            ("GenJet_pt", BranchType::VecF32),
+            ("Rho_fixedGridRhoFastjetAll", BranchType::F32),
+        ] {
+            assert!(
+                read_branches.contains(&(branch, branch_type)),
+                "missing required branch {branch}"
+            );
+        }
+        assert!(!read_branches
+            .iter()
+            .any(|(branch, _)| *branch == "Jet_ptJec"));
+        assert!(!read_branches
+            .iter()
+            .any(|(branch, _)| *branch == "Jet_ptDef"));
     }
 
     #[test]
@@ -5321,9 +8126,9 @@ object good_muon : Muon {}
 "#,
         )
         .expect_err("bad correction kind should fail");
-        assert!(bad_kind
-            .to_string()
-            .contains("unsupported kind `shift`; expected `scale`"));
+        assert!(bad_kind.to_string().contains(
+            "unsupported kind `shift`; expected `jec_nominal`, `jer_nominal`, `scale`, `jes`, or `scale_factor`"
+        ));
 
         let missing_up = AnalysisSpec::from_adl_str(
             r#"
@@ -5707,7 +8512,9 @@ expr = "z_mu_remaining.mass"
         assert!(errors.iter().any(|error| matches!(
             error,
             SpecError::InvalidExpression { detail, .. }
-                if detail.contains("supported attributes are `mass` and `pt`")
+                if detail.contains("supported attributes are `mass`, `pt`, `eta`, `phi`")
+                    && detail.contains("`leading_phi`, `subleading_phi`")
+                    && detail.contains("`leading_mass`, and `subleading_mass`")
         )));
     }
 
@@ -5738,6 +8545,89 @@ expr = "z_mu_remaining.mass"
         assert_eq!(spec.models[0].output, "Muon_topscore");
         assert_eq!(spec.models[0].output_dtype, ModelOutputDType::F32);
         assert_eq!(spec.models[0].provider.kind, ModelProviderKind::Mock);
+    }
+
+    #[test]
+    fn parses_output_dtype_overrides() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "dtype_demo"
+year = "Run2024"
+
+[[outputs]]
+name = "eventNum"
+expr = "event"
+dtype = "U64"
+
+[[outputs]]
+name = "mllZDef"
+expr = "1.0"
+dtype = "F64"
+"#,
+        )
+        .expect("parse output dtype spec");
+
+        assert_eq!(spec.outputs[0].dtype, Some(OutputDType::U64));
+        assert_eq!(spec.outputs[1].dtype, Some(OutputDType::F64));
+
+        let error = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "bad_dtype_demo"
+year = "Run2024"
+
+[[outputs]]
+name = "bad"
+expr = "1.0"
+dtype = "F16"
+"#,
+        )
+        .expect_err("invalid output dtype should fail");
+
+        assert!(matches!(
+            error,
+            ParseError::InvalidSpec(message)
+                if message.contains("unsupported dtype `F16`")
+        ));
+    }
+
+    #[test]
+    fn parses_validation_compare_policy() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "validation_policy"
+year = "Run2024"
+
+[validation.compare]
+tree = "Events"
+rtol = 1e-5
+atol = 1e-4
+
+[[validation.compare.branch_tolerance]]
+branch = "ptlWDef"
+rtol = 0.0
+atol = 1.0
+reason = "legacy stochastic muon correction"
+"#,
+        )
+        .expect("parse validation policy spec");
+
+        let compare = spec
+            .validation
+            .as_ref()
+            .and_then(|validation| validation.compare.as_ref())
+            .expect("validation compare policy");
+        assert_eq!(compare.tree.as_deref(), Some("Events"));
+        assert_eq!(compare.rtol, Some(1e-5));
+        assert_eq!(compare.atol, Some(1e-4));
+        assert_eq!(compare.branch_tolerances.len(), 1);
+        assert_eq!(compare.branch_tolerances[0].branch, "ptlWDef");
+        assert_eq!(
+            compare.branch_tolerances[0].reason.as_deref(),
+            Some("legacy stochastic muon correction")
+        );
     }
 
     #[test]

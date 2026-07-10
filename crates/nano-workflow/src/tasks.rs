@@ -9,6 +9,7 @@ use nano_producers::{MuonProducer, MuonSkimRow};
 use crate::artifacts::{ChunkSpec, Cutflow, EntryRange, MergedOutput, PartialOutput};
 use crate::error::{Result, WorkflowError};
 use crate::planner::Kernel;
+use crate::sources::{is_http_source, is_xrootd_source};
 
 #[derive(Clone)]
 pub struct KernelBinding {
@@ -131,7 +132,13 @@ pub fn run_chunk_with_kernel(
     chunk_size: usize,
     kernel: &Kernel,
 ) -> Result<PartialOutput> {
-    if is_http_url(&chunk.source) {
+    if is_xrootd_source(&chunk.source) {
+        return Err(WorkflowError::UnsupportedSource(format!(
+            "XRootD source `{}` is not implemented in nano.rust; use a local ROOT path or an HTTP(S) byte-range source",
+            chunk.source
+        )));
+    }
+    if is_http_source(&chunk.source) {
         run_remote_chunk(chunk, schema, chunk_size, kernel)
     } else {
         let iterator =
@@ -236,8 +243,4 @@ where
 {
     let bytes = fs::read(path)?;
     Ok(serde_json::from_slice(&bytes)?)
-}
-
-fn is_http_url(source: &str) -> bool {
-    source.starts_with("http://") || source.starts_with("https://")
 }

@@ -573,6 +573,7 @@ pub fn generated_scale_factor_specs() -> Vec<GeneratedSpec> {
                     objects: vec![ObjectDef {
                         name: collection.clone(),
                         source: template.source.to_string(),
+                        kinematics: Default::default(),
                         cuts,
                     }],
                     derived_objects: Vec::new(),
@@ -601,6 +602,7 @@ pub fn generated_scale_factor_specs() -> Vec<GeneratedSpec> {
                         },
                     },
                     systematics: vec![SystematicDef::Nominal],
+                    object_corrections: Vec::new(),
                     shape_corrections: Vec::new(),
                     scale_factor_corrections: vec![scale_factor_correction(
                         &format!("sf_weight_{index:03}"),
@@ -658,6 +660,7 @@ pub fn generated_jes_specs() -> Vec<GeneratedSpec> {
                     objects: vec![ObjectDef {
                         name: collection.clone(),
                         source: "Jet".to_string(),
+                        kinematics: Default::default(),
                         cuts: vec![
                             Cut {
                                 lhs: Expr::Attr {
@@ -697,6 +700,7 @@ pub fn generated_jes_specs() -> Vec<GeneratedSpec> {
                     }],
                     weight: WeightDef::default(),
                     systematics: vec![SystematicDef::Nominal],
+                    object_corrections: Vec::new(),
                     shape_corrections: vec![jes_correction(
                         &format!("jes_total_{index:03}"),
                         &collection,
@@ -757,6 +761,7 @@ pub fn generated_lumi_mask_specs() -> Vec<GeneratedSpec> {
                     objects: vec![ObjectDef {
                         name: "lumi_muon".to_string(),
                         source: "Muon".to_string(),
+                        kinematics: Default::default(),
                         cuts: vec![Cut {
                             lhs: Expr::Attr {
                                 object: "lumi_muon".to_string(),
@@ -779,6 +784,7 @@ pub fn generated_lumi_mask_specs() -> Vec<GeneratedSpec> {
                     histograms: Vec::new(),
                     weight: WeightDef::default(),
                     systematics: vec![SystematicDef::Nominal],
+                    object_corrections: Vec::new(),
                     shape_corrections: Vec::new(),
                     scale_factor_corrections: Vec::new(),
                     channels: Vec::new(),
@@ -821,6 +827,7 @@ pub fn generated_combined_real_specs() -> Vec<GeneratedSpec> {
                         ObjectDef {
                             name: "combo_muon".to_string(),
                             source: "Muon".to_string(),
+                            kinematics: Default::default(),
                             cuts: vec![
                                 Cut {
                                     lhs: Expr::Attr {
@@ -843,6 +850,7 @@ pub fn generated_combined_real_specs() -> Vec<GeneratedSpec> {
                         ObjectDef {
                             name: "combo_jet".to_string(),
                             source: "Jet".to_string(),
+                            kinematics: Default::default(),
                             cuts: vec![
                                 Cut {
                                     lhs: Expr::Attr {
@@ -905,6 +913,7 @@ pub fn generated_combined_real_specs() -> Vec<GeneratedSpec> {
                         nominal: vec![round(rng.f64(0.8, 1.2))],
                     },
                     systematics: vec![SystematicDef::Nominal],
+                    object_corrections: Vec::new(),
                     shape_corrections: vec![jes_correction(
                         &format!("combo_jes_{index:03}"),
                         "combo_jet",
@@ -1012,6 +1021,7 @@ fn generated_union_spec(index: usize) -> GeneratedSpec {
             }],
             weight: WeightDef::default(),
             systematics: vec![SystematicDef::Nominal],
+            object_corrections: Vec::new(),
             shape_corrections: Vec::new(),
             scale_factor_corrections: Vec::new(),
             channels,
@@ -1031,6 +1041,7 @@ fn union_channel(name: &str, source: &str, pt_threshold: f64) -> ChannelDef {
         objects: vec![ObjectDef {
             name: "probe".to_string(),
             source: source.to_string(),
+            kinematics: Default::default(),
             cuts: vec![Cut {
                 lhs: Expr::Attr {
                     object: "probe".to_string(),
@@ -1058,6 +1069,7 @@ fn generated_standard_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec 
         .map(|object| ObjectDef {
             name: object.name.to_string(),
             source: object.source.to_string(),
+            kinematics: Default::default(),
             cuts: object_cuts(object, rng),
         })
         .collect::<Vec<_>>();
@@ -1190,6 +1202,7 @@ fn generated_standard_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec 
             histograms,
             weight,
             systematics,
+            object_corrections: Vec::new(),
             shape_corrections,
             scale_factor_corrections: Vec::new(),
             channels: Vec::new(),
@@ -1233,6 +1246,7 @@ fn generated_model_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
     let selected = ObjectDef {
         name: target.selected.to_string(),
         source: target.source.to_string(),
+        kinematics: Default::default(),
         cuts: object_cuts(
             &ObjectTemplate {
                 name: target.selected,
@@ -1245,6 +1259,7 @@ fn generated_model_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
     let tagged = ObjectDef {
         name: target.tagged.to_string(),
         source: target.source.to_string(),
+        kinematics: Default::default(),
         cuts: vec![
             Cut {
                 lhs: Expr::Attr {
@@ -1334,6 +1349,7 @@ fn generated_model_spec(index: usize, rng: &mut SplitMix64) -> GeneratedSpec {
             histograms: Vec::new(),
             weight: WeightDef::default(),
             systematics: vec![SystematicDef::Nominal],
+            object_corrections: Vec::new(),
             shape_corrections: Vec::new(),
             scale_factor_corrections: Vec::new(),
             channels: Vec::new(),

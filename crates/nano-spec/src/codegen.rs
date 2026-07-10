@@ -14,8 +14,10 @@ use nano_core::BranchType;
 use crate::kir::{ForEachAxis, KirProgram, Rvalue, Stmt, ValueId};
 use crate::{
     AnalysisSpec, ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef,
-    ModelProviderKind, ObjectCandidateDef, ObjectDef, ObjectPairDef, PairConstraint, PairSelection,
-    ResolvedPlan, ScaleFactorInputSource, ScaleFactorLiteral, ShapeCorrectionPayload,
+    ModelProviderKind, ObjectCandidateDef, ObjectDef, ObjectPairDef, PairConstituentRank,
+    PairConstraint, PairSelection, ResolvedPlan, ScaleFactorInputSource, ScaleFactorLiteral,
+    ShapeCorrectionPayload, JET_ID_TIGHT_RUN2024_ATTRS, JET_VETO_MAP_RUN2024_ATTRS,
+    MET_TYPE1_JET_ATTRS,
 };
 
 /// Generate compilable Rust producer source from a validated plan.
@@ -70,6 +72,11 @@ enum GeneratedSystematicSource {
 
 impl<'a> Generator<'a> {
     fn generate(&self) -> Result<String, CodegenError> {
+        if self.spec().has_object_correction() {
+            return Err(CodegenError::UnsupportedFeature(
+                "nominal object corrections are currently supported by the interpreter, not generated producers".to_string(),
+            ));
+        }
         if !self.spec().channels.is_empty() {
             return self.generate_union();
         }
@@ -357,6 +364,7 @@ impl<'a> Generator<'a> {
                         let object = ObjectDef {
                             name: object.name.clone(),
                             source: object.source.clone(),
+                            kinematics: object.kinematics.clone(),
                             cuts: object.cuts.clone(),
                         };
                         self.emit_object_selection(source, &object, error_mapper)?;
@@ -370,27 +378,11 @@ impl<'a> Generator<'a> {
                         }
                     },
                     Rvalue::Requirement { requirement } => {
-                        let condition = if let Expr::EventScalar(branch) = &requirement.lhs {
-                            let ident = format!("event_scalar_requirement_{}", value.id.0);
-                            writeln!(
-                                source,
-                                "        let {ident} = event.scalar::<bool>({})?;",
-                                rust_string(branch)
-                            )
-                            .unwrap();
-                            bool_comparison_expr(
-                                ident,
-                                requirement.op,
-                                requirement.rhs.value,
-                                "region requirement",
-                            )?
-                        } else {
-                            self.emit_region_requirement(
-                                &requirement.lhs,
-                                requirement.op,
-                                requirement.rhs.value,
-                            )?
-                        };
+                        let condition = self.emit_region_requirement(
+                            &requirement.lhs,
+                            requirement.op,
+                            requirement.rhs.value,
+                        )?;
                         requirement_conditions.insert(value.id, condition);
                     }
                     Rvalue::LumiMask { mask } => {
@@ -939,6 +931,12 @@ impl<'a> Generator<'a> {
         for output in &self.spec().outputs {
             checked_ident(&output.name, "output name")?;
             match &output.expr {
+                Expr::EventScalar(branch) => {
+                    self.require_event_scalar_branch(branch, "event scalar output")?;
+                }
+                Expr::Literal(_) | Expr::Binary { .. } | Expr::Abs(_) | Expr::Sqrt(_) => {
+                    self.validate_region_expr(&output.expr, "numeric output")?;
+                }
                 Expr::Count(object) => {
                     self.object(object)?;
                 }
@@ -955,12 +953,109 @@ impl<'a> Generator<'a> {
                 Expr::EitherPairPt { left, right, .. } => {
                     self.object(left)?;
                     self.object(right)?;
-                    self.require_f32_attr(left, "pt", "either_pair_pt output")?;
-                    self.require_f32_attr(right, "pt", "either_pair_pt output")?;
+                    self.require_f32_kinematic_attr(left, "pt", "either_pair_pt output")?;
+                    self.require_f32_kinematic_attr(right, "pt", "either_pair_pt output")?;
                 }
                 Expr::ClosestMass { left, right, .. } | Expr::OtherMass { left, right, .. } => {
                     self.validate_derived_attr(left, "mass", "mass-order output")?;
                     self.validate_derived_attr(right, "mass", "mass-order output")?;
+                }
+                Expr::ZepVv {
+                    system,
+                    met_pt,
+                    met_phi,
+                    dijet,
+                } => {
+                    self.validate_derived_attr(system, "eta", "zep_vv output")?;
+                    self.validate_derived_attr(dijet, "delta_eta", "zep_vv output")?;
+                    self.require_event_f32_branch(met_pt, "zep_vv output")?;
+                    self.require_event_f32_branch(met_phi, "zep_vv output")?;
+                }
+                Expr::SystemMetEta {
+                    system,
+                    met_pt,
+                    met_phi,
+                } => {
+                    self.validate_derived_attr(system, "eta", "system_met_eta output")?;
+                    self.require_event_f32_branch(met_pt, "system_met_eta output")?;
+                    self.require_event_f32_branch(met_phi, "system_met_eta output")?;
+                }
+                Expr::SystemMetPt {
+                    system,
+                    met_pt,
+                    met_phi,
+                } => {
+                    self.validate_derived_attr(system, "pt", "system_met_pt output")?;
+                    self.require_event_f32_branch(met_pt, "system_met_pt output")?;
+                    self.require_event_f32_branch(met_phi, "system_met_pt output")?;
+                }
+                Expr::SystemPairMetPt {
+                    system,
+                    met_pt,
+                    met_phi,
+                    pair,
+                } => {
+                    self.validate_derived_attr(system, "pt", "system_pair_met_pt output")?;
+                    self.validate_derived_attr(pair, "pt", "system_pair_met_pt output")?;
+                    self.require_event_f32_branch(met_pt, "system_pair_met_pt output")?;
+                    self.require_event_f32_branch(met_phi, "system_pair_met_pt output")?;
+                }
+                Expr::SystemPairPtBalance {
+                    system,
+                    met_pt,
+                    met_phi,
+                    pair,
+                } => {
+                    self.validate_derived_attr(system, "pt", "system_pair_pt_balance output")?;
+                    self.validate_derived_attr(pair, "pt", "system_pair_pt_balance output")?;
+                    self.require_event_f32_branch(met_pt, "system_pair_pt_balance output")?;
+                    self.require_event_f32_branch(met_phi, "system_pair_pt_balance output")?;
+                }
+                Expr::MetType1Pt {
+                    jets,
+                    met_pt,
+                    met_phi,
+                    nominal_pt,
+                    shifted_pt,
+                }
+                | Expr::MetType1Phi {
+                    jets,
+                    met_pt,
+                    met_phi,
+                    nominal_pt,
+                    shifted_pt,
+                } => {
+                    self.validate_met_type1(
+                        jets,
+                        met_pt,
+                        met_phi,
+                        nominal_pt,
+                        shifted_pt,
+                        "met_type1 output",
+                    )?;
+                }
+                Expr::SystemDeltaPhi { left, right } => {
+                    self.validate_derived_attr(left, "phi", "system_delta_phi output")?;
+                    self.validate_derived_attr(right, "phi", "system_delta_phi output")?;
+                }
+                Expr::LegacyLeptonRpt {
+                    muons,
+                    electrons,
+                    dijet,
+                } => {
+                    self.object(muons)?;
+                    self.object(electrons)?;
+                    self.require_f32_kinematic_attr(muons, "pt", "legacy_lepton_rpt output")?;
+                    self.require_f32_kinematic_attr(electrons, "pt", "legacy_lepton_rpt output")?;
+                    self.validate_derived_attr(dijet, "leading_pt", "legacy_lepton_rpt output")?;
+                    self.validate_derived_attr(dijet, "subleading_pt", "legacy_lepton_rpt output")?;
+                }
+                Expr::PairConstituentAttr { pair, attr, .. } => {
+                    self.validate_pair_constituent_attr(pair, attr, "pair constituent output")?;
+                }
+                Expr::ZepMax { system, dijet } => {
+                    self.validate_derived_attr(system, "eta", "zep_max output")?;
+                    self.validate_derived_attr(dijet, "delta_eta", "zep_max output")?;
                 }
                 Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
                     self.validate_derived_attr(object, attr, "derived output")?;
@@ -1918,7 +2013,7 @@ impl<'a> Generator<'a> {
                 .unwrap();
                 writeln!(
                     expr,
-                    "                let {correction_ident} = {set_ident}.correction({}).map_err({correction_mapper})?;",
+                    "                let {correction_ident} = {set_ident}.correction_ref({}).map_err({correction_mapper})?;",
                     rust_string(payload_name)
                 )
                 .unwrap();
@@ -1931,7 +2026,7 @@ impl<'a> Generator<'a> {
                 writeln!(expr, "                ];").unwrap();
                 writeln!(
                     expr,
-                    "                let {uncertainty_ident} = {correction_ident}.evaluate(&{values_ident}).map_err({correction_mapper})?;"
+                    "                let {uncertainty_ident} = {correction_ident}.evaluate(&{set_ident}, &{values_ident}).map_err({correction_mapper})?;"
                 )
                 .unwrap();
                 writeln!(expr, "                match systematic {{").unwrap();
@@ -2145,9 +2240,11 @@ impl<'a> Generator<'a> {
         } else {
             conditions.join(" && ")
         };
+        let predicate_ident = format!("{event_ident}_predicate");
+        writeln!(source, "        let {predicate_ident} = {predicate};").unwrap();
         writeln!(
             source,
-            "        let Some({event_ident}_event) = {baseline_ident}.select::<{type_ident}>(|_| {predicate}) else {{"
+            "        let Some({event_ident}_event) = {baseline_ident}.select::<{type_ident}>(|_| {predicate_ident}) else {{"
         )
         .unwrap();
         writeln!(source, "            return Ok(None);").unwrap();
@@ -2172,13 +2269,29 @@ impl<'a> Generator<'a> {
         };
         let attrs = self.attrs_needed_for_object(&object.name)?;
         let selected_attrs = self.selected_attrs_for_object(&object.name)?;
+        let p4_components = self.object_required_kinematic_components(&object.name);
+        let needs_p4 = !p4_components.is_empty();
         let selected_type = selected_type_ident(&object.name)?;
         let selected_ident = selected_objects_ident(&object.name)?;
 
-        if !selected_attrs.is_empty() {
+        if needs_p4 || !selected_attrs.is_empty() {
             writeln!(source, "        #[derive(Debug, Clone, Copy)]").unwrap();
             writeln!(source, "        struct {selected_type} {{").unwrap();
             writeln!(source, "            source_index: usize,").unwrap();
+            if needs_p4 {
+                if p4_components.contains("pt") {
+                    writeln!(source, "            p4_pt: f32,").unwrap();
+                }
+                if p4_components.contains("eta") {
+                    writeln!(source, "            p4_eta: f32,").unwrap();
+                }
+                if p4_components.contains("phi") {
+                    writeln!(source, "            p4_phi: f32,").unwrap();
+                }
+                if p4_components.contains("mass") {
+                    writeln!(source, "            p4_mass: f32,").unwrap();
+                }
+            }
             for attr in &selected_attrs {
                 writeln!(
                     source,
@@ -2271,7 +2384,7 @@ impl<'a> Generator<'a> {
             object
                 .cuts
                 .iter()
-                .map(|cut| self.emit_cut(object, cut))
+                .map(|cut| self.emit_cut(object, cut, &item_ident))
                 .collect::<Result<Vec<_>, _>>()?
                 .join(" && ")
         };
@@ -2298,7 +2411,7 @@ impl<'a> Generator<'a> {
                 }
             }
         }
-        if !selected_attrs.is_empty() {
+        if needs_p4 || !selected_attrs.is_empty() {
             writeln!(
                 source,
                 "                {selected_ident}.push({selected_type} {{"
@@ -2309,6 +2422,40 @@ impl<'a> Generator<'a> {
                 "                    source_index: {item_ident}.index(),"
             )
             .unwrap();
+            if needs_p4 {
+                if p4_components.contains("pt") {
+                    writeln!(
+                        source,
+                        "                    p4_pt: {},",
+                        attr_ident(&object.name, &object.kinematics.pt)?
+                    )
+                    .unwrap();
+                }
+                if p4_components.contains("eta") {
+                    writeln!(
+                        source,
+                        "                    p4_eta: {},",
+                        attr_ident(&object.name, &object.kinematics.eta)?
+                    )
+                    .unwrap();
+                }
+                if p4_components.contains("phi") {
+                    writeln!(
+                        source,
+                        "                    p4_phi: {},",
+                        attr_ident(&object.name, &object.kinematics.phi)?
+                    )
+                    .unwrap();
+                }
+                if p4_components.contains("mass") {
+                    writeln!(
+                        source,
+                        "                    p4_mass: {},",
+                        attr_ident(&object.name, &object.kinematics.mass)?
+                    )
+                    .unwrap();
+                }
+            }
             for attr in &selected_attrs {
                 let attr_ident = attr_ident(&object.name, attr)?;
                 writeln!(
@@ -2348,16 +2495,30 @@ impl<'a> Generator<'a> {
                 attrs.insert(correction.attr.clone());
             }
         }
+        let p4_components = self.object_required_kinematic_components(object_name);
+        if !p4_components.is_empty() {
+            for (component, attr) in object.kinematics.component_attrs() {
+                if p4_components.contains(component) {
+                    attrs.insert(attr.to_string());
+                }
+            }
+        }
         for cut in &object.cuts {
             collect_attr_names_for_current_object(&cut.lhs, object_name, &mut attrs)?;
         }
         for region in &self.spec().regions {
             for requirement in &region.require {
                 collect_selected_attr_names(&requirement.lhs, object_name, &mut attrs)?;
+                self.collect_pair_constituent_attr_names(
+                    &requirement.lhs,
+                    object_name,
+                    &mut attrs,
+                )?;
             }
         }
         for output in &self.spec().outputs {
             collect_selected_attr_names(&output.expr, object_name, &mut attrs)?;
+            self.collect_pair_constituent_attr_names(&output.expr, object_name, &mut attrs)?;
         }
         for output in &self.spec().outputs {
             if let Expr::LeadingAttr { object, attr } = &output.expr {
@@ -2383,11 +2544,49 @@ impl<'a> Generator<'a> {
         Ok(attrs)
     }
 
+    fn object_required_kinematic_components(&self, object_name: &str) -> BTreeSet<&'static str> {
+        let mut components = BTreeSet::new();
+        for derived in &self.spec().derived_objects {
+            match &derived.source {
+                DerivedSource::Pair(pair) if pair.object == object_name => {
+                    components.extend(["pt", "eta", "phi", "mass"]);
+                }
+                DerivedSource::Candidate(candidate)
+                    if candidate.items.iter().any(|item| item == object_name) =>
+                {
+                    components.extend(["pt", "eta", "phi", "mass"]);
+                }
+                _ => {}
+            }
+        }
+        for requirement in self
+            .spec()
+            .regions
+            .iter()
+            .flat_map(|region| region.require.iter())
+        {
+            collect_expr_required_kinematic_components(
+                &requirement.lhs,
+                object_name,
+                &mut components,
+            );
+        }
+        for output in &self.spec().outputs {
+            collect_expr_required_kinematic_components(&output.expr, object_name, &mut components);
+        }
+        components
+    }
+
     fn selected_attrs_for_object(
         &self,
         object_name: &str,
     ) -> Result<BTreeSet<String>, CodegenError> {
         let mut attrs = BTreeSet::new();
+        for object in &self.spec().objects {
+            for cut in &object.cuts {
+                collect_selected_attr_names(&cut.lhs, object_name, &mut attrs)?;
+            }
+        }
         for region in &self.spec().regions {
             for requirement in &region.require {
                 collect_selected_attr_names(&requirement.lhs, object_name, &mut attrs)?;
@@ -2416,10 +2615,9 @@ impl<'a> Generator<'a> {
                         continue;
                     }
 
-                    attrs.insert("pt".to_string());
-                    attrs.insert("eta".to_string());
-                    attrs.insert("phi".to_string());
-                    attrs.insert("mass".to_string());
+                    for (_, attr) in object.kinematics.component_attrs() {
+                        attrs.insert(attr.to_string());
+                    }
                     for constraint in &pair.constraints {
                         if matches!(constraint, PairConstraint::OppositeCharge) {
                             attrs.insert("charge".to_string());
@@ -2431,10 +2629,9 @@ impl<'a> Generator<'a> {
                 }
                 DerivedSource::Candidate(candidate) => {
                     if candidate.items.iter().any(|item| item == object_name) {
-                        attrs.insert("pt".to_string());
-                        attrs.insert("eta".to_string());
-                        attrs.insert("phi".to_string());
-                        attrs.insert("mass".to_string());
+                        for (_, attr) in object.kinematics.component_attrs() {
+                            attrs.insert(attr.to_string());
+                        }
                         for filter in &candidate.filters {
                             collect_candidate_filter_attr_names(&filter.lhs, &mut attrs);
                         }
@@ -2443,6 +2640,62 @@ impl<'a> Generator<'a> {
             }
         }
         Ok(attrs)
+    }
+
+    fn collect_pair_constituent_attr_names(
+        &self,
+        expr: &Expr,
+        object_name: &str,
+        attrs: &mut BTreeSet<String>,
+    ) -> Result<(), CodegenError> {
+        match expr {
+            Expr::PairConstituentAttr { pair, attr, .. } => {
+                let derived = self.derived_object(pair)?;
+                let DerivedSource::Pair(pair_def) = &derived.source else {
+                    return Err(CodegenError::UnsupportedFeature(format!(
+                        "derived object `{pair}` is not a pair"
+                    )));
+                };
+                if pair_def.object == object_name {
+                    attrs.insert(attr.clone());
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.collect_pair_constituent_attr_names(lhs, object_name, attrs)?;
+                self.collect_pair_constituent_attr_names(rhs, object_name, attrs)?;
+            }
+            Expr::Abs(inner) | Expr::Sqrt(inner) => {
+                self.collect_pair_constituent_attr_names(inner, object_name, attrs)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn emit_constituent_values_binding(
+        &self,
+        source: &mut String,
+        binding: &str,
+        object_name: &str,
+        item_expr: &str,
+    ) -> Result<(), CodegenError> {
+        let attrs = self.selected_attrs_for_object(object_name)?;
+        writeln!(
+            source,
+            "                let {binding} = Box::leak(Box::new(["
+        )
+        .unwrap();
+        for attr in attrs {
+            let attr_field = checked_ident(&attr, "constituent attribute")?;
+            writeln!(
+                source,
+                "                    ({}, {item_expr}.{attr_field} as f64),",
+                rust_string(&attr)
+            )
+            .unwrap();
+        }
+        writeln!(source, "                ]));").unwrap();
+        Ok(())
     }
 
     fn emit_derived_row_structs(&self, source: &mut String) -> Result<(), CodegenError> {
@@ -2456,7 +2709,19 @@ impl<'a> Generator<'a> {
             writeln!(source, "struct {type_ident} {{").unwrap();
             writeln!(source, "    mass: f64,").unwrap();
             writeln!(source, "    pt: f64,").unwrap();
+            writeln!(source, "    eta: f64,").unwrap();
+            writeln!(source, "    phi: f64,").unwrap();
             writeln!(source, "    min_delta_r: f64,").unwrap();
+            writeln!(source, "    delta_eta: f64,").unwrap();
+            writeln!(source, "    delta_phi: f64,").unwrap();
+            writeln!(source, "    leading_pt: f64,").unwrap();
+            writeln!(source, "    subleading_pt: f64,").unwrap();
+            writeln!(source, "    leading_eta: f64,").unwrap();
+            writeln!(source, "    subleading_eta: f64,").unwrap();
+            writeln!(source, "    leading_phi: f64,").unwrap();
+            writeln!(source, "    subleading_phi: f64,").unwrap();
+            writeln!(source, "    leading_mass: f64,").unwrap();
+            writeln!(source, "    subleading_mass: f64,").unwrap();
             writeln!(source, "    energy: f64,").unwrap();
             writeln!(source, "    px: f64,").unwrap();
             writeln!(source, "    py: f64,").unwrap();
@@ -2480,6 +2745,8 @@ impl<'a> Generator<'a> {
         writeln!(source, "    pt: f32,").unwrap();
         writeln!(source, "    eta: f32,").unwrap();
         writeln!(source, "    phi: f32,").unwrap();
+        writeln!(source, "    mass: f32,").unwrap();
+        writeln!(source, "    values: &'static [(&'static str, f64)],").unwrap();
         writeln!(source, "}}").unwrap();
         writeln!(source).unwrap();
         writeln!(
@@ -2519,6 +2786,25 @@ impl<'a> Generator<'a> {
         writeln!(source).unwrap();
         writeln!(
             source,
+            "fn gen_vector_eta(px: f64, py: f64, pz: f64) -> f64 {{"
+        )
+        .unwrap();
+        writeln!(source, "    let pt = px.hypot(py);").unwrap();
+        writeln!(source, "    let momentum = pt.hypot(pz);").unwrap();
+        writeln!(source, "    let denominator = momentum - pz;").unwrap();
+        writeln!(
+            source,
+            "    if denominator <= 0.0 {{ 0.0 }} else {{ 0.5 * ((momentum + pz) / denominator).ln() }}"
+        )
+        .unwrap();
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
+        writeln!(source, "fn gen_vector_phi(px: f64, py: f64) -> f64 {{").unwrap();
+        writeln!(source, "    py.atan2(px)").unwrap();
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
+        writeln!(
+            source,
             "fn gen_delta_r(left_eta: f32, left_phi: f32, right_eta: f32, right_phi: f32) -> f64 {{"
         )
         .unwrap();
@@ -2543,6 +2829,76 @@ impl<'a> Generator<'a> {
         )
         .unwrap();
         writeln!(source, "    (deta * deta + dphi * dphi).sqrt()").unwrap();
+        writeln!(source, "}}").unwrap();
+        writeln!(source).unwrap();
+        writeln!(
+            source,
+            "fn gen_constituent_geometry(items: &[GenConstituent]) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) {{"
+        )
+        .unwrap();
+        writeln!(source, "    let mut ordered = items.to_vec();").unwrap();
+        writeln!(
+            source,
+            "    ordered.sort_by(|left, right| right.pt.total_cmp(&left.pt));"
+        )
+        .unwrap();
+        writeln!(source, "    let leading = ordered.first();").unwrap();
+        writeln!(source, "    let subleading = ordered.get(1);").unwrap();
+        writeln!(
+            source,
+            "    let leading_pt = leading.map(|item| f64::from(item.pt)).unwrap_or(0.0);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    let subleading_pt = subleading.map(|item| f64::from(item.pt)).unwrap_or(0.0);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    let leading_eta = leading.map(|item| f64::from(item.eta)).unwrap_or(0.0);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    let subleading_eta = subleading.map(|item| f64::from(item.eta)).unwrap_or(0.0);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    let leading_phi = leading.map(|item| f64::from(item.phi)).unwrap_or(0.0);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    let subleading_phi = subleading.map(|item| f64::from(item.phi)).unwrap_or(0.0);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    let leading_mass = leading.map(|item| f64::from(item.mass)).unwrap_or(0.0);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    let subleading_mass = subleading.map(|item| f64::from(item.mass)).unwrap_or(0.0);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    let delta_eta = leading.zip(subleading).map(|(left, right)| (f64::from(left.eta) - f64::from(right.eta)).abs()).unwrap_or(0.0);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    let delta_phi = leading.zip(subleading).map(|(left, right)| {{ let mut dphi = f64::from(left.phi) - f64::from(right.phi); while dphi > std::f64::consts::PI {{ dphi -= 2.0 * std::f64::consts::PI; }} while dphi <= -std::f64::consts::PI {{ dphi += 2.0 * std::f64::consts::PI; }} dphi.abs() }}).unwrap_or(0.0);"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "    (delta_eta, delta_phi, leading_pt, subleading_pt, leading_eta, subleading_eta, leading_phi, subleading_phi, leading_mass, subleading_mass, gen_candidate_min_delta_r(items))"
+        )
+        .unwrap();
         writeln!(source, "}}").unwrap();
         writeln!(source).unwrap();
         writeln!(
@@ -2657,7 +3013,7 @@ impl<'a> Generator<'a> {
             .unwrap();
             writeln!(
                 source,
-                "        {order_ident}.sort_by(|&left, &right| {selected_ident}[right].pt.total_cmp(&{selected_ident}[left].pt));"
+                "        {order_ident}.sort_by(|&left, &right| {selected_ident}[right].p4_pt.total_cmp(&{selected_ident}[left].p4_pt));"
             )
             .unwrap();
         } else {
@@ -2753,12 +3109,12 @@ impl<'a> Generator<'a> {
 
         writeln!(
             source,
-            "                let (e1, px1, py1, pz1) = gen_four_vector(first.pt, first.eta, first.phi, first.mass);"
+            "                let (e1, px1, py1, pz1) = gen_four_vector(first.p4_pt, first.p4_eta, first.p4_phi, first.p4_mass);"
         )
         .unwrap();
         writeln!(
             source,
-            "                let (e2, px2, py2, pz2) = gen_four_vector(second.pt, second.eta, second.phi, second.mass);"
+            "                let (e2, px2, py2, pz2) = gen_four_vector(second.p4_pt, second.p4_eta, second.p4_phi, second.p4_mass);"
         )
         .unwrap();
         writeln!(source, "                let energy = e1 + e2;").unwrap();
@@ -2777,6 +3133,8 @@ impl<'a> Generator<'a> {
         .unwrap();
         writeln!(source, "                    continue;").unwrap();
         writeln!(source, "                }}").unwrap();
+        self.emit_constituent_values_binding(source, "first_values", &pair.object, "first")?;
+        self.emit_constituent_values_binding(source, "second_values", &pair.object, "second")?;
         writeln!(
             source,
             "                let constituents = Box::leak(Box::new(["
@@ -2784,25 +3142,25 @@ impl<'a> Generator<'a> {
         .unwrap();
         writeln!(
             source,
-            "                    GenConstituent {{ object: {}, index: first.source_index, pt: first.pt, eta: first.eta, phi: first.phi }},",
+            "                    GenConstituent {{ object: {}, index: first.source_index, pt: first.p4_pt, eta: first.p4_eta, phi: first.p4_phi, mass: first.p4_mass, values: first_values }},",
             rust_string(&pair.object)
         )
         .unwrap();
         writeln!(
             source,
-            "                    GenConstituent {{ object: {}, index: second.source_index, pt: second.pt, eta: second.eta, phi: second.phi }},",
+            "                    GenConstituent {{ object: {}, index: second.source_index, pt: second.p4_pt, eta: second.p4_eta, phi: second.p4_phi, mass: second.p4_mass, values: second_values }},",
             rust_string(&pair.object)
         )
         .unwrap();
         writeln!(source, "                ]));").unwrap();
         writeln!(
             source,
-            "                let min_delta_r = gen_delta_r(first.eta, first.phi, second.eta, second.phi);"
+            "                let (delta_eta, delta_phi, leading_pt, subleading_pt, leading_eta, subleading_eta, leading_phi, subleading_phi, leading_mass, subleading_mass, min_delta_r) = gen_constituent_geometry(constituents);"
         )
         .unwrap();
         writeln!(
             source,
-            "                let candidate = {derived_type} {{ mass, pt, min_delta_r, energy, px, py, pz, constituents }};"
+            "                let candidate = {derived_type} {{ mass, pt, eta: gen_vector_eta(px, py, pz), phi: gen_vector_phi(px, py), min_delta_r, delta_eta, delta_phi, leading_pt, subleading_pt, leading_eta, subleading_eta, leading_phi, subleading_phi, leading_mass, subleading_mass, energy, px, py, pz, constituents }};"
         )
         .unwrap();
         match (target, truncated_target) {
@@ -2861,11 +3219,11 @@ impl<'a> Generator<'a> {
 
     fn emit_pair_filter_expr(&self, expr: &Expr) -> Result<String, CodegenError> {
         match expr {
-            Expr::PairDeltaR => {
-                Ok("gen_delta_r(first.eta, first.phi, second.eta, second.phi)".to_string())
-            }
-            Expr::PairLeadingPt => Ok("first.pt.max(second.pt)".to_string()),
-            Expr::PairSubleadingPt => Ok("first.pt.min(second.pt)".to_string()),
+            Expr::PairDeltaR => Ok(
+                "gen_delta_r(first.p4_eta, first.p4_phi, second.p4_eta, second.p4_phi)".to_string(),
+            ),
+            Expr::PairLeadingPt => Ok("first.p4_pt.max(second.p4_pt)".to_string()),
+            Expr::PairSubleadingPt => Ok("first.p4_pt.min(second.p4_pt)".to_string()),
             other => Err(CodegenError::UnsupportedFeature(format!(
                 "pair filter expression `{other}` is not supported by codegen"
             ))),
@@ -2917,16 +3275,22 @@ impl<'a> Generator<'a> {
                 .unwrap();
                 writeln!(
                     source,
-                    "                let (item_e, item_px, item_py, item_pz) = gen_four_vector({local_ident}.pt, {local_ident}.eta, {local_ident}.phi, {local_ident}.mass);"
+                    "                let (item_e, item_px, item_py, item_pz) = gen_four_vector({local_ident}.p4_pt, {local_ident}.p4_eta, {local_ident}.p4_phi, {local_ident}.p4_mass);"
                 )
                 .unwrap();
                 writeln!(source, "                energy += item_e;").unwrap();
                 writeln!(source, "                px += item_px;").unwrap();
                 writeln!(source, "                py += item_py;").unwrap();
                 writeln!(source, "                pz += item_pz;").unwrap();
+                self.emit_constituent_values_binding(
+                    source,
+                    &format!("{local_ident}_values"),
+                    item,
+                    &local_ident,
+                )?;
                 writeln!(
                     source,
-                    "                {used_ident}.push(GenConstituent {{ object: {}, index: {local_ident}.source_index, pt: {local_ident}.pt, eta: {local_ident}.eta, phi: {local_ident}.phi }});",
+                    "                {used_ident}.push(GenConstituent {{ object: {}, index: {local_ident}.source_index, pt: {local_ident}.p4_pt, eta: {local_ident}.p4_eta, phi: {local_ident}.p4_phi, mass: {local_ident}.p4_mass, values: {local_ident}_values }});",
                     rust_string(item)
                 )
                 .unwrap();
@@ -2967,7 +3331,7 @@ impl<'a> Generator<'a> {
         .unwrap();
         writeln!(
             source,
-            "            let min_delta_r = gen_candidate_min_delta_r(&{used_ident});"
+            "            let (delta_eta, delta_phi, leading_pt, subleading_pt, leading_eta, subleading_eta, leading_phi, subleading_phi, leading_mass, subleading_mass, min_delta_r) = gen_constituent_geometry(&{used_ident});"
         )
         .unwrap();
         writeln!(source, "            if mass.is_finite() && mass > 0.0 {{").unwrap();
@@ -2991,7 +3355,7 @@ impl<'a> Generator<'a> {
         .unwrap();
         writeln!(
             source,
-            "                    {derived_ident} = Some({derived_type} {{ mass, pt, min_delta_r, energy, px, py, pz, constituents }});"
+            "                    {derived_ident} = Some({derived_type} {{ mass, pt, eta: gen_vector_eta(px, py, pz), phi: gen_vector_phi(px, py), min_delta_r, delta_eta, delta_phi, leading_pt, subleading_pt, leading_eta, subleading_eta, leading_phi, subleading_phi, leading_mass, subleading_mass, energy, px, py, pz, constituents }});"
         )
         .unwrap();
         writeln!(source, "                }}").unwrap();
@@ -3018,14 +3382,24 @@ impl<'a> Generator<'a> {
         }
     }
 
-    fn emit_cut(&self, object: &ObjectDef, cut: &crate::Cut) -> Result<String, CodegenError> {
-        let lhs = as_f64_expr(self.emit_cut_value_expr(&cut.lhs, &object.name)?);
+    fn emit_cut(
+        &self,
+        object: &ObjectDef,
+        cut: &crate::Cut,
+        item_ident: &str,
+    ) -> Result<String, CodegenError> {
+        let lhs = as_f64_expr(self.emit_cut_value_expr(&cut.lhs, &object.name, item_ident)?);
         let op = cmp_op(cut.op);
         let rhs = f64_literal(cut.rhs.value);
         Ok(format!("({lhs} {op} {rhs})"))
     }
 
-    fn emit_cut_value_expr(&self, expr: &Expr, object_name: &str) -> Result<String, CodegenError> {
+    fn emit_cut_value_expr(
+        &self,
+        expr: &Expr,
+        object_name: &str,
+        item_ident: &str,
+    ) -> Result<String, CodegenError> {
         match expr {
             Expr::Attr { object, attr } if object == object_name => {
                 attr_ident(object_name, attr)
@@ -3034,19 +3408,38 @@ impl<'a> Generator<'a> {
                 "object cut references `{object}`; this slice only supports cuts on the object being selected"
             ))),
             Expr::Literal(value) => Ok(f64_literal(*value)),
+            Expr::IndexNotIn { object, attr } => {
+                self.emit_index_not_in_expr(object, attr, &format!("{item_ident}.index()"))
+            }
+            Expr::JetIdTightRun2024 { object } if object == object_name => self
+                .emit_jet_id_tight_run2024_expr(|attr| attr_ident(object_name, attr)),
+            Expr::JetIdTightRun2024 { object } => Err(CodegenError::UnsupportedFeature(format!(
+                "object cut references jet ID for `{object}`"
+            ))),
+            Expr::JetVetoMapRun2024 { object } if object == object_name => {
+                self.emit_jet_veto_map_run2024_expr(|attr| attr_ident(object_name, attr))
+            }
+            Expr::JetVetoMapRun2024 { object } => {
+                Err(CodegenError::UnsupportedFeature(format!(
+                    "object cut references jet veto map for `{object}`"
+                )))
+            }
             Expr::Binary { op, lhs, rhs } => {
-                let lhs = as_f64_expr(self.emit_cut_value_expr(lhs, object_name)?);
-                let rhs = as_f64_expr(self.emit_cut_value_expr(rhs, object_name)?);
+                let lhs = as_f64_expr(self.emit_cut_value_expr(lhs, object_name, item_ident)?);
+                let rhs = as_f64_expr(self.emit_cut_value_expr(rhs, object_name, item_ident)?);
                 if matches!(op, ArithOp::Pow) {
                     Ok(format!("{lhs}.powf({rhs})"))
                 } else {
                     Ok(format!("({lhs} {} {rhs})", arith_op(*op)))
                 }
             }
-            Expr::Abs(inner) => Ok(format!("{}.abs()", self.emit_cut_value_expr(inner, object_name)?)),
+            Expr::Abs(inner) => Ok(format!(
+                "{}.abs()",
+                self.emit_cut_value_expr(inner, object_name, item_ident)?
+            )),
             Expr::Sqrt(inner) => Ok(format!(
                 "{}.sqrt()",
-                as_f64_expr(self.emit_cut_value_expr(inner, object_name)?)
+                as_f64_expr(self.emit_cut_value_expr(inner, object_name, item_ident)?)
             )),
             other => Err(CodegenError::UnsupportedFeature(format!(
                 "object cut expression `{other}` is not supported by this slice"
@@ -3084,6 +3477,29 @@ impl<'a> Generator<'a> {
                 "collection predicate for `{object_name}` references `{object}`"
             ))),
             Expr::Literal(value) => Ok(f64_literal(*value)),
+            Expr::IndexNotIn { object, attr } => {
+                self.emit_index_not_in_expr(object, attr, &format!("{item_ident}.source_index"))
+            }
+            Expr::JetIdTightRun2024 { object } if object == object_name => self
+                .emit_jet_id_tight_run2024_expr(|attr| {
+                    Ok(format!(
+                        "{item_ident}.{}",
+                        checked_ident(attr, "selected jet ID attribute")?
+                    ))
+                }),
+            Expr::JetIdTightRun2024 { object } => Err(CodegenError::UnsupportedFeature(format!(
+                "collection predicate for `{object_name}` references jet ID for `{object}`"
+            ))),
+            Expr::JetVetoMapRun2024 { object } if object == object_name => self
+                .emit_jet_veto_map_run2024_expr(|attr| {
+                    Ok(format!(
+                        "{item_ident}.{}",
+                        checked_ident(attr, "selected jet veto map attribute")?
+                    ))
+                }),
+            Expr::JetVetoMapRun2024 { object } => Err(CodegenError::UnsupportedFeature(format!(
+                "collection predicate for `{object_name}` references jet veto map for `{object}`"
+            ))),
             Expr::Binary { op, lhs, rhs } => {
                 let lhs =
                     as_f64_expr(self.emit_selected_value_expr(lhs, object_name, item_ident)?);
@@ -3109,6 +3525,38 @@ impl<'a> Generator<'a> {
         }
     }
 
+    fn emit_index_not_in_expr(
+        &self,
+        object: &str,
+        attr: &str,
+        source_index_expr: &str,
+    ) -> Result<String, CodegenError> {
+        let selected = selected_objects_ident(object)?;
+        let item = format!(
+            "{}_index_item",
+            checked_ident(object, "index predicate object")?
+        );
+        let attr = checked_ident(attr, "index predicate attribute")?;
+        Ok(format!(
+            "if {selected}.iter().all(|{item}| ({item}.{attr} as f64 - {source_index_expr} as f64).abs() > f64::EPSILON) {{ 1.0_f64 }} else {{ 0.0_f64 }}"
+        ))
+    }
+
+    fn emit_jet_id_tight_run2024_expr<F>(&self, mut attr_expr: F) -> Result<String, CodegenError>
+    where
+        F: FnMut(&str) -> Result<String, CodegenError>,
+    {
+        let eta = attr_expr("eta")?;
+        let ch_hef = attr_expr("chHEF")?;
+        let ne_hef = attr_expr("neHEF")?;
+        let ne_em_ef = attr_expr("neEmEF")?;
+        let ch_mult = attr_expr("chMultiplicity")?;
+        let ne_mult = attr_expr("neMultiplicity")?;
+        Ok(format!(
+            "{{ let eta = ({eta} as f64).abs(); let ch_hef = {ch_hef} as f64; let ne_hef = {ne_hef} as f64; let ne_em_ef = {ne_em_ef} as f64; let ch_mult = {ch_mult} as f64; let ne_mult = {ne_mult} as f64; if (if eta <= 2.6_f64 {{ ne_hef < 0.99_f64 && ne_em_ef < 0.9_f64 && ch_mult + ne_mult > 1.0_f64 && ch_hef > 0.01_f64 && ch_mult > 0.0_f64 }} else if eta <= 2.7_f64 {{ ne_hef < 0.90_f64 && ne_em_ef < 0.99_f64 }} else if eta < 3.0_f64 {{ ne_hef < 0.99_f64 }} else {{ ne_mult >= 2.0_f64 && ne_em_ef < 0.4_f64 }}) {{ 1.0_f64 }} else {{ 0.0_f64 }} }}"
+        ))
+    }
+
     fn emit_region_requirement(
         &self,
         lhs: &Expr,
@@ -3117,14 +3565,30 @@ impl<'a> Generator<'a> {
     ) -> Result<String, CodegenError> {
         match lhs {
             Expr::EventScalar(branch) => {
-                let branch = rust_string(branch);
-                Ok(bool_comparison_expr(
-                    format!("event.scalar::<bool>({branch})?"),
-                    op,
-                    rhs,
-                    "region requirement",
-                )?)
+                let branch_type = self.branch_type(branch)?;
+                if branch_type == BranchType::Bool {
+                    let branch = rust_string(branch);
+                    Ok(bool_comparison_expr(
+                        format!("event.scalar::<bool>({branch})?"),
+                        op,
+                        rhs,
+                        "region requirement",
+                    )?)
+                } else {
+                    Ok(format!(
+                        "{} {} {}",
+                        self.emit_event_scalar_numeric_expr(branch, branch_type)?,
+                        cmp_op(op),
+                        f64_literal(rhs)
+                    ))
+                }
             }
+            Expr::Literal(_) | Expr::Binary { .. } | Expr::Abs(_) | Expr::Sqrt(_) => Ok(format!(
+                "{} {} {}",
+                self.emit_output_expr(lhs, "region_requirement")?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
             Expr::Count(object) => {
                 let lhs = count_ident(object)?;
                 let rhs = checked_count_rhs(rhs, "region requirement")?;
@@ -3213,6 +3677,111 @@ impl<'a> Generator<'a> {
                 cmp_op(op),
                 f64_literal(rhs)
             )),
+            Expr::ZepVv {
+                system,
+                met_pt,
+                met_phi,
+                dijet,
+            } => Ok(format!(
+                "{} {} {}",
+                self.emit_zep_vv_expr(system, met_pt, met_phi, dijet)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
+            Expr::SystemMetEta {
+                system,
+                met_pt,
+                met_phi,
+            } => Ok(format!(
+                "{} {} {}",
+                self.emit_system_met_eta_expr(system, met_pt, met_phi)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
+            Expr::SystemMetPt {
+                system,
+                met_pt,
+                met_phi,
+            } => Ok(format!(
+                "{} {} {}",
+                self.emit_system_met_pt_expr(system, met_pt, met_phi)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
+            Expr::SystemPairMetPt {
+                system,
+                met_pt,
+                met_phi,
+                pair,
+            } => Ok(format!(
+                "{} {} {}",
+                self.emit_system_pair_met_pt_expr(system, met_pt, met_phi, pair)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
+            Expr::SystemPairPtBalance {
+                system,
+                met_pt,
+                met_phi,
+                pair,
+            } => Ok(format!(
+                "{} {} {}",
+                self.emit_system_pair_pt_balance_expr(system, met_pt, met_phi, pair)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
+            Expr::MetType1Pt {
+                jets,
+                met_pt,
+                met_phi,
+                nominal_pt,
+                shifted_pt,
+            } => Ok(format!(
+                "{} {} {}",
+                self.emit_met_type1_expr(jets, met_pt, met_phi, nominal_pt, shifted_pt, true)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
+            Expr::MetType1Phi {
+                jets,
+                met_pt,
+                met_phi,
+                nominal_pt,
+                shifted_pt,
+            } => Ok(format!(
+                "{} {} {}",
+                self.emit_met_type1_expr(jets, met_pt, met_phi, nominal_pt, shifted_pt, false)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
+            Expr::SystemDeltaPhi { left, right } => Ok(format!(
+                "{} {} {}",
+                self.emit_system_delta_phi_expr(left, right)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
+            Expr::LegacyLeptonRpt {
+                muons,
+                electrons,
+                dijet,
+            } => Ok(format!(
+                "{} {} {}",
+                self.emit_legacy_lepton_rpt_expr(muons, electrons, dijet)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
+            Expr::PairConstituentAttr { pair, attr, rank } => Ok(format!(
+                "{} {} {}",
+                self.emit_pair_constituent_attr_expr(pair, attr, *rank)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
+            Expr::ZepMax { system, dijet } => Ok(format!(
+                "{} {} {}",
+                self.emit_zep_max_expr(system, dijet)?,
+                cmp_op(op),
+                f64_literal(rhs)
+            )),
             Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
                 let lhs = derived_attr_expr(object, attr)?;
                 Ok(format!("{lhs} {} {}", cmp_op(op), f64_literal(rhs)))
@@ -3289,7 +3858,7 @@ impl<'a> Generator<'a> {
         let selected = selected_objects_ident(object)?;
         let item = format!("{}_pt_item", checked_ident(object, "pair pT object")?);
         Ok(format!(
-            "{{ let mut pts = {selected}.iter().map(|{item}| {item}.pt).collect::<Vec<_>>(); pts.sort_by(|left, right| right.total_cmp(left)); pts.first().is_some_and(|pt| *pt > {}) && pts.get(1).is_some_and(|pt| *pt > {}) }}",
+            "{{ let mut pts = {selected}.iter().map(|{item}| {item}.p4_pt).collect::<Vec<_>>(); pts.sort_by(|left, right| right.total_cmp(left)); pts.first().is_some_and(|pt| *pt > {}) && pts.get(1).is_some_and(|pt| *pt > {}) }}",
             f32_literal(leading),
             f32_literal(subleading)
         ))
@@ -3311,8 +3880,224 @@ impl<'a> Generator<'a> {
         ))
     }
 
+    fn emit_event_scalar_numeric_expr(
+        &self,
+        branch: &str,
+        branch_type: BranchType,
+    ) -> Result<String, CodegenError> {
+        let branch = rust_string(branch);
+        match branch_type {
+            BranchType::I8 => Ok(format!("f64::from(event.scalar::<i8>({branch})?)")),
+            BranchType::U8 => Ok(format!("f64::from(event.scalar::<u8>({branch})?)")),
+            BranchType::I16 => Ok(format!("f64::from(event.scalar::<i16>({branch})?)")),
+            BranchType::U16 => Ok(format!("f64::from(event.scalar::<u16>({branch})?)")),
+            BranchType::I32 => Ok(format!("f64::from(event.scalar::<i32>({branch})?)")),
+            BranchType::U32 => Ok(format!("f64::from(event.scalar::<u32>({branch})?)")),
+            BranchType::I64 => Ok(format!("event.scalar::<i64>({branch})? as f64")),
+            BranchType::U64 => Ok(format!("event.scalar::<u64>({branch})? as f64")),
+            BranchType::F32 => Ok(format!("f64::from(event.scalar::<f32>({branch})?)")),
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "event scalar branch {branch} has type {:?}; expected numeric scalar",
+                other
+            ))),
+        }
+    }
+
+    fn emit_event_scalar_output_expr(&self, branch: &str) -> Result<String, CodegenError> {
+        let branch_type = self.branch_type(branch)?;
+        if branch_type == BranchType::Bool {
+            return Ok(format!("event.scalar::<bool>({})?", rust_string(branch)));
+        }
+        self.emit_event_scalar_numeric_expr(branch, branch_type)
+    }
+
+    fn emit_system_met_components_expr(
+        &self,
+        system: &str,
+        met_pt: &str,
+        met_phi: &str,
+    ) -> Result<String, CodegenError> {
+        let system = checked_ident(system, "system+MET system")?;
+        let met_pt = rust_string(met_pt);
+        let met_phi = rust_string(met_phi);
+        Ok(format!(
+            "{{ let met_pt = f64::from(event.scalar::<f32>({met_pt})?); let met_phi = f64::from(event.scalar::<f32>({met_phi})?); ({system}.px + met_pt * met_phi.cos(), {system}.py + met_pt * met_phi.sin(), {system}.pz) }}"
+        ))
+    }
+
+    fn emit_system_met_eta_expr(
+        &self,
+        system: &str,
+        met_pt: &str,
+        met_phi: &str,
+    ) -> Result<String, CodegenError> {
+        let components = self.emit_system_met_components_expr(system, met_pt, met_phi)?;
+        Ok(format!(
+            "{{ let (px, py, pz) = {components}; gen_vector_eta(px, py, pz) }}"
+        ))
+    }
+
+    fn emit_system_met_pt_expr(
+        &self,
+        system: &str,
+        met_pt: &str,
+        met_phi: &str,
+    ) -> Result<String, CodegenError> {
+        let components = self.emit_system_met_components_expr(system, met_pt, met_phi)?;
+        Ok(format!(
+            "{{ let (px, py, _) = {components}; (px * px + py * py).sqrt() }}"
+        ))
+    }
+
+    fn emit_system_pair_met_pt_expr(
+        &self,
+        system: &str,
+        met_pt: &str,
+        met_phi: &str,
+        pair: &str,
+    ) -> Result<String, CodegenError> {
+        let components = self.emit_system_met_components_expr(system, met_pt, met_phi)?;
+        let pair = checked_ident(pair, "system_pair_met_pt pair")?;
+        Ok(format!(
+            "{{ let (px, py, _) = {components}; ((px + {pair}.px).powi(2) + (py + {pair}.py).powi(2)).sqrt() }}"
+        ))
+    }
+
+    fn emit_system_pair_pt_balance_expr(
+        &self,
+        system: &str,
+        met_pt: &str,
+        met_phi: &str,
+        pair: &str,
+    ) -> Result<String, CodegenError> {
+        let vv_pt = self.emit_system_met_pt_expr(system, met_pt, met_phi)?;
+        let pair = checked_ident(pair, "system_pair_pt_balance pair")?;
+        Ok(format!(
+            "{{ let vv_pt = {vv_pt}; (vv_pt - {pair}.pt) / {pair}.pt }}"
+        ))
+    }
+
+    fn emit_met_type1_expr(
+        &self,
+        jets: &str,
+        met_pt: &str,
+        met_phi: &str,
+        nominal_pt: &str,
+        shifted_pt: &str,
+        emit_pt: bool,
+    ) -> Result<String, CodegenError> {
+        let selected = selected_objects_ident(jets)?;
+        let met_pt = rust_string(met_pt);
+        let met_phi = rust_string(met_phi);
+        let nominal_pt = checked_ident(nominal_pt, "met_type1 nominal pT attribute")?;
+        let shifted_pt = checked_ident(shifted_pt, "met_type1 shifted pT attribute")?;
+        let output = if emit_pt {
+            "(px * px + py * py).sqrt()"
+        } else {
+            "gen_vector_phi(px, py)"
+        };
+        Ok(format!(
+            "{{ let met_pt = f64::from(event.scalar::<f32>({met_pt})?); let met_phi = f64::from(event.scalar::<f32>({met_phi})?); let mut px = met_pt * met_phi.cos(); let mut py = met_pt * met_phi.sin(); for jet in &{selected} {{ let ch_em_ef = jet.chEmEF as f64; let ne_em_ef = jet.neEmEF as f64; if ch_em_ef + ne_em_ef >= 0.9_f64 {{ continue; }} let muon_subtr = jet.muonSubtrFactor as f64; let nominal = jet.{nominal_pt} as f64 * (1.0_f64 - muon_subtr); if nominal < 15.0_f64 {{ continue; }} let shifted = jet.{shifted_pt} as f64 * (1.0_f64 - muon_subtr); let phi = jet.phi as f64; px += (nominal - shifted) * phi.cos(); py += (nominal - shifted) * phi.sin(); }} {output} }}"
+        ))
+    }
+
+    fn emit_jet_veto_map_run2024_expr<F>(&self, attr_expr: F) -> Result<String, CodegenError>
+    where
+        F: Fn(&str) -> Result<String, CodegenError>,
+    {
+        let eta = attr_expr("eta")?;
+        let phi = attr_expr("phi")?;
+        Ok(format!(
+            "{{ let set = nano_corrections::CorrectionSet::from_path({file:?}).map_err(|error| nano_core::NanoError::MissingAttachment {{ name: error.to_string() }})?; let correction = set.correction({correction:?}).map_err(|error| nano_core::NanoError::MissingAttachment {{ name: error.to_string() }})?; correction.evaluate(&[nano_corrections::Value::from({map_type:?}), nano_corrections::Value::Real(({eta} as f64).clamp(-5.18_f64, 5.18_f64)), nano_corrections::Value::Real(({phi} as f64).clamp(-3.1415_f64, 3.1415_f64))]).map_err(|error| nano_core::NanoError::MissingAttachment {{ name: error.to_string() }})? }}",
+            file = crate::JET_VETO_MAP_RUN2024_FILE,
+            correction = crate::JET_VETO_MAP_RUN2024_CORRECTION,
+            map_type = crate::JET_VETO_MAP_TYPE,
+        ))
+    }
+
+    fn emit_system_delta_phi_expr(&self, left: &str, right: &str) -> Result<String, CodegenError> {
+        let left = checked_ident(left, "system_delta_phi left")?;
+        let right = checked_ident(right, "system_delta_phi right")?;
+        Ok(format!(
+            "{{ let mut dphi = {left}.phi - {right}.phi; while dphi > std::f64::consts::PI {{ dphi -= 2.0_f64 * std::f64::consts::PI; }} while dphi <= -std::f64::consts::PI {{ dphi += 2.0_f64 * std::f64::consts::PI; }} dphi.abs() }}"
+        ))
+    }
+
+    fn emit_legacy_lepton_rpt_expr(
+        &self,
+        muons: &str,
+        electrons: &str,
+        dijet: &str,
+    ) -> Result<String, CodegenError> {
+        let muons = selected_objects_ident(muons)?;
+        let electrons = selected_objects_ident(electrons)?;
+        let dijet = checked_ident(dijet, "legacy_lepton_rpt dijet")?;
+        Ok(format!(
+            "{{ let mut lepton_pts = Vec::<f64>::new(); lepton_pts.extend({muons}.iter().map(|item| f64::from(item.p4_pt))); lepton_pts.extend({electrons}.iter().map(|item| f64::from(item.p4_pt))); if lepton_pts.len() < 2 {{ 1.0_f64 }} else {{ (lepton_pts[0] * lepton_pts[1]) / ({dijet}.leading_pt * {dijet}.subleading_pt) }} }}"
+        ))
+    }
+
+    fn emit_pair_constituent_attr_expr(
+        &self,
+        pair: &str,
+        attr: &str,
+        rank: PairConstituentRank,
+    ) -> Result<String, CodegenError> {
+        let pair = checked_ident(pair, "pair constituent attribute pair")?;
+        let attr = rust_string(attr);
+        let index = match rank {
+            PairConstituentRank::Leading => 0,
+            PairConstituentRank::Subleading => 1,
+        };
+        Ok(format!(
+            "{{ let mut constituents = {pair}.constituents.to_vec(); constituents.sort_by(|left, right| right.pt.total_cmp(&left.pt)); constituents.get({index}).and_then(|item| item.values.iter().find(|(name, _)| *name == {attr}).map(|(_, value)| *value)).expect(\"validated pair constituent attribute\") }}"
+        ))
+    }
+
+    fn emit_zep_vv_expr(
+        &self,
+        system: &str,
+        met_pt: &str,
+        met_phi: &str,
+        dijet: &str,
+    ) -> Result<String, CodegenError> {
+        let system = checked_ident(system, "zep_vv system")?;
+        let dijet = checked_ident(dijet, "zep_vv dijet")?;
+        let vv_eta = self.emit_system_met_eta_expr(&system, met_pt, met_phi)?;
+        Ok(format!(
+            "{{ let vv_eta = {vv_eta}; let midpoint = ({dijet}.leading_eta + {dijet}.subleading_eta) / 2.0_f64; if {dijet}.delta_eta <= 0.0_f64 {{ f64::INFINITY }} else {{ (vv_eta - midpoint).abs() / {dijet}.delta_eta }} }}"
+        ))
+    }
+
+    fn emit_zep_max_expr(&self, system: &str, dijet: &str) -> Result<String, CodegenError> {
+        let system = checked_ident(system, "zep_max system")?;
+        let dijet = checked_ident(dijet, "zep_max dijet")?;
+        Ok(format!(
+            "{{ let midpoint = ({dijet}.leading_eta + {dijet}.subleading_eta) / 2.0_f64; if {dijet}.delta_eta <= 0.0_f64 {{ f64::INFINITY }} else {{ {system}.constituents.iter().map(|item| (item.eta - midpoint).abs() / {dijet}.delta_eta).fold(0.0_f64, f64::max) }} }}"
+        ))
+    }
+
     fn emit_output_expr(&self, expr: &Expr, output_name: &str) -> Result<String, CodegenError> {
         match expr {
+            Expr::EventScalar(branch) => self.emit_event_scalar_output_expr(branch),
+            Expr::Literal(value) => Ok(f64_literal(*value)),
+            Expr::Binary { op, lhs, rhs } => {
+                let lhs = self.emit_output_expr(lhs, output_name)?;
+                let rhs = self.emit_output_expr(rhs, output_name)?;
+                if matches!(op, ArithOp::Pow) {
+                    Ok(format!("{lhs}.powf({rhs})"))
+                } else {
+                    Ok(format!("({lhs} {} {rhs})", arith_op(*op)))
+                }
+            }
+            Expr::Abs(inner) => Ok(format!(
+                "{}.abs()",
+                self.emit_output_expr(inner, output_name)?
+            )),
+            Expr::Sqrt(inner) => Ok(format!(
+                "{}.sqrt()",
+                as_f64_expr(self.emit_output_expr(inner, output_name)?)
+            )),
             Expr::Count(object) => count_ident(object),
             Expr::CountWhere { object, predicate } => {
                 let selected = selected_objects_ident(object)?;
@@ -3352,6 +4137,58 @@ impl<'a> Generator<'a> {
                 right,
                 target,
             } => self.emit_ordered_mass_expr(left, right, target.value, false),
+            Expr::ZepVv {
+                system,
+                met_pt,
+                met_phi,
+                dijet,
+            } => self.emit_zep_vv_expr(system, met_pt, met_phi, dijet),
+            Expr::SystemMetEta {
+                system,
+                met_pt,
+                met_phi,
+            } => self.emit_system_met_eta_expr(system, met_pt, met_phi),
+            Expr::SystemMetPt {
+                system,
+                met_pt,
+                met_phi,
+            } => self.emit_system_met_pt_expr(system, met_pt, met_phi),
+            Expr::SystemPairMetPt {
+                system,
+                met_pt,
+                met_phi,
+                pair,
+            } => self.emit_system_pair_met_pt_expr(system, met_pt, met_phi, pair),
+            Expr::SystemPairPtBalance {
+                system,
+                met_pt,
+                met_phi,
+                pair,
+            } => self.emit_system_pair_pt_balance_expr(system, met_pt, met_phi, pair),
+            Expr::MetType1Pt {
+                jets,
+                met_pt,
+                met_phi,
+                nominal_pt,
+                shifted_pt,
+            } => self.emit_met_type1_expr(jets, met_pt, met_phi, nominal_pt, shifted_pt, true),
+            Expr::MetType1Phi {
+                jets,
+                met_pt,
+                met_phi,
+                nominal_pt,
+                shifted_pt,
+            } => self.emit_met_type1_expr(jets, met_pt, met_phi, nominal_pt, shifted_pt, false),
+            Expr::SystemDeltaPhi { left, right } => self.emit_system_delta_phi_expr(left, right),
+            Expr::LegacyLeptonRpt {
+                muons,
+                electrons,
+                dijet,
+            } => self.emit_legacy_lepton_rpt_expr(muons, electrons, dijet),
+            Expr::PairConstituentAttr { pair, attr, rank } => {
+                self.emit_pair_constituent_attr_expr(pair, attr, *rank)
+            }
+            Expr::ZepMax { system, dijet } => self.emit_zep_max_expr(system, dijet),
             Expr::Attr { object, attr } if self.derived_object(object).is_ok() => {
                 derived_attr_expr(object, attr)
             }
@@ -3364,12 +4201,28 @@ impl<'a> Generator<'a> {
 
     fn output_type(&self, expr: &Expr) -> Result<&'static str, CodegenError> {
         match expr {
+            Expr::EventScalar(branch) => match self.branch_type(branch)? {
+                BranchType::Bool => Ok("bool"),
+                _ => Ok("f64"),
+            },
+            Expr::Literal(_) | Expr::Binary { .. } | Expr::Abs(_) | Expr::Sqrt(_) => Ok("f64"),
             Expr::Count(_) => Ok("u32"),
             Expr::CountWhere { .. } => Ok("u32"),
             Expr::SumAttr { .. } => Ok("f64"),
             Expr::All { .. } | Expr::Any { .. } => Ok("bool"),
             Expr::EitherPairPt { .. } => Ok("bool"),
             Expr::ClosestMass { .. } | Expr::OtherMass { .. } => Ok("f64"),
+            Expr::ZepVv { .. }
+            | Expr::SystemMetEta { .. }
+            | Expr::SystemMetPt { .. }
+            | Expr::SystemPairMetPt { .. }
+            | Expr::SystemPairPtBalance { .. }
+            | Expr::MetType1Pt { .. }
+            | Expr::MetType1Phi { .. }
+            | Expr::SystemDeltaPhi { .. }
+            | Expr::LegacyLeptonRpt { .. }
+            | Expr::PairConstituentAttr { .. }
+            | Expr::ZepMax { .. } => Ok("f64"),
             Expr::Attr { object, .. } if self.derived_object(object).is_ok() => Ok("f64"),
             Expr::LeadingAttr { .. } => Ok("f32"),
             other => Err(CodegenError::UnsupportedFeature(format!(
@@ -3381,12 +4234,29 @@ impl<'a> Generator<'a> {
     fn validate_cut_expr(&self, object_name: &str, expr: &Expr) -> Result<(), CodegenError> {
         match expr {
             Expr::Attr { object, attr } if object == object_name => {
-                self.require_f32_attr(object, attr, "object cut")?;
+                self.require_supported_object_attr(object, attr, "object cut")?;
                 Ok(())
             }
             Expr::Attr { object, .. } => Err(CodegenError::UnsupportedFeature(format!(
                 "object `{object_name}` cut references `{object}`; this slice only supports cuts on the object being selected"
             ))),
+            Expr::IndexNotIn { object, attr } => {
+                self.require_supported_object_attr(object, attr, "object cut index predicate")
+            }
+            Expr::JetIdTightRun2024 { object } if object == object_name => {
+                self.require_jet_id_tight_run2024_attrs(object, "object cut jet ID")
+            }
+            Expr::JetIdTightRun2024 { object } => Err(CodegenError::UnsupportedFeature(format!(
+                "object `{object_name}` cut references jet ID for `{object}`"
+            ))),
+            Expr::JetVetoMapRun2024 { object } if object == object_name => {
+                self.require_jet_veto_map_run2024_attrs(object, "object cut jet veto map")
+            }
+            Expr::JetVetoMapRun2024 { object } => {
+                Err(CodegenError::UnsupportedFeature(format!(
+                    "object `{object_name}` cut references jet veto map for `{object}`"
+                )))
+            }
             Expr::Literal(_) => Ok(()),
             Expr::Binary { lhs, rhs, .. } => {
                 self.validate_cut_expr(object_name, lhs)?;
@@ -3404,14 +4274,32 @@ impl<'a> Generator<'a> {
         match expr {
             Expr::EventScalar(branch) => {
                 let branch_type = self.branch_type(branch)?;
-                if branch_type == BranchType::Bool {
+                if matches!(
+                    branch_type,
+                    BranchType::Bool
+                        | BranchType::I8
+                        | BranchType::U8
+                        | BranchType::I16
+                        | BranchType::U16
+                        | BranchType::I32
+                        | BranchType::U32
+                        | BranchType::I64
+                        | BranchType::U64
+                        | BranchType::F32
+                ) {
                     Ok(())
                 } else {
                     Err(CodegenError::UnsupportedFeature(format!(
-                        "{context}: event scalar branch `{branch}` has type {branch_type:?}; this slice only emits bool event requirements"
+                        "{context}: event scalar branch `{branch}` has type {branch_type:?}; this slice only emits bool/numeric event requirements"
                     )))
                 }
             }
+            Expr::Literal(_) => Ok(()),
+            Expr::Binary { lhs, rhs, .. } => {
+                self.validate_region_expr(lhs, context)?;
+                self.validate_region_expr(rhs, context)
+            }
+            Expr::Abs(inner) | Expr::Sqrt(inner) => self.validate_region_expr(inner, context),
             Expr::Count(object) => {
                 self.object(object)?;
                 Ok(())
@@ -3425,12 +4313,100 @@ impl<'a> Generator<'a> {
             Expr::EitherPairPt { left, right, .. } => {
                 self.object(left)?;
                 self.object(right)?;
-                self.require_f32_attr(left, "pt", context)?;
-                self.require_f32_attr(right, "pt", context)
+                self.require_f32_kinematic_attr(left, "pt", context)?;
+                self.require_f32_kinematic_attr(right, "pt", context)
             }
             Expr::ClosestMass { left, right, .. } | Expr::OtherMass { left, right, .. } => {
                 self.validate_derived_attr(left, "mass", context)?;
                 self.validate_derived_attr(right, "mass", context)
+            }
+            Expr::ZepVv {
+                system,
+                met_pt,
+                met_phi,
+                dijet,
+            } => {
+                self.validate_derived_attr(system, "eta", context)?;
+                self.validate_derived_attr(dijet, "delta_eta", context)?;
+                self.require_event_f32_branch(met_pt, context)?;
+                self.require_event_f32_branch(met_phi, context)
+            }
+            Expr::SystemMetEta {
+                system,
+                met_pt,
+                met_phi,
+            } => {
+                self.validate_derived_attr(system, "eta", context)?;
+                self.require_event_f32_branch(met_pt, context)?;
+                self.require_event_f32_branch(met_phi, context)
+            }
+            Expr::SystemMetPt {
+                system,
+                met_pt,
+                met_phi,
+            } => {
+                self.validate_derived_attr(system, "pt", context)?;
+                self.require_event_f32_branch(met_pt, context)?;
+                self.require_event_f32_branch(met_phi, context)
+            }
+            Expr::SystemPairMetPt {
+                system,
+                met_pt,
+                met_phi,
+                pair,
+            } => {
+                self.validate_derived_attr(system, "pt", context)?;
+                self.validate_derived_attr(pair, "pt", context)?;
+                self.require_event_f32_branch(met_pt, context)?;
+                self.require_event_f32_branch(met_phi, context)
+            }
+            Expr::SystemPairPtBalance {
+                system,
+                met_pt,
+                met_phi,
+                pair,
+            } => {
+                self.validate_derived_attr(system, "pt", context)?;
+                self.validate_derived_attr(pair, "pt", context)?;
+                self.require_event_f32_branch(met_pt, context)?;
+                self.require_event_f32_branch(met_phi, context)
+            }
+            Expr::MetType1Pt {
+                jets,
+                met_pt,
+                met_phi,
+                nominal_pt,
+                shifted_pt,
+            }
+            | Expr::MetType1Phi {
+                jets,
+                met_pt,
+                met_phi,
+                nominal_pt,
+                shifted_pt,
+            } => self.validate_met_type1(jets, met_pt, met_phi, nominal_pt, shifted_pt, context),
+            Expr::SystemDeltaPhi { left, right } => {
+                self.validate_derived_attr(left, "phi", context)?;
+                self.validate_derived_attr(right, "phi", context)
+            }
+            Expr::LegacyLeptonRpt {
+                muons,
+                electrons,
+                dijet,
+            } => {
+                self.object(muons)?;
+                self.object(electrons)?;
+                self.require_f32_kinematic_attr(muons, "pt", context)?;
+                self.require_f32_kinematic_attr(electrons, "pt", context)?;
+                self.validate_derived_attr(dijet, "leading_pt", context)?;
+                self.validate_derived_attr(dijet, "subleading_pt", context)
+            }
+            Expr::PairConstituentAttr { pair, attr, .. } => {
+                self.validate_pair_constituent_attr(pair, attr, context)
+            }
+            Expr::ZepMax { system, dijet } => {
+                self.validate_derived_attr(system, "eta", context)?;
+                self.validate_derived_attr(dijet, "delta_eta", context)
             }
             Expr::SumAttr { object, attr } => {
                 self.object(object)?;
@@ -3456,6 +4432,21 @@ impl<'a> Generator<'a> {
             }
             Expr::Attr { object, .. } => Err(CodegenError::UnsupportedFeature(format!(
                 "collection predicate for `{object_name}` references `{object}`"
+            ))),
+            Expr::IndexNotIn { object, attr } => {
+                self.require_supported_object_attr(object, attr, "collection index predicate")
+            }
+            Expr::JetIdTightRun2024 { object } if object == object_name => {
+                self.require_jet_id_tight_run2024_attrs(object, "collection jet ID predicate")
+            }
+            Expr::JetIdTightRun2024 { object } => Err(CodegenError::UnsupportedFeature(format!(
+                "collection predicate for `{object_name}` references jet ID for `{object}`"
+            ))),
+            Expr::JetVetoMapRun2024 { object } if object == object_name => {
+                self.require_jet_veto_map_run2024_attrs(object, "collection jet veto map predicate")
+            }
+            Expr::JetVetoMapRun2024 { object } => Err(CodegenError::UnsupportedFeature(format!(
+                "collection predicate for `{object_name}` references jet veto map for `{object}`"
             ))),
             Expr::Literal(_) => Ok(()),
             Expr::Binary { lhs, rhs, .. } => {
@@ -3499,6 +4490,84 @@ impl<'a> Generator<'a> {
         Ok(())
     }
 
+    fn require_f32_kinematic_attr(
+        &self,
+        object_name: &str,
+        component: &str,
+        context: &str,
+    ) -> Result<(), CodegenError> {
+        let object = self.object(object_name)?;
+        let Some((_, attr)) = object
+            .kinematics
+            .component_attrs()
+            .into_iter()
+            .find(|(name, _)| *name == component)
+        else {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "{context}: unknown kinematic component `{component}`"
+            )));
+        };
+        self.require_f32_attr(object_name, attr, context)
+    }
+
+    fn require_event_f32_branch(&self, branch: &str, context: &str) -> Result<(), CodegenError> {
+        let Some(info) = self.plan.read_branches.find(branch) else {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "{context}: branch `{branch}` was not present in the validated read schema"
+            )));
+        };
+        if info.branch_type != BranchType::F32 {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "{context}: branch `{branch}` has type {:?}; this slice only emits f32 event scalar reads",
+                info.branch_type
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_met_type1(
+        &self,
+        jets: &str,
+        met_pt: &str,
+        met_phi: &str,
+        nominal_pt: &str,
+        shifted_pt: &str,
+        context: &str,
+    ) -> Result<(), CodegenError> {
+        self.object(jets)?;
+        for attr in MET_TYPE1_JET_ATTRS {
+            self.require_f32_attr(jets, attr, context)?;
+        }
+        self.require_f32_attr(jets, nominal_pt, context)?;
+        self.require_f32_attr(jets, shifted_pt, context)?;
+        self.require_event_f32_branch(met_pt, context)?;
+        self.require_event_f32_branch(met_phi, context)
+    }
+
+    fn require_event_scalar_branch(&self, branch: &str, context: &str) -> Result<(), CodegenError> {
+        let branch_type = self.branch_type(branch)?;
+        if matches!(
+            branch_type,
+            BranchType::Bool
+                | BranchType::I8
+                | BranchType::U8
+                | BranchType::I16
+                | BranchType::U16
+                | BranchType::I32
+                | BranchType::U32
+                | BranchType::I64
+                | BranchType::U64
+                | BranchType::F32
+        ) {
+            Ok(())
+        } else {
+            Err(CodegenError::UnsupportedFeature(format!(
+                "{context}: branch `{branch}` has type {:?}; this slice only emits scalar bool/numeric reads",
+                branch_type
+            )))
+        }
+    }
+
     fn require_supported_object_attr(
         &self,
         object_name: &str,
@@ -3515,12 +4584,34 @@ impl<'a> Generator<'a> {
             return Ok(());
         }
         let branch_type = self.object_attr_branch_type(object_name, attr)?;
-        if !matches!(branch_type, BranchType::VecF32 | BranchType::VecI32) {
+        if vector_rust_type(branch_type).is_none() {
             let branch = format!("{}_{}", object.source, attr);
             return Err(CodegenError::UnsupportedFeature(format!(
-                "{context}: branch `{branch}` has type {:?}; this slice only emits f32/i32 object reads",
+                "{context}: branch `{branch}` has type {:?}; this slice only emits numeric object reads",
                 branch_type
             )));
+        }
+        Ok(())
+    }
+
+    fn require_jet_id_tight_run2024_attrs(
+        &self,
+        object_name: &str,
+        context: &str,
+    ) -> Result<(), CodegenError> {
+        for attr in JET_ID_TIGHT_RUN2024_ATTRS {
+            self.require_supported_object_attr(object_name, attr, context)?;
+        }
+        Ok(())
+    }
+
+    fn require_jet_veto_map_run2024_attrs(
+        &self,
+        object_name: &str,
+        context: &str,
+    ) -> Result<(), CodegenError> {
+        for attr in JET_VETO_MAP_RUN2024_ATTRS {
+            self.require_supported_object_attr(object_name, attr, context)?;
         }
         Ok(())
     }
@@ -3539,13 +4630,12 @@ impl<'a> Generator<'a> {
         {
             return Ok("f32");
         }
-        match self.object_attr_branch_type(object_name, attr)? {
-            BranchType::VecF32 => Ok("f32"),
-            BranchType::VecI32 => Ok("i32"),
-            other => Err(CodegenError::UnsupportedFeature(format!(
-                "object `{object_name}` attribute `{attr}` has unsupported type {other:?}"
-            ))),
-        }
+        let branch_type = self.object_attr_branch_type(object_name, attr)?;
+        vector_rust_type(branch_type).ok_or_else(|| {
+            CodegenError::UnsupportedFeature(format!(
+                "object `{object_name}` attribute `{attr}` has unsupported type {branch_type:?}"
+            ))
+        })
     }
 
     fn object_attr_branch_type(
@@ -3599,11 +4689,11 @@ impl<'a> Generator<'a> {
     fn validate_derived_object(&self, derived: &DerivedObjectDef) -> Result<(), CodegenError> {
         match &derived.source {
             DerivedSource::Pair(pair) => {
-                self.object(&pair.object)?;
-                for attr in ["pt", "eta", "phi", "mass"] {
+                let object = self.object(&pair.object)?;
+                for (component, attr) in object.kinematics.component_attrs() {
                     if self.object_attr_branch_type(&pair.object, attr)? != BranchType::VecF32 {
                         return Err(CodegenError::UnsupportedFeature(format!(
-                            "derived pair `{}` requires `{}`.{attr} as a f32 vector branch",
+                            "derived pair `{}` requires `{}`.{attr} as a f32 vector branch for `{component}` kinematics",
                             derived.name, pair.object
                         )));
                     }
@@ -3635,11 +4725,11 @@ impl<'a> Generator<'a> {
                     )));
                 }
                 for item in &candidate.items {
-                    if self.object(item).is_ok() {
-                        for attr in ["pt", "eta", "phi", "mass"] {
+                    if let Ok(object) = self.object(item) {
+                        for (component, attr) in object.kinematics.component_attrs() {
                             if self.object_attr_branch_type(item, attr)? != BranchType::VecF32 {
                                 return Err(CodegenError::UnsupportedFeature(format!(
-                                    "derived candidate `{}` requires `{}`.{attr} as a f32 vector branch",
+                                    "derived candidate `{}` requires `{}`.{attr} as a f32 vector branch for `{component}` kinematics",
                                     derived.name, item
                                 )));
                             }
@@ -3659,11 +4749,11 @@ impl<'a> Generator<'a> {
     fn validate_pair_filter(&self, object: &str, expr: &Expr) -> Result<(), CodegenError> {
         match expr {
             Expr::PairDeltaR => {
-                self.require_f32_attr(object, "eta", "pair delta-R filter")?;
-                self.require_f32_attr(object, "phi", "pair delta-R filter")
+                self.require_f32_kinematic_attr(object, "eta", "pair delta-R filter")?;
+                self.require_f32_kinematic_attr(object, "phi", "pair delta-R filter")
             }
             Expr::PairLeadingPt | Expr::PairSubleadingPt => {
-                self.require_f32_attr(object, "pt", "pair pT filter")
+                self.require_f32_kinematic_attr(object, "pt", "pair pT filter")
             }
             other => Err(CodegenError::UnsupportedFeature(format!(
                 "pair filter expression `{other}` is not supported by codegen"
@@ -3690,11 +4780,28 @@ impl<'a> Generator<'a> {
     ) -> Result<(), CodegenError> {
         self.derived_object(object)?;
         match attr {
-            "mass" | "pt" | "min_delta_r" | "dR" | "dr" => Ok(()),
+            "mass" | "pt" | "eta" | "phi" | "min_delta_r" | "dR" | "dr" | "delta_eta"
+            | "delta_phi" | "leading_pt" | "subleading_pt" | "leading_eta" | "subleading_eta"
+            | "leading_phi" | "subleading_phi" | "leading_mass" | "subleading_mass" => Ok(()),
             other => Err(CodegenError::UnsupportedFeature(format!(
                 "{context}: derived object `{object}` has no supported attribute `{other}`"
             ))),
         }
+    }
+
+    fn validate_pair_constituent_attr(
+        &self,
+        pair_name: &str,
+        attr: &str,
+        context: &str,
+    ) -> Result<(), CodegenError> {
+        let derived = self.derived_object(pair_name)?;
+        let DerivedSource::Pair(pair) = &derived.source else {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "{context}: derived object `{pair_name}` is not a pair"
+            )));
+        };
+        self.require_supported_object_attr(&pair.object, attr, context)
     }
 
     fn object(&self, name: &str) -> Result<&ObjectDef, CodegenError> {
@@ -4103,7 +5210,7 @@ impl<'a> Generator<'a> {
             object
                 .cuts
                 .iter()
-                .map(|cut| self.emit_cut(object, cut))
+                .map(|cut| self.emit_cut(object, cut, &item_ident))
                 .collect::<Result<Vec<_>, _>>()?
                 .join(" && ")
         };
@@ -4291,6 +5398,25 @@ fn collect_attr_names_for_current_object(
         Expr::Attr { object, .. } => Err(CodegenError::UnsupportedFeature(format!(
             "object `{object_name}` cut references `{object}`; this slice only supports cuts on the object being selected"
         ))),
+        Expr::IndexNotIn { .. } => Ok(()),
+        Expr::JetIdTightRun2024 { object } if object == object_name => {
+            for attr in JET_ID_TIGHT_RUN2024_ATTRS {
+                attrs.insert((*attr).to_string());
+            }
+            Ok(())
+        }
+        Expr::JetIdTightRun2024 { object } => Err(CodegenError::UnsupportedFeature(format!(
+            "object `{object_name}` cut references jet ID for `{object}`"
+        ))),
+        Expr::JetVetoMapRun2024 { object } if object == object_name => {
+            for attr in JET_VETO_MAP_RUN2024_ATTRS {
+                attrs.insert((*attr).to_string());
+            }
+            Ok(())
+        }
+        Expr::JetVetoMapRun2024 { object } => Err(CodegenError::UnsupportedFeature(format!(
+            "object `{object_name}` cut references jet veto map for `{object}`"
+        ))),
         Expr::Literal(_) => Ok(()),
         Expr::Binary { lhs, rhs, .. } => {
             collect_attr_names_for_current_object(lhs, object_name, attrs)?;
@@ -4314,7 +5440,26 @@ fn collect_selected_attr_names(
             attrs.insert(attr.clone());
             Ok(())
         }
+        Expr::IndexNotIn { object, attr } if object == object_name => {
+            attrs.insert(attr.clone());
+            Ok(())
+        }
+        Expr::JetIdTightRun2024 { object } if object == object_name => {
+            for attr in JET_ID_TIGHT_RUN2024_ATTRS {
+                attrs.insert((*attr).to_string());
+            }
+            Ok(())
+        }
+        Expr::JetVetoMapRun2024 { object } if object == object_name => {
+            for attr in JET_VETO_MAP_RUN2024_ATTRS {
+                attrs.insert((*attr).to_string());
+            }
+            Ok(())
+        }
         Expr::EventScalar(_) | Expr::Attr { .. } | Expr::Literal(_) | Expr::Count(_) => Ok(()),
+        Expr::IndexNotIn { .. }
+        | Expr::JetIdTightRun2024 { .. }
+        | Expr::JetVetoMapRun2024 { .. } => Ok(()),
         Expr::LeadingAttr { object, attr } if object == object_name => {
             attrs.insert(attr.clone());
             Ok(())
@@ -4341,7 +5486,58 @@ fn collect_selected_attr_names(
             }
             Ok(())
         }
-        Expr::ClosestMass { .. } | Expr::OtherMass { .. } => Ok(()),
+        Expr::ClosestMass { .. }
+        | Expr::OtherMass { .. }
+        | Expr::ZepVv { .. }
+        | Expr::SystemMetEta { .. }
+        | Expr::SystemMetPt { .. }
+        | Expr::SystemPairMetPt { .. }
+        | Expr::SystemPairPtBalance { .. }
+        | Expr::SystemDeltaPhi { .. }
+        | Expr::PairConstituentAttr { .. }
+        | Expr::ZepMax { .. } => Ok(()),
+        Expr::MetType1Pt {
+            jets,
+            nominal_pt,
+            shifted_pt,
+            ..
+        }
+        | Expr::MetType1Phi {
+            jets,
+            nominal_pt,
+            shifted_pt,
+            ..
+        } => {
+            if jets == object_name {
+                for attr in MET_TYPE1_JET_ATTRS {
+                    attrs.insert((*attr).to_string());
+                }
+                attrs.insert(nominal_pt.clone());
+                attrs.insert(shifted_pt.clone());
+            }
+            Ok(())
+        }
+        Expr::LeadingType1Mt {
+            object,
+            jets,
+            nominal_pt,
+            shifted_pt,
+            ..
+        } => {
+            if object == object_name {
+                attrs.insert("pt".to_string());
+                attrs.insert("phi".to_string());
+            }
+            if jets == object_name {
+                for attr in MET_TYPE1_JET_ATTRS {
+                    attrs.insert((*attr).to_string());
+                }
+                attrs.insert(nominal_pt.clone());
+                attrs.insert(shifted_pt.clone());
+            }
+            Ok(())
+        }
+        Expr::LegacyLeptonRpt { .. } => Ok(()),
         Expr::SumAttr { object, attr } if object == object_name => {
             attrs.insert(attr.clone());
             Ok(())
@@ -4356,14 +5552,42 @@ fn collect_selected_attr_names(
     }
 }
 
-fn collect_pair_filter_attr_names(expr: &Expr, attrs: &mut BTreeSet<String>) {
+fn collect_pair_filter_attr_names(expr: &Expr, _attrs: &mut BTreeSet<String>) {
     match expr {
-        Expr::PairDeltaR => {
-            attrs.insert("eta".to_string());
-            attrs.insert("phi".to_string());
+        Expr::PairDeltaR | Expr::PairLeadingPt | Expr::PairSubleadingPt => {}
+        _ => {}
+    }
+}
+
+fn collect_expr_required_kinematic_components(
+    expr: &Expr,
+    object_name: &str,
+    components: &mut BTreeSet<&'static str>,
+) {
+    match expr {
+        Expr::EitherPairPt { left, right, .. } => {
+            if left == object_name || right == object_name {
+                components.insert("pt");
+            }
         }
-        Expr::PairLeadingPt | Expr::PairSubleadingPt => {
-            attrs.insert("pt".to_string());
+        Expr::LegacyLeptonRpt {
+            muons, electrons, ..
+        } => {
+            if muons == object_name || electrons == object_name {
+                components.insert("pt");
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_expr_required_kinematic_components(lhs, object_name, components);
+            collect_expr_required_kinematic_components(rhs, object_name, components);
+        }
+        Expr::Abs(inner) | Expr::Sqrt(inner) => {
+            collect_expr_required_kinematic_components(inner, object_name, components);
+        }
+        Expr::CountWhere { predicate, .. }
+        | Expr::All { predicate, .. }
+        | Expr::Any { predicate, .. } => {
+            collect_expr_required_kinematic_components(&predicate.lhs, object_name, components);
         }
         _ => {}
     }
@@ -4719,6 +5943,98 @@ fn collect_derived_objects_in_expr(
                 objects.insert(right.clone());
             }
         }
+        Expr::ZepVv { system, dijet, .. } => {
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *system)
+            {
+                objects.insert(system.clone());
+            }
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *dijet)
+            {
+                objects.insert(dijet.clone());
+            }
+        }
+        Expr::SystemMetEta { system, .. } | Expr::SystemMetPt { system, .. } => {
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *system)
+            {
+                objects.insert(system.clone());
+            }
+        }
+        Expr::SystemPairMetPt { system, pair, .. }
+        | Expr::SystemPairPtBalance { system, pair, .. } => {
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *system)
+            {
+                objects.insert(system.clone());
+            }
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *pair)
+            {
+                objects.insert(pair.clone());
+            }
+        }
+        Expr::SystemDeltaPhi { left, right } => {
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *left)
+            {
+                objects.insert(left.clone());
+            }
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *right)
+            {
+                objects.insert(right.clone());
+            }
+        }
+        Expr::LegacyLeptonRpt { dijet, .. } => {
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *dijet)
+            {
+                objects.insert(dijet.clone());
+            }
+        }
+        Expr::PairConstituentAttr { pair, .. } => {
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *pair)
+            {
+                objects.insert(pair.clone());
+            }
+        }
+        Expr::ZepMax { system, dijet } => {
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *system)
+            {
+                objects.insert(system.clone());
+            }
+            if spec
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *dijet)
+            {
+                objects.insert(dijet.clone());
+            }
+        }
         _ => {}
     }
 }
@@ -4744,6 +6060,7 @@ mod tests {
     const MUON_TAGGER_SPEC: &str = include_str!("../examples/muon_tagger.toml");
     const DIMUON_SPEC: &str = include_str!("../examples/dimuon.toml");
     const NANOV9_CATALOGUE: &str = include_str!("../../../configs/branches/nanov9.yaml");
+    const NANOV15_CATALOGUE: &str = include_str!("../../../configs/branches/nanov15.yaml");
 
     #[test]
     fn generates_muon_producer_source() {
@@ -4761,7 +6078,8 @@ mod tests {
             "if ((good_muon_pt as f64) > 30.0_f64) && ((good_muon_eta.abs() as f64) < 2.4_f64)"
         ));
         assert!(source.contains("let baseline = nano_analysis::Ev::new(event)"));
-        assert!(source.contains("baseline.select::<SignalRegion>(|_| n_good_muon >= 1_u32)"));
+        assert!(source.contains("let signal_predicate = n_good_muon >= 1_u32;"));
+        assert!(source.contains("baseline.select::<SignalRegion>(|_| signal_predicate)"));
         assert!(source.contains("n_good_muon,"));
         assert!(source.contains("lead_muon_pt,"));
     }
@@ -4784,8 +6102,11 @@ mod tests {
         assert!(source
             .contains("let Some(leading_good_muon_topscore) = leading_good_muon_topscore else"));
         assert!(source.contains(
-            "muon_tagger_baseline.select::<SignalRegion>(|_| n_good_muon >= 1_u32 && leading_good_muon_topscore > 0.5_f32)"
+            "let signal_predicate = n_good_muon >= 1_u32 && leading_good_muon_topscore > 0.5_f32;"
         ));
+        assert!(
+            source.contains("muon_tagger_baseline.select::<SignalRegion>(|_| signal_predicate)")
+        );
     }
 
     #[test]
@@ -4821,12 +6142,123 @@ mod tests {
         assert!(source.contains("let mut good_muon_selected = Vec::new();"));
         assert!(source.contains("let good_muon_charge = good_muon_item.get::<i32>(\"charge\")?;"));
         assert!(source.contains(
-            "dimuon_order.sort_by(|&left, &right| good_muon_selected[right].pt.total_cmp(&good_muon_selected[left].pt));"
+            "dimuon_order.sort_by(|&left, &right| good_muon_selected[right].p4_pt.total_cmp(&good_muon_selected[left].p4_pt));"
         ));
         assert!(source.contains("if first.charge * second.charge >= 0"));
         assert!(source.contains("let deta = f64::from(left_eta) - f64::from(right_eta);"));
         assert!(source.contains("let mut dphi = f64::from(left_phi) - f64::from(right_phi);"));
         assert!(source.contains("let Some(dimuon) = dimuon else"));
         assert!(source.contains("dimuon_mass: dimuon.mass,"));
+    }
+
+    #[test]
+    fn object_kinematics_alias_drives_pair_p4_reads() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "aliased_pair_p4"
+year = "Run2018"
+
+[objects.good_muon]
+source = "Muon"
+kinematics = { pt = "dxy" }
+cuts = ["abs(eta) < 2.4"]
+
+[derived.dimuon]
+kind = "pair"
+object = "good_muon"
+constraints = ["opposite_charge"]
+selection = "leading_pt"
+
+[[outputs]]
+name = "dimuon_mass"
+expr = "dimuon.mass"
+"#,
+        )
+        .unwrap();
+        let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").unwrap();
+        let plan = validate(&spec, &catalogue).unwrap();
+        let source = generate_producer_source(&plan).unwrap();
+
+        assert!(plan.read_branches.find("Muon_dxy").is_some());
+        assert!(plan.read_branches.find("Muon_pt").is_none());
+        assert!(source.contains("let good_muon_dxy = good_muon_item.get::<f32>(\"dxy\")?;"));
+        assert!(source.contains("p4_pt: good_muon_dxy,"));
+        assert!(source.contains(
+            "dimuon_order.sort_by(|&left, &right| good_muon_selected[right].p4_pt.total_cmp(&good_muon_selected[left].p4_pt));"
+        ));
+        assert!(source.contains(
+            "let (e1, px1, py1, pz1) = gen_four_vector(first.p4_pt, first.p4_eta, first.p4_phi, first.p4_mass);"
+        ));
+    }
+
+    #[test]
+    fn generates_met_type1_producer_source() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "met_type1_codegen"
+year = "Run2024"
+
+[objects.clean_jet]
+source = "Jet"
+cuts = ["pt > 10 GeV"]
+
+[regions.signal]
+require = ["met_type1_pt(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, mass) > 30 GeV"]
+
+[[outputs]]
+name = "met_pt_def"
+expr = "met_type1_pt(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, mass)"
+
+[[outputs]]
+name = "met_phi_def"
+expr = "met_type1_phi(clean_jet, PuppiMET_pt, PuppiMET_phi, pt, mass)"
+"#,
+        )
+        .unwrap();
+        let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV15_CATALOGUE, "v15").unwrap();
+        let plan = validate(&spec, &catalogue).unwrap();
+        let source = generate_producer_source(&plan).unwrap();
+
+        assert!(source.contains("let clean_jet_muonSubtrFactor"));
+        assert!(source.contains("let clean_jet_chEmEF"));
+        assert!(source.contains("let clean_jet_neEmEF"));
+        assert!(source.contains("for jet in &clean_jet_selected"));
+        assert!(source.contains("if ch_em_ef + ne_em_ef >= 0.9_f64"));
+        assert!(source.contains("let shifted = jet.mass as f64 * (1.0_f64 - muon_subtr);"));
+        assert!(source.contains("gen_vector_phi(px, py)"));
+    }
+
+    #[test]
+    fn generates_jet_veto_map_run2024_producer_source() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "jet_veto_codegen"
+year = "Run2024"
+
+[objects.clean_jet]
+source = "Jet"
+cuts = [
+  "pt > 10 GeV",
+  "jet_veto_map_run2024() == 0",
+]
+
+[[outputs]]
+name = "n_clean_jet"
+expr = "count(clean_jet)"
+"#,
+        )
+        .unwrap();
+        let catalogue = Catalogue::from_nanoaod_yaml_str(NANOV15_CATALOGUE, "v15").unwrap();
+        let plan = validate(&spec, &catalogue).unwrap();
+        let source = generate_producer_source(&plan).unwrap();
+
+        assert!(source.contains(crate::JET_VETO_MAP_RUN2024_FILE));
+        assert!(source.contains(crate::JET_VETO_MAP_RUN2024_CORRECTION));
+        assert!(source.contains("nano_corrections::Value::from(\"jetvetomap\")"));
+        assert!(source.contains("clean_jet_eta as f64"));
+        assert!(source.contains("clean_jet_phi as f64"));
     }
 }

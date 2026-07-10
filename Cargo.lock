@@ -1027,6 +1027,8 @@ dependencies = [
  "nano-workflow",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "toml",
 ]
 
 [[package]]

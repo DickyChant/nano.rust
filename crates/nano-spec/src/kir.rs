@@ -6,7 +6,7 @@
 //! expression graph. The current interpreter uses the executable plan lowering
 //! while Core still lacks object identity on zero-argument `object` calls.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -14,8 +14,8 @@ use nano_core::{BranchSpec, BranchType};
 
 use crate::core::{self, CoreIr, ExprKind, PrimitiveArg, PrimitiveError, PrimitiveRegistry, Type};
 use crate::{
-    Catalogue, CatalogueBranch, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, HistogramDef,
-    Quantity, ResolvedPlan, SpecError, SystematicDef, WeightDef,
+    ArithOp, Catalogue, CatalogueBranch, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr,
+    HistogramDef, ObjectKinematics, Quantity, ResolvedPlan, SpecError, SystematicDef, WeightDef,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -43,6 +43,7 @@ pub struct KirProgram {
     pub outputs: Vec<KirOutput>,
     pub histograms: Vec<KirHistogram>,
     pub systematics: Vec<SystematicDef>,
+    pub object_corrections: Vec<KirObjectCorrection>,
     pub shape_corrections: Vec<KirShapeCorrection>,
     pub scale_factor_corrections: Vec<KirScaleFactorCorrection>,
     pub weight: WeightDef,
@@ -153,6 +154,7 @@ pub struct NamedValue {
 pub struct KirObject {
     pub name: String,
     pub source: String,
+    pub kinematics: ObjectKinematics,
     pub cuts: Vec<Cut>,
 }
 
@@ -185,6 +187,35 @@ pub struct KirOutput {
 pub struct KirHistogram {
     pub name: String,
     pub def: HistogramDef,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KirObjectCorrection {
+    pub name: String,
+    pub collection: String,
+    pub attr: String,
+    pub source_attr: String,
+    pub payload: KirObjectCorrectionPayload,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum KirObjectCorrectionPayload {
+    JecNominal {
+        file: String,
+        correction: String,
+        raw_factor_attr: String,
+        inputs: Vec<crate::ScaleFactorInputDef>,
+    },
+    JerNominal {
+        scale_factor_file: String,
+        scale_factor_correction: String,
+        scale_factor_inputs: Vec<crate::ScaleFactorInputDef>,
+        resolution_file: String,
+        resolution_correction: String,
+        resolution_inputs: Vec<crate::ScaleFactorInputDef>,
+        gen_jet_index_attr: String,
+        gen_jet_pt_branch: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -345,6 +376,7 @@ pub fn lower_to_kir(core: &CoreIr) -> Result<KirProgram, KirError> {
                 object.source.as_ref().map(|source| KirObject {
                     name: object.name.clone(),
                     source: source.clone(),
+                    kinematics: ObjectKinematics::default(),
                     cuts: Vec::new(),
                 })
             })
@@ -380,6 +412,7 @@ pub fn lower_to_kir(core: &CoreIr) -> Result<KirProgram, KirError> {
             })
             .collect(),
         systematics: vec![SystematicDef::Nominal],
+        object_corrections: Vec::new(),
         shape_corrections: Vec::new(),
         scale_factor_corrections: Vec::new(),
         weight: WeightDef::default(),
@@ -401,6 +434,7 @@ pub fn lower_plan_to_kir(plan: &ResolvedPlan) -> Result<KirProgram, KirError> {
         .map(|object| KirObject {
             name: object.name.clone(),
             source: object.source.clone(),
+            kinematics: object.kinematics.clone(),
             cuts: object.cuts.clone(),
         })
         .collect();
@@ -450,6 +484,49 @@ pub fn lower_plan_to_kir(plan: &ResolvedPlan) -> Result<KirProgram, KirError> {
         .collect();
     program.systematics = plan.spec.systematics.clone();
     program.lumi_mask = plan.spec.lumi_mask.clone();
+    program.object_corrections = plan
+        .spec
+        .object_corrections
+        .iter()
+        .map(|correction| KirObjectCorrection {
+            name: correction.name.clone(),
+            collection: correction.collection.clone(),
+            attr: correction.attr.clone(),
+            source_attr: correction.source_attr.clone(),
+            payload: match &correction.payload {
+                crate::ObjectCorrectionPayload::JecNominal {
+                    file,
+                    correction,
+                    raw_factor_attr,
+                    inputs,
+                } => KirObjectCorrectionPayload::JecNominal {
+                    file: file.clone(),
+                    correction: correction.clone(),
+                    raw_factor_attr: raw_factor_attr.clone(),
+                    inputs: inputs.clone(),
+                },
+                crate::ObjectCorrectionPayload::JerNominal {
+                    scale_factor_file,
+                    scale_factor_correction,
+                    scale_factor_inputs,
+                    resolution_file,
+                    resolution_correction,
+                    resolution_inputs,
+                    gen_jet_index_attr,
+                    gen_jet_pt_branch,
+                } => KirObjectCorrectionPayload::JerNominal {
+                    scale_factor_file: scale_factor_file.clone(),
+                    scale_factor_correction: scale_factor_correction.clone(),
+                    scale_factor_inputs: scale_factor_inputs.clone(),
+                    resolution_file: resolution_file.clone(),
+                    resolution_correction: resolution_correction.clone(),
+                    resolution_inputs: resolution_inputs.clone(),
+                    gen_jet_index_attr: gen_jet_index_attr.clone(),
+                    gen_jet_pt_branch: gen_jet_pt_branch.clone(),
+                },
+            },
+        })
+        .collect();
     program.shape_corrections = plan
         .spec
         .shape_corrections
@@ -704,9 +781,8 @@ fn derived_dependencies(object: &DerivedObjectDef) -> Vec<String> {
 fn output_expr_type(expr: &Expr) -> Type {
     match expr {
         Expr::Count(_) | Expr::CountWhere { .. } => Type::Int,
-        Expr::EventScalar(_) | Expr::All { .. } | Expr::Any { .. } | Expr::EitherPairPt { .. } => {
-            Type::Bool
-        }
+        Expr::All { .. } | Expr::Any { .. } | Expr::EitherPairPt { .. } => Type::Bool,
+        Expr::EventScalar(_) => Type::Float,
         Expr::Attr { .. }
         | Expr::Literal(_)
         | Expr::Binary { .. }
@@ -715,6 +791,21 @@ fn output_expr_type(expr: &Expr) -> Type {
         | Expr::SumAttr { .. }
         | Expr::ClosestMass { .. }
         | Expr::OtherMass { .. }
+        | Expr::ZepVv { .. }
+        | Expr::SystemMetEta { .. }
+        | Expr::SystemMetPt { .. }
+        | Expr::SystemPairMetPt { .. }
+        | Expr::SystemPairPtBalance { .. }
+        | Expr::MetType1Pt { .. }
+        | Expr::MetType1Phi { .. }
+        | Expr::LeadingType1Mt { .. }
+        | Expr::SystemDeltaPhi { .. }
+        | Expr::LegacyLeptonRpt { .. }
+        | Expr::PairConstituentAttr { .. }
+        | Expr::ZepMax { .. }
+        | Expr::IndexNotIn { .. }
+        | Expr::JetIdTightRun2024 { .. }
+        | Expr::JetVetoMapRun2024 { .. }
         | Expr::LeadingAttr { .. }
         | Expr::PairDeltaR
         | Expr::PairLeadingPt
@@ -727,6 +818,7 @@ fn output_expr_type(expr: &Expr) -> Type {
 
 pub fn verify(program: &KirProgram) -> Result<(), KirError> {
     verify_requirements(program)?;
+    verify_object_corrections(program)?;
     verify_shape_corrections(program)?;
     verify_scale_factor_corrections(program)?;
     let registry = PrimitiveRegistry::standard();
@@ -768,8 +860,17 @@ fn verify_requirement_expr(
 ) -> Result<RequirementExprType, KirError> {
     match expr {
         Expr::EventScalar(branch) => {
-            require_event_scalar_branch(program, branch, context)?;
-            Ok(RequirementExprType::Bool)
+            let branch_type = require_event_scalar_branch(program, branch, context)?;
+            if branch_type == BranchType::Bool {
+                Ok(RequirementExprType::Bool)
+            } else if is_numeric_scalar_branch(branch_type) {
+                Ok(RequirementExprType::Numeric(event_scalar_dimension(branch)))
+            } else {
+                Err(KirError::Lower(format!(
+                    "{context}: event scalar branch `{branch}` has type {}, expected bool or numeric scalar",
+                    raw_branch_type(branch_type)
+                )))
+            }
         }
         Expr::Count(object) => {
             require_object(program, object, context)?;
@@ -780,45 +881,203 @@ fn verify_requirement_expr(
             verify_selected_numeric_expr(program, object, &predicate.lhs, context)?;
             Ok(RequirementExprType::Count)
         }
-        Expr::SumAttr { object, attr } | Expr::LeadingAttr { object, attr } => {
-            require_object_attr(program, object, attr, context).map(RequirementExprType::Numeric)
-        }
         Expr::All { object, predicate } | Expr::Any { object, predicate } => {
             require_object(program, object, context)?;
             verify_selected_numeric_expr(program, object, &predicate.lhs, context)?;
             Ok(RequirementExprType::Bool)
         }
         Expr::EitherPairPt { left, right, .. } => {
-            require_object_attr(program, left, "pt", context)?;
-            require_object_attr(program, right, "pt", context)?;
+            require_object_kinematic_component(program, left, "pt", context)?;
+            require_object_kinematic_component(program, right, "pt", context)?;
             Ok(RequirementExprType::Bool)
+        }
+        other => verify_numeric_requirement_expr(program, other, context)
+            .map(RequirementExprType::Numeric),
+    }
+}
+
+fn verify_numeric_requirement_expr(
+    program: &KirProgram,
+    expr: &Expr,
+    context: &str,
+) -> Result<crate::Dimension, KirError> {
+    match expr {
+        Expr::Attr { object, attr } => {
+            if program
+                .derived_objects
+                .iter()
+                .any(|derived| derived.name == *object)
+            {
+                require_derived_attr(program, object, attr, context)
+            } else {
+                require_object_attr(program, object, attr, context)
+            }
+        }
+        Expr::EventScalar(branch) => {
+            let branch_type = require_event_scalar_branch(program, branch, context)?;
+            if is_numeric_scalar_branch(branch_type) {
+                Ok(event_scalar_dimension(branch))
+            } else {
+                Err(KirError::Lower(format!(
+                    "{context}: event scalar branch `{branch}` has type {}, expected numeric scalar",
+                    raw_branch_type(branch_type)
+                )))
+            }
+        }
+        Expr::Literal(_) => Ok(crate::Dimension::Dimensionless),
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs_dimension = verify_numeric_requirement_expr(program, lhs, context)?;
+            let rhs_dimension = verify_numeric_requirement_expr(program, rhs, context)?;
+            if matches!(op, ArithOp::Add | ArithOp::Sub) {
+                if matches!(**rhs, Expr::Literal(_))
+                    && rhs_dimension == crate::Dimension::Dimensionless
+                {
+                    return Ok(lhs_dimension);
+                }
+                if matches!(**lhs, Expr::Literal(_))
+                    && lhs_dimension == crate::Dimension::Dimensionless
+                {
+                    return Ok(rhs_dimension);
+                }
+            }
+            verify_arithmetic_dimension(*op, lhs_dimension, rhs_dimension, context, expr)
+        }
+        Expr::Abs(inner) | Expr::Sqrt(inner) => {
+            verify_numeric_requirement_expr(program, inner, context)
+        }
+        Expr::SumAttr { object, attr } | Expr::LeadingAttr { object, attr } => {
+            require_object_attr(program, object, attr, context)
         }
         Expr::ClosestMass { left, right, .. } | Expr::OtherMass { left, right, .. } => {
             require_derived_attr(program, left, "mass", context)?;
             require_derived_attr(program, right, "mass", context)?;
-            Ok(RequirementExprType::Numeric(crate::Dimension::Momentum))
+            Ok(crate::Dimension::Momentum)
         }
-        Expr::Attr { object, attr } => if program
-            .derived_objects
-            .iter()
-            .any(|derived| derived.name == *object)
-        {
-            require_derived_attr(program, object, attr, context)
-        } else {
-            require_object_attr(program, object, attr, context)
+        Expr::ZepVv {
+            system,
+            met_pt,
+            met_phi,
+            dijet,
+        } => {
+            require_derived_attr(program, system, "eta", context)?;
+            require_derived_attr(program, dijet, "delta_eta", context)?;
+            require_numeric_event_scalar_branch(program, met_pt, context)?;
+            require_numeric_event_scalar_branch(program, met_phi, context)?;
+            Ok(crate::Dimension::Dimensionless)
         }
-        .map(RequirementExprType::Numeric),
-        Expr::Literal(_)
-        | Expr::Binary { .. }
-        | Expr::Abs(_)
-        | Expr::Sqrt(_)
-        | Expr::PairDeltaR
-        | Expr::PairLeadingPt
-        | Expr::PairSubleadingPt
-        | Expr::CandidateMinDeltaR
-        | Expr::CandidateLeadingPt
-        | Expr::CandidateSubleadingPt => Err(KirError::Unsupported(format!(
-            "{context}: expression `{expr}` is not supported as a region requirement"
+        Expr::SystemMetEta {
+            system,
+            met_pt,
+            met_phi,
+        } => {
+            require_derived_attr(program, system, "eta", context)?;
+            require_numeric_event_scalar_branch(program, met_pt, context)?;
+            require_numeric_event_scalar_branch(program, met_phi, context)?;
+            Ok(crate::Dimension::Dimensionless)
+        }
+        Expr::SystemMetPt {
+            system,
+            met_pt,
+            met_phi,
+        } => {
+            require_derived_attr(program, system, "pt", context)?;
+            require_numeric_event_scalar_branch(program, met_pt, context)?;
+            require_numeric_event_scalar_branch(program, met_phi, context)?;
+            Ok(crate::Dimension::Momentum)
+        }
+        Expr::SystemPairMetPt {
+            system,
+            met_pt,
+            met_phi,
+            pair,
+        } => {
+            require_derived_attr(program, system, "pt", context)?;
+            require_derived_attr(program, pair, "pt", context)?;
+            require_numeric_event_scalar_branch(program, met_pt, context)?;
+            require_numeric_event_scalar_branch(program, met_phi, context)?;
+            Ok(crate::Dimension::Momentum)
+        }
+        Expr::SystemPairPtBalance {
+            system,
+            met_pt,
+            met_phi,
+            pair,
+        } => {
+            require_derived_attr(program, system, "pt", context)?;
+            require_derived_attr(program, pair, "pt", context)?;
+            require_numeric_event_scalar_branch(program, met_pt, context)?;
+            require_numeric_event_scalar_branch(program, met_phi, context)?;
+            Ok(crate::Dimension::Dimensionless)
+        }
+        Expr::MetType1Pt {
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => {
+            require_met_type1(
+                program, jets, met_pt, met_phi, nominal_pt, shifted_pt, context,
+            )?;
+            Ok(crate::Dimension::Momentum)
+        }
+        Expr::MetType1Phi {
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => {
+            require_met_type1(
+                program, jets, met_pt, met_phi, nominal_pt, shifted_pt, context,
+            )?;
+            Ok(crate::Dimension::Dimensionless)
+        }
+        Expr::LeadingType1Mt {
+            object,
+            jets,
+            met_pt,
+            met_phi,
+            nominal_pt,
+            shifted_pt,
+        } => {
+            require_object_kinematic_component(program, object, "pt", context)?;
+            require_object_kinematic_component(program, object, "phi", context)?;
+            require_met_type1(
+                program, jets, met_pt, met_phi, nominal_pt, shifted_pt, context,
+            )?;
+            Ok(crate::Dimension::Momentum)
+        }
+        Expr::JetVetoMapRun2024 { object } => {
+            require_jet_veto_map_run2024(program, object, context)?;
+            Ok(crate::Dimension::Dimensionless)
+        }
+        Expr::SystemDeltaPhi { left, right } => {
+            require_derived_attr(program, left, "phi", context)?;
+            require_derived_attr(program, right, "phi", context)?;
+            Ok(crate::Dimension::Dimensionless)
+        }
+        Expr::LegacyLeptonRpt {
+            muons,
+            electrons,
+            dijet,
+        } => {
+            require_object_kinematic_component(program, muons, "pt", context)?;
+            require_object_kinematic_component(program, electrons, "pt", context)?;
+            require_derived_attr(program, dijet, "leading_pt", context)?;
+            require_derived_attr(program, dijet, "subleading_pt", context)?;
+            Ok(crate::Dimension::Dimensionless)
+        }
+        Expr::PairConstituentAttr { pair, attr, .. } => {
+            require_pair_constituent_attr(program, pair, attr, context)
+        }
+        Expr::ZepMax { system, dijet } => {
+            require_derived_attr(program, system, "eta", context)?;
+            require_derived_attr(program, dijet, "delta_eta", context)?;
+            Ok(crate::Dimension::Dimensionless)
+        }
+        other => Err(KirError::Unsupported(format!(
+            "{context}: expression `{other}` is not supported as a numeric region requirement"
         ))),
     }
 }
@@ -922,6 +1181,23 @@ fn require_event_scalar_branch(
     program: &KirProgram,
     branch: &str,
     context: &str,
+) -> Result<BranchType, KirError> {
+    let Some(spec) = program
+        .read_branches
+        .iter()
+        .find(|spec| spec.name == branch)
+    else {
+        return Err(KirError::Lower(format!(
+            "{context}: event scalar branch `{branch}` is missing from read schema"
+        )));
+    };
+    Ok(spec.branch_type)
+}
+
+fn require_numeric_event_scalar_branch(
+    program: &KirProgram,
+    branch: &str,
+    context: &str,
 ) -> Result<(), KirError> {
     let Some(spec) = program
         .read_branches
@@ -932,14 +1208,44 @@ fn require_event_scalar_branch(
             "{context}: event scalar branch `{branch}` is missing from read schema"
         )));
     };
-    if spec.branch_type == BranchType::Bool {
+    if spec.branch_type == BranchType::F32 {
         Ok(())
     } else {
         Err(KirError::Lower(format!(
-            "{context}: event scalar branch `{branch}` has type {}, expected bool",
+            "{context}: event scalar branch `{branch}` has type {}, expected float",
             raw_branch_type(spec.branch_type)
         )))
     }
+}
+
+fn require_met_type1(
+    program: &KirProgram,
+    jets: &str,
+    met_pt: &str,
+    met_phi: &str,
+    nominal_pt: &str,
+    shifted_pt: &str,
+    context: &str,
+) -> Result<(), KirError> {
+    for attr in crate::MET_TYPE1_JET_ATTRS {
+        require_object_attr(program, jets, attr, context)?;
+    }
+    require_object_attr(program, jets, nominal_pt, context)?;
+    require_object_attr(program, jets, shifted_pt, context)?;
+    require_numeric_event_scalar_branch(program, met_pt, context)?;
+    require_numeric_event_scalar_branch(program, met_phi, context)?;
+    Ok(())
+}
+
+fn require_jet_veto_map_run2024(
+    program: &KirProgram,
+    object: &str,
+    context: &str,
+) -> Result<(), KirError> {
+    for attr in crate::JET_VETO_MAP_RUN2024_ATTRS {
+        require_object_attr(program, object, attr, context)?;
+    }
+    Ok(())
 }
 
 fn require_object_attr(
@@ -948,8 +1254,20 @@ fn require_object_attr(
     attr: &str,
     context: &str,
 ) -> Result<crate::Dimension, KirError> {
-    let object = require_object(program, object, context)?;
-    let branch = format!("{}_{}", object.source, attr);
+    let object_def = require_object(program, object, context)?;
+    if program
+        .object_corrections
+        .iter()
+        .any(|correction| correction.collection == object && correction.attr == attr)
+    {
+        return Ok(kir_object_attr_dimension(
+            program,
+            object,
+            attr,
+            &mut BTreeSet::new(),
+        ));
+    }
+    let branch = format!("{}_{}", object_def.source, attr);
     if program.model_outputs.iter().any(|output| output == &branch) {
         return Ok(crate::Dimension::Dimensionless);
     }
@@ -967,6 +1285,88 @@ fn require_object_attr(
     Ok(attribute_dimension(attr))
 }
 
+fn kir_object_attr_dimension(
+    program: &KirProgram,
+    object: &str,
+    attr: &str,
+    seen: &mut BTreeSet<String>,
+) -> crate::Dimension {
+    if !seen.insert(attr.to_string()) {
+        return attribute_dimension(attr);
+    }
+    if let Some(correction) = program
+        .object_corrections
+        .iter()
+        .find(|correction| correction.collection == object && correction.attr == attr)
+    {
+        return kir_object_attr_dimension(program, object, &correction.source_attr, seen);
+    }
+    attribute_dimension(attr)
+}
+
+fn require_object_four_vector(
+    program: &KirProgram,
+    object: &str,
+    context: &str,
+) -> Result<(), KirError> {
+    for component in ["pt", "eta", "phi", "mass"] {
+        require_object_kinematic_component(program, object, component, context)?;
+    }
+    Ok(())
+}
+
+fn require_object_kinematic_component(
+    program: &KirProgram,
+    object: &str,
+    component: &str,
+    context: &str,
+) -> Result<crate::Dimension, KirError> {
+    let object_def = require_object(program, object, context)?;
+    let attr = object_def
+        .kinematics
+        .component_attrs()
+        .into_iter()
+        .find_map(|(name, attr)| (name == component).then_some(attr))
+        .ok_or_else(|| {
+            KirError::Lower(format!(
+                "{context}: unknown kinematic component `{component}` for object `{object}`"
+            ))
+        })?;
+    let actual = require_object_attr(program, object, attr, context)?;
+    let expected = match component {
+        "pt" | "mass" => crate::Dimension::Momentum,
+        "eta" | "phi" => crate::Dimension::Dimensionless,
+        _ => crate::Dimension::Dimensionless,
+    };
+    if actual != expected {
+        return Err(KirError::Lower(format!(
+            "{context}: kinematic component `{component}` uses `{attr}` with dimension {actual:?}, expected {expected:?}"
+        )));
+    }
+    Ok(expected)
+}
+
+fn require_pair_constituent_attr(
+    program: &KirProgram,
+    pair_name: &str,
+    attr: &str,
+    context: &str,
+) -> Result<crate::Dimension, KirError> {
+    let derived = program
+        .derived_objects
+        .iter()
+        .find(|candidate| candidate.name == pair_name)
+        .ok_or_else(|| {
+            KirError::Lower(format!("{context}: unknown derived object `{pair_name}`"))
+        })?;
+    let DerivedSource::Pair(pair) = &derived.def.source else {
+        return Err(KirError::Unsupported(format!(
+            "{context}: derived object `{pair_name}` is not a pair"
+        )));
+    };
+    require_object_attr(program, &pair.object, attr, context)
+}
+
 fn require_derived_attr(
     program: &KirProgram,
     object: &str,
@@ -979,13 +1379,41 @@ fn require_derived_attr(
         .find(|candidate| candidate.name == object)
         .ok_or_else(|| KirError::Lower(format!("{context}: unknown derived object `{object}`")))?;
     match (&derived.def.source, attr) {
-        (DerivedSource::Pair(_), "mass" | "pt") | (DerivedSource::Candidate(_), "mass" | "pt") => {
+        (DerivedSource::Pair(pair), "mass") => {
+            require_object_four_vector(program, &pair.object, context)?;
             Ok(crate::Dimension::Momentum)
         }
-        (DerivedSource::Pair(_), "min_delta_r" | "dR" | "dr")
-        | (DerivedSource::Candidate(_), "min_delta_r" | "dR" | "dr") => {
+        (DerivedSource::Pair(pair), "pt") => {
+            require_object_kinematic_component(program, &pair.object, "pt", context)?;
+            require_object_kinematic_component(program, &pair.object, "phi", context)?;
+            Ok(crate::Dimension::Momentum)
+        }
+        (DerivedSource::Pair(pair), "leading_pt" | "subleading_pt") => {
+            require_object_kinematic_component(program, &pair.object, "pt", context)?;
+            Ok(crate::Dimension::Momentum)
+        }
+        (DerivedSource::Pair(pair), "leading_mass" | "subleading_mass") => {
+            require_object_kinematic_component(program, &pair.object, "mass", context)?;
+            Ok(crate::Dimension::Momentum)
+        }
+        (DerivedSource::Candidate(_), "mass" | "pt") => Ok(crate::Dimension::Momentum),
+        (DerivedSource::Pair(pair), "min_delta_r" | "dR" | "dr") => {
+            require_object_kinematic_component(program, &pair.object, "eta", context)?;
+            require_object_kinematic_component(program, &pair.object, "phi", context)?;
             Ok(crate::Dimension::Dimensionless)
         }
+        (DerivedSource::Pair(pair), "eta" | "delta_eta" | "leading_eta" | "subleading_eta") => {
+            require_object_kinematic_component(program, &pair.object, "eta", context)?;
+            Ok(crate::Dimension::Dimensionless)
+        }
+        (DerivedSource::Pair(pair), "phi" | "delta_phi" | "leading_phi" | "subleading_phi") => {
+            require_object_kinematic_component(program, &pair.object, "phi", context)?;
+            Ok(crate::Dimension::Dimensionless)
+        }
+        (DerivedSource::Candidate(_), "min_delta_r" | "dR" | "dr") => {
+            Ok(crate::Dimension::Dimensionless)
+        }
+        (DerivedSource::Candidate(_), "eta" | "phi") => Ok(crate::Dimension::Dimensionless),
         _ => Err(KirError::Unsupported(format!(
             "{context}: derived object `{object}` has no supported attribute `{attr}`"
         ))),
@@ -998,6 +1426,28 @@ fn attribute_dimension(attr: &str) -> crate::Dimension {
         value if value.ends_with("Pt") || value.ends_with("Mass") => crate::Dimension::Momentum,
         _ => crate::Dimension::Dimensionless,
     }
+}
+
+fn event_scalar_dimension(branch: &str) -> crate::Dimension {
+    branch
+        .rsplit_once('_')
+        .map(|(_, attr)| attribute_dimension(attr))
+        .unwrap_or(crate::Dimension::Dimensionless)
+}
+
+fn is_numeric_scalar_branch(branch_type: BranchType) -> bool {
+    matches!(
+        branch_type,
+        BranchType::I8
+            | BranchType::U8
+            | BranchType::I16
+            | BranchType::U16
+            | BranchType::I32
+            | BranchType::U32
+            | BranchType::I64
+            | BranchType::U64
+            | BranchType::F32
+    )
 }
 
 fn is_numeric_vector_branch(branch_type: BranchType) -> bool {
@@ -1013,6 +1463,120 @@ fn is_numeric_vector_branch(branch_type: BranchType) -> bool {
             | BranchType::VecU64
             | BranchType::VecF32
     )
+}
+
+fn verify_object_corrections(program: &KirProgram) -> Result<(), KirError> {
+    for correction in &program.object_corrections {
+        if !program
+            .objects
+            .iter()
+            .any(|object| object.name == correction.collection)
+        {
+            return Err(KirError::Lower(format!(
+                "object correction `{}` references unknown collection `{}`",
+                correction.name, correction.collection
+            )));
+        }
+        match &correction.payload {
+            KirObjectCorrectionPayload::JecNominal {
+                file,
+                correction: payload_name,
+                inputs,
+                ..
+            } => {
+                let set = nano_corrections::CorrectionSet::from_path(file).map_err(|error| {
+                    KirError::Lower(format!(
+                        "JEC nominal correction `{}` failed to load `{}`: {error}",
+                        correction.name, file
+                    ))
+                })?;
+                let payload = set.correction_ref(payload_name).map_err(|error| {
+                    KirError::Lower(format!(
+                        "JEC nominal correction `{}` payload lookup failed: {error}",
+                        correction.name
+                    ))
+                })?;
+                let declared = inputs
+                    .iter()
+                    .map(|input| input.name.as_str())
+                    .collect::<Vec<_>>();
+                let expected = payload
+                    .inputs()
+                    .iter()
+                    .map(|input| input.name.as_str())
+                    .collect::<Vec<_>>();
+                if declared != expected {
+                    return Err(KirError::Lower(format!(
+                        "JEC nominal correction `{}` declared inputs [{}] but payload expects [{}]",
+                        correction.name,
+                        declared.join(", "),
+                        expected.join(", ")
+                    )));
+                }
+            }
+            KirObjectCorrectionPayload::JerNominal {
+                scale_factor_file,
+                scale_factor_correction,
+                scale_factor_inputs,
+                resolution_file,
+                resolution_correction,
+                resolution_inputs,
+                ..
+            } => {
+                verify_object_correction_payload(
+                    &correction.name,
+                    "JER scale-factor",
+                    scale_factor_file,
+                    scale_factor_correction,
+                    scale_factor_inputs,
+                )?;
+                verify_object_correction_payload(
+                    &correction.name,
+                    "JER resolution",
+                    resolution_file,
+                    resolution_correction,
+                    resolution_inputs,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_object_correction_payload(
+    correction_name: &str,
+    label: &str,
+    file: &str,
+    payload_name: &str,
+    inputs: &[crate::ScaleFactorInputDef],
+) -> Result<(), KirError> {
+    let set = nano_corrections::CorrectionSet::from_path(file).map_err(|error| {
+        KirError::Lower(format!(
+            "{label} correction `{correction_name}` failed to load `{file}`: {error}"
+        ))
+    })?;
+    let payload = set.correction_ref(payload_name).map_err(|error| {
+        KirError::Lower(format!(
+            "{label} correction `{correction_name}` payload lookup failed: {error}"
+        ))
+    })?;
+    let declared = inputs
+        .iter()
+        .map(|input| input.name.as_str())
+        .collect::<Vec<_>>();
+    let expected = payload
+        .inputs()
+        .iter()
+        .map(|input| input.name.as_str())
+        .collect::<Vec<_>>();
+    if declared != expected {
+        return Err(KirError::Lower(format!(
+            "{label} correction `{correction_name}` declared inputs [{}] but payload expects [{}]",
+            declared.join(", "),
+            expected.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn verify_shape_corrections(program: &KirProgram) -> Result<(), KirError> {
@@ -1147,7 +1711,9 @@ fn verify_block(
                     return Err(KirError::DuplicateValue(value.id));
                 }
                 let actual = match expr {
-                    Rvalue::Attr { .. } | Rvalue::DerivedAttr { .. } => value.ty.clone(),
+                    Rvalue::Literal(_) | Rvalue::Attr { .. } | Rvalue::DerivedAttr { .. } => {
+                        value.ty.clone()
+                    }
                     _ => verify_rvalue(expr, registry, values)?,
                 };
                 if actual != value.ty {
@@ -1398,6 +1964,41 @@ mod tests {
         verify(&kir).expect("verify kir");
         assert_eq!(kir.name, "muon_demo");
         assert!(matches!(kir.block.stmts.last(), Some(Stmt::Return { .. })));
+    }
+
+    #[test]
+    fn verifies_numeric_arithmetic_region_requirements() {
+        let spec = AnalysisSpec::from_toml_str(
+            r#"
+[analysis]
+name = "charge_balance"
+year = "Run2018"
+
+[objects.fake_muon]
+source = "Muon"
+cuts = []
+
+[objects.fake_electron]
+source = "Electron"
+cuts = []
+
+[regions.signal]
+require = [
+  "abs(sum(fake_muon.charge) + sum(fake_electron.charge)) == 1",
+]
+
+[[outputs]]
+name = "n_fake_muon"
+expr = "count(fake_muon)"
+"#,
+        )
+        .expect("parse charge-balance spec");
+        let catalogue =
+            Catalogue::from_nanoaod_yaml_str(NANOV9_CATALOGUE, "v9").expect("parse catalogue");
+        let plan = crate::validate(&spec, &catalogue).expect("validate spec");
+        let kir = lower_plan_to_kir(&plan).expect("lower executable kir");
+
+        verify(&kir).expect("verify kir");
     }
 
     #[test]

@@ -902,7 +902,7 @@ pub(crate) fn parse_tree<'a>(
         parse_branch_header(raw, ctx, source.clone())
     })?;
     let mut leaves_payload = cur.checked_sub()?;
-    let _tree_leaves = read_tobjarray(&mut leaves_payload, ctx, parse_leaf)?;
+    let _tree_leaves = read_tobjarray(&mut leaves_payload, ctx, |_raw, _ctx| Ok(()))?;
     let _aliases = maybe_raw_buffer(cur, ctx)?;
     let index_value_count = cur.i32()?;
     for _ in 0..index_value_count.max(0) {

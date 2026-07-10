@@ -601,6 +601,7 @@ pub mod writer {
         U32(String, Vec<u32>),
         U64(String, Vec<u64>),
         F32(String, Vec<f32>),
+        F64(String, Vec<f64>),
         VecF32(String, Vec<Vec<f32>>),
     }
 
@@ -625,6 +626,10 @@ pub mod writer {
             Self::F32(name.into(), values)
         }
 
+        pub fn f64(name: impl Into<String>, values: Vec<f64>) -> Self {
+            Self::F64(name.into(), values)
+        }
+
         pub fn vec_f32(name: impl Into<String>, values: Vec<Vec<f32>>) -> Self {
             Self::VecF32(name.into(), values)
         }
@@ -636,6 +641,7 @@ pub mod writer {
                 Self::U32(name, values) => Branch::u32(name, values.clone()),
                 Self::U64(name, values) => Branch::u64(name, values.clone()),
                 Self::F32(name, values) => Branch::f32(name, values.clone()),
+                Self::F64(name, values) => Branch::f64(name, values.clone()),
                 Self::VecF32(name, values) => Branch::vec_f32(name, values.clone()),
             }
         }

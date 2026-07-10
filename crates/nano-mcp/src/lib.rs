@@ -435,6 +435,7 @@ pub fn run_workflow(input: RunWorkflowInput) -> RunWorkflowResult {
         parallel: input.parallel,
         kernel: None,
         interpret: false,
+        max_events: None,
     }) {
         Ok(report) => run_workflow_success(report),
         Err(error) => RunWorkflowResult {

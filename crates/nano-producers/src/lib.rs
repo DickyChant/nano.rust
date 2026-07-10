@@ -1,5 +1,6 @@
 pub mod muon;
 pub mod weights;
+pub mod wz;
 
 pub use muon::{MuonProducer, MuonSkimRow};
 pub use weights::{
@@ -7,3 +8,4 @@ pub use weights::{
     JetCorrectionInput, JetSystematic, JmeJetCorrections, VariedJet, VariedJetSelection,
     VariedMuonSignalRegion, WeightedMuonSkimRow,
 };
+pub use wz::{wz_schema, WzConfig, WzProducer, WzRegion, WzRow};

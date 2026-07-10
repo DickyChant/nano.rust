@@ -1,0 +1,11 @@
+# MC samples for the Run 3 WZ VBS validation slice
+wz_vbs_ewk:
+- /WZTo3LNu-2Jets-EWK_TuneCP5_13p6TeV_madgraph-madspin-pythia8/RunIII2024Summer24NanoAODv15-150X_mcRun3_2024_realistic_v2-v2/NANOAODSIM
+
+wz_vbs_ewk_qcd:
+- /WZTo3LNu-2Jets-EWK-QCD_TuneCP5_13p6TeV_madgraph-madspin-pythia8/RunIII2024Summer24NanoAODv15-150X_mcRun3_2024_realistic_v2-v2/NANOAODSIM
+
+# Present on EOS but currently empty on the checked mount:
+# - /WZJJto3LNu-EWK_TuneCP5_13p6TeV_madgraph-pythia8/RunIII2024Summer24NanoAODv15-150X_mcRun3_2024_realistic_v2-v2/NANOAODSIM
+# - /WZTo3LNu-2Jets-QCD_TuneCP5_13p6TeV_madgraph-madspin-pythia8/RunIII2024Summer24NanoAODv15-150X_mcRun3_2024_realistic_v2-v2/NANOAODSIM
+# - /VBSWZ-Interference_TuneCP5_13p6TeV_madgraph-pythia8/RunIII2024Summer24NanoAODv15-150X_mcRun3_2024_realistic_v2-v2/NANOAODSIM

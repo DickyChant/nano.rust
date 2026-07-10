@@ -43,6 +43,98 @@ fn validate_muon_toml_reports_resolved_summary() {
 }
 
 #[test]
+fn validate_wz_vbs_accepts_explicit_nanoaod_v15_catalogue() {
+    let spec = repo_path("crates/nano-spec/examples/wz_vbs.toml");
+    let output = run([
+        "validate",
+        "--catalogue-version",
+        "v15",
+        spec.to_str().unwrap(),
+    ])
+    .expect("validate command");
+
+    let Output::Validate(report) = output else {
+        panic!("expected validate report");
+    };
+
+    assert_eq!(report.analysis.name, "wz_vbs_nominal");
+    assert_eq!(report.catalogue_version, "v15");
+    assert!(report
+        .read_branches
+        .iter()
+        .any(|branch| { branch.name == "Electron_cutBased" && branch.branch_type == "VecU8" }));
+}
+
+#[test]
+fn campaign_wz_vbs_declares_demo_and_validation_gates() {
+    let campaign = repo_path("configs/validation/wz_vbs_2024_v15_campaign.toml");
+    let output = run(["campaign", campaign.to_str().unwrap()]).expect("campaign command");
+
+    let Output::Campaign(report) = output else {
+        panic!("expected campaign report");
+    };
+    assert_eq!(report.name, "wz_vbs_2024_v15_campaign");
+    assert_eq!(report.catalogue_version, "v15");
+    assert!(report.demo.is_some());
+    assert!(report
+        .gates
+        .iter()
+        .any(|gate| gate.name == "legacy_wz_root_parity" && gate.status == "implemented"));
+    assert!(report.gates.iter().any(|gate| {
+        gate.scope == "branch_new_analysis"
+            && gate.status == "implemented"
+            && gate.kind == "yield_closure"
+            && gate.expected_entries == Some(1)
+    }));
+}
+
+#[test]
+fn campaign_yield_closure_checks_materialized_root_entries() {
+    let fixture = Fixture::new("campaign-yield");
+    let artifact = fixture.path("skim.root");
+    let campaign = fixture.path("campaign.toml");
+    let spec = repo_path("crates/nano-spec/examples/muon.toml");
+    write_compare_file(&artifact, vec![1.0, 2.0, 3.0]);
+    std::fs::write(
+        &campaign,
+        format!(
+            r#"
+[campaign]
+name = "yield_campaign"
+analysis_spec = "{}"
+catalogue_version = "v9"
+purpose = "test materialized yield closure"
+
+[[gate]]
+name = "selected_entries"
+kind = "yield_closure"
+status = "implemented"
+scope = "branch_new_analysis"
+description = "check selected entries"
+artifact = "skim.root"
+tree = "Events"
+expected_entries = 3
+"#,
+            spec.display()
+        ),
+    )
+    .unwrap();
+
+    let output = run(["campaign", campaign.to_str().unwrap()]).expect("campaign command");
+
+    let Output::Campaign(report) = output else {
+        panic!("expected campaign report");
+    };
+    let gate = report
+        .gates
+        .iter()
+        .find(|gate| gate.name == "selected_entries")
+        .expect("yield gate");
+    assert_eq!(gate.check_status, "passed");
+    assert_eq!(gate.observed_entries, Some(3));
+}
+
+#[test]
 fn validate_broken_spec_fails_with_structured_errors() {
     let spec = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/broken-muon.toml");
     let error = run(["--json", "validate", spec.to_str().unwrap()])
@@ -151,7 +243,10 @@ fn codegen_muon_toml_emits_generated_producer_source() {
         .contains("impl nano_analysis::Region for SignalRegion"));
     assert!(report
         .source
-        .contains("baseline.select::<SignalRegion>(|_| n_good_muon >= 1_u32)"));
+        .contains("let signal_predicate = n_good_muon >= 1_u32;"));
+    assert!(report
+        .source
+        .contains("baseline.select::<SignalRegion>(|_| signal_predicate)"));
 }
 
 #[test]
@@ -232,6 +327,89 @@ fn compare_identical_root_files_reports_pass() {
 }
 
 #[test]
+fn compare_branch_tolerance_flag_allows_named_branch_jitter() {
+    let fixture = Fixture::new("compare-branch-tolerance");
+    let reference = fixture.path("reference.root");
+    let candidate = fixture.path("candidate.root");
+    write_compare_file(&reference, vec![1.0, 2.0, 3.0]);
+    write_compare_file(&candidate, vec![1.0, 2.2, 3.0]);
+
+    let output = run([
+        "compare",
+        reference.to_str().unwrap(),
+        candidate.to_str().unwrap(),
+        "--rtol",
+        "0",
+        "--atol",
+        "0",
+        "--branch-tolerance",
+        "pt:0:0.25",
+    ])
+    .expect("compare command");
+
+    let Output::Compare(report) = output else {
+        panic!("expected compare report");
+    };
+    assert!(report.passed());
+    assert_eq!(report.branch_tolerances.len(), 1);
+    assert_eq!(
+        report
+            .branches
+            .iter()
+            .find(|branch| branch.name == "pt")
+            .unwrap()
+            .n_mismatched,
+        0
+    );
+}
+
+#[test]
+fn compare_validation_spec_supplies_branch_tolerance_policy() {
+    let fixture = Fixture::new("compare-validation-spec");
+    let reference = fixture.path("reference.root");
+    let candidate = fixture.path("candidate.root");
+    let spec = fixture.path("validation.toml");
+    write_compare_file(&reference, vec![1.0, 2.0, 3.0]);
+    write_compare_file(&candidate, vec![1.0, 2.2, 3.0]);
+    std::fs::write(
+        &spec,
+        r#"
+[analysis]
+name = "validation_policy"
+year = "Run2024"
+
+[validation.compare]
+rtol = 0.0
+atol = 0.0
+
+[[validation.compare.branch_tolerance]]
+branch = "pt"
+rtol = 0.0
+atol = 0.25
+reason = "test stochastic branch"
+"#,
+    )
+    .unwrap();
+
+    let output = run([
+        "compare",
+        reference.to_str().unwrap(),
+        candidate.to_str().unwrap(),
+        "--validation-spec",
+        spec.to_str().unwrap(),
+    ])
+    .expect("compare command");
+
+    let Output::Compare(report) = output else {
+        panic!("expected compare report");
+    };
+    assert!(report.passed());
+    assert_eq!(report.tolerance.rtol, 0.0);
+    assert_eq!(report.tolerance.atol, 0.0);
+    assert_eq!(report.branch_tolerances.len(), 1);
+}
+
+#[test]
 fn compare_mismatch_json_is_well_formed_and_binary_exits_nonzero() {
     let fixture = Fixture::new("compare-fail");
     let reference = fixture.path("reference.root");
@@ -285,6 +463,7 @@ fn run_muon_spec_writes_skim_matching_single_pass_producer() {
         parallel: false,
         kernel: None,
         interpret: false,
+        max_events: None,
     })
     .expect("run workflow");
 
@@ -326,6 +505,133 @@ fn run_json_output_is_well_formed() {
 }
 
 #[test]
+fn run_input_list_executes_direct_sources_without_intermediate_skim() {
+    let fixture = Fixture::new("run-input-list");
+    let input_a = fixture.path("input-a.root");
+    let input_b = fixture.path("input-b.root");
+    let input_list = fixture.path("direct-sources.txt");
+    let output = fixture.path("skim.root");
+    write_synthetic_input(&input_a);
+    write_synthetic_input(&input_b);
+    std::fs::write(
+        &input_list,
+        format!(
+            "# Direct raw NanoAOD sources\n{}\n\n{}\n",
+            input_a.display(),
+            input_b.display()
+        ),
+    )
+    .unwrap();
+
+    let output_report = run([
+        "run",
+        repo_path("crates/nano-spec/examples/muon.toml")
+            .to_str()
+            .unwrap(),
+        "--input-list",
+        input_list.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ])
+    .expect("run command");
+
+    let Output::Run(report) = output_report else {
+        panic!("expected run report");
+    };
+    let expected_rows = single_pass_rows(&input_a)
+        .into_iter()
+        .chain(single_pass_rows(&input_b))
+        .collect::<Vec<_>>();
+
+    assert_eq!(report.mode, "compiled");
+    assert_eq!(report.kernel, "muon");
+    assert_eq!(report.inputs, vec![input_a, input_b]);
+    assert_eq!(report.events_seen, 10);
+    assert_eq!(report.events_selected, 6);
+    assert_eq!(read_skim_rows(&output), expected_rows);
+}
+
+#[test]
+fn eos_sources_resolves_sample_yaml_to_direct_input_list() {
+    let fixture = Fixture::new("eos-sources");
+    let store = fixture.path("store");
+    let sample_yaml = fixture.path("samples.yaml");
+    let output = fixture.path("sources.txt");
+    let mc_file = store
+        .join("mc")
+        .join("RunIII2024Summer24NanoAODv15")
+        .join("WZJJto3LNu-EWK_TuneCP5_13p6TeV_madgraph-pythia8")
+        .join("NANOAODSIM")
+        .join("150X_mcRun3_2024_realistic_v2-v2")
+        .join("0000")
+        .join("mc.root");
+    let data_file = store
+        .join("data")
+        .join("Run2024C")
+        .join("Muon0")
+        .join("NANOAOD")
+        .join("MINIv6NANOv15-v1")
+        .join("2530000")
+        .join("data.root");
+    std::fs::create_dir_all(mc_file.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(data_file.parent().unwrap()).unwrap();
+    std::fs::write(&mc_file, "").unwrap();
+    std::fs::write(&data_file, "").unwrap();
+    std::fs::write(
+        &sample_yaml,
+        "\
+wz_vbs_ewk:
+- /WZJJto3LNu-EWK_TuneCP5_13p6TeV_madgraph-pythia8/RunIII2024Summer24NanoAODv15-150X_mcRun3_2024_realistic_v2-v2/NANOAODSIM
+data_check:
+- [/Muon0/Run2024C-MINIv6NANOv15-v1/NANOAOD]
+",
+    )
+    .unwrap();
+
+    let output_report = run([
+        "eos-sources",
+        sample_yaml.to_str().unwrap(),
+        "--store-root",
+        store.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--max-files-per-dataset",
+        "1",
+    ])
+    .expect("eos-sources command");
+
+    let Output::EosSources(report) = output_report else {
+        panic!("expected eos-sources report");
+    };
+    let source_list = std::fs::read_to_string(&output).unwrap();
+
+    assert_eq!(report.files, 2);
+    assert!(source_list.contains("# sample: wz_vbs_ewk"));
+    assert!(source_list.contains(&mc_file.display().to_string()));
+    assert!(source_list.contains(&data_file.display().to_string()));
+}
+
+#[test]
+fn run_empty_input_list_returns_usage_error() {
+    let fixture = Fixture::new("run-empty-input-list");
+    let input_list = fixture.path("empty.txt");
+    std::fs::write(&input_list, "# no inputs yet\n\n").unwrap();
+
+    let error = run([
+        "run",
+        repo_path("crates/nano-spec/examples/muon.toml")
+            .to_str()
+            .unwrap(),
+        "--input-list",
+        input_list.to_str().unwrap(),
+    ])
+    .expect_err("empty input list should fail");
+
+    assert_eq!(error.kind, ErrorKind::Usage);
+    assert!(error.message.contains("did not contain any input sources"));
+}
+
+#[test]
 fn run_interpret_writes_same_skim_as_compiled_kernel() {
     let fixture = Fixture::new("run-interpret-cross-backend");
     let input = fixture.path("input.root");
@@ -340,6 +646,7 @@ fn run_interpret_writes_same_skim_as_compiled_kernel() {
         parallel: false,
         kernel: None,
         interpret: false,
+        max_events: None,
     })
     .expect("compiled run");
     let interpreted = run([
@@ -399,6 +706,111 @@ fn run_interpret_json_output_is_well_formed() {
 }
 
 #[test]
+fn run_interpret_honors_max_events() {
+    let fixture = Fixture::new("run-interpret-max-events");
+    let input = fixture.path("input.root");
+    write_synthetic_input(&input);
+
+    let output = run([
+        "run",
+        "--interpret",
+        "--max-events",
+        "2",
+        repo_path("crates/nano-spec/examples/muon.toml")
+            .to_str()
+            .unwrap(),
+        "--inputs",
+        input.to_str().unwrap(),
+    ])
+    .expect("interpreted run");
+
+    let Output::Run(report) = output else {
+        panic!("expected run report");
+    };
+
+    assert_eq!(report.events_seen, 2);
+    assert_eq!(report.events_selected, 1);
+}
+
+#[test]
+fn run_interpret_union_spec_writes_channel_index() {
+    let fixture = Fixture::new("run-interpret-union");
+    let spec = fixture.path("union.toml");
+    let input = fixture.path("input.root");
+    let output = fixture.path("union.root");
+    write_synthetic_input(&input);
+    std::fs::write(
+        &spec,
+        r#"
+[analysis]
+name = "union_demo"
+year = "Run2018"
+
+[[channel]]
+name = "high"
+
+[channel.objects.good_muon]
+source = "Muon"
+cuts = ["pt > 50 GeV", "abs(eta) < 2.4"]
+
+[channel.regions.signal]
+require = ["count(good_muon) >= 1"]
+
+[[channel.outputs]]
+name = "lead_muon_pt"
+expr = "leading(good_muon).pt"
+
+[[channel]]
+name = "loose"
+
+[channel.objects.good_muon]
+source = "Muon"
+cuts = ["pt > 30 GeV", "abs(eta) < 2.4"]
+
+[channel.regions.signal]
+require = ["count(good_muon) >= 1"]
+
+[[channel.outputs]]
+name = "lead_muon_pt"
+expr = "leading(good_muon).pt"
+"#,
+    )
+    .unwrap();
+
+    let run_output = run([
+        "run",
+        "--interpret",
+        spec.to_str().unwrap(),
+        "--inputs",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ])
+    .expect("interpreted union run");
+
+    let Output::Run(report) = run_output else {
+        panic!("expected run report");
+    };
+    let rows = read_events(
+        &output,
+        BranchSchema::new([
+            BranchSpec::new("channel_index", BranchType::U32),
+            BranchSpec::new("lead_muon_pt", BranchType::F32),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let channel_indices = rows
+        .iter()
+        .map(|event| event.scalar::<u32>("channel_index").unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(report.events_seen, 5);
+    assert_eq!(report.events_selected, 4);
+    assert_eq!(channel_indices, vec![1, 1, 0, 1]);
+}
+
+#[test]
 fn run_interpret_model_spec_returns_structured_unsupported_error() {
     let fixture = Fixture::new("run-interpret-model");
     let input = fixture.path("input.root");
@@ -446,6 +858,7 @@ fn run_spec_without_registered_kernel_returns_structured_error() {
         parallel: false,
         kernel: None,
         interpret: false,
+        max_events: None,
     })
     .expect_err("spec should not resolve to a registered kernel");
 
@@ -468,6 +881,7 @@ fn run_muon_like_spec_with_incompatible_schema_returns_structured_error() {
         parallel: false,
         kernel: None,
         interpret: false,
+        max_events: None,
     })
     .expect_err("muon_tagger spec should not match the registered muon kernel");
 
@@ -493,6 +907,7 @@ fn run_serial_and_parallel_outputs_are_identical() {
         parallel: false,
         kernel: None,
         interpret: false,
+        max_events: None,
     })
     .expect("serial run");
     let parallel = run_workflow(WorkflowRunOptions {
@@ -502,6 +917,7 @@ fn run_serial_and_parallel_outputs_are_identical() {
         parallel: true,
         kernel: None,
         interpret: false,
+        max_events: None,
     })
     .expect("parallel run");
 
