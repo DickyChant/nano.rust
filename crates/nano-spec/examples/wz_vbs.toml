@@ -52,7 +52,7 @@ reason = "Legacy jet/JER stochastic path leaves a small HT residual."
 [[correction]]
 name = "clean_jet_pt_jec"
 kind = "jec_nominal"
-file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+file = "configs/corrections/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
 correction = "Summer24Prompt24_V2_MC_L1L2L3Res_AK4PFPuppi"
 collection = "clean_jet"
 attr = "ptJec"
@@ -69,7 +69,7 @@ inputs = [
 [[correction]]
 name = "vbs_jet_pt_jec"
 kind = "jec_nominal"
-file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+file = "configs/corrections/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
 correction = "Summer24Prompt24_V2_MC_L1L2L3Res_AK4PFPuppi"
 collection = "vbs_jet"
 attr = "ptJec"
@@ -86,7 +86,7 @@ inputs = [
 [[correction]]
 name = "btag_jet_pt_jec"
 kind = "jec_nominal"
-file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+file = "configs/corrections/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
 correction = "Summer24Prompt24_V2_MC_L1L2L3Res_AK4PFPuppi"
 collection = "btag_jet"
 attr = "ptJec"
@@ -106,14 +106,14 @@ kind = "jer_nominal"
 collection = "clean_jet"
 attr = "ptDef"
 source_attr = "ptJec"
-scale_factor_file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+scale_factor_file = "configs/corrections/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
 scale_factor_correction = "Summer23BPixPrompt23_RunD_JRV1_MC_ScaleFactor_AK4PFPuppi"
 scale_factor_inputs = [
   { name = "JetEta", from = "eta" },
   { name = "JetPt", from = "ptJec" },
   { name = "systematic", value = "nom" },
 ]
-resolution_file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+resolution_file = "configs/corrections/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
 resolution_correction = "Summer23BPixPrompt23_RunD_JRV1_MC_PtResolution_AK4PFPuppi"
 resolution_inputs = [
   { name = "JetEta", from = "eta" },
@@ -129,14 +129,14 @@ kind = "jer_nominal"
 collection = "vbs_jet"
 attr = "ptDef"
 source_attr = "ptJec"
-scale_factor_file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+scale_factor_file = "configs/corrections/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
 scale_factor_correction = "Summer23BPixPrompt23_RunD_JRV1_MC_ScaleFactor_AK4PFPuppi"
 scale_factor_inputs = [
   { name = "JetEta", from = "eta" },
   { name = "JetPt", from = "ptJec" },
   { name = "systematic", value = "nom" },
 ]
-resolution_file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+resolution_file = "configs/corrections/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
 resolution_correction = "Summer23BPixPrompt23_RunD_JRV1_MC_PtResolution_AK4PFPuppi"
 resolution_inputs = [
   { name = "JetEta", from = "eta" },
@@ -152,14 +152,14 @@ kind = "jer_nominal"
 collection = "btag_jet"
 attr = "ptDef"
 source_attr = "ptJec"
-scale_factor_file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+scale_factor_file = "configs/corrections/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
 scale_factor_correction = "Summer23BPixPrompt23_RunD_JRV1_MC_ScaleFactor_AK4PFPuppi"
 scale_factor_inputs = [
   { name = "JetEta", from = "eta" },
   { name = "JetPt", from = "ptJec" },
   { name = "systematic", value = "nom" },
 ]
-resolution_file = "../MitAnalysisRunIII/rdf/macros/jsonpog-integration/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
+resolution_file = "configs/corrections/POG/JME/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/jet_jerc.json.gz"
 resolution_correction = "Summer23BPixPrompt23_RunD_JRV1_MC_PtResolution_AK4PFPuppi"
 resolution_inputs = [
   { name = "JetEta", from = "eta" },
