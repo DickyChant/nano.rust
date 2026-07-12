@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: grid-cli-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 env:
   ARTIFACT_NAME: nano-rust-cli-el9-x86_64
   BUILD_IMAGE: cmssw/el9:x86_64
