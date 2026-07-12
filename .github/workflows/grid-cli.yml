@@ -39,7 +39,9 @@ jobs:
             --target-dir target/release \
             --output-dir "dist/${ARTIFACT_NAME}" \
             --build-image "${BUILD_IMAGE}" \
-            --features "${RUST_FEATURES}"
+            --features "${RUST_FEATURES}" \
+            --repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --commit "${GITHUB_SHA}"
           python3 "dist/${ARTIFACT_NAME}/verify.py" "dist/${ARTIFACT_NAME}"
           tar -C dist -czf "dist/${ARTIFACT_NAME}.tar.gz" "${ARTIFACT_NAME}"
 

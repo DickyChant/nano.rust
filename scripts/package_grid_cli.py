@@ -47,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--build-image", required=True)
     parser.add_argument("--features", default="")
+    parser.add_argument("--repository")
+    parser.add_argument("--commit")
     return parser.parse_args()
 
 
@@ -93,11 +95,15 @@ def main() -> None:
         shutil.copy2("LICENSE", args.output_dir / "LICENSE")
 
     image_info = Path("/image-build-info.txt")
+    repository = args.repository or command_output(
+        "git", "config", "--get", "remote.origin.url"
+    )
+    commit = args.commit or command_output("git", "rev-parse", "HEAD")
     manifest = {
         "schema_version": 1,
         "source": {
-            "repository": command_output("git", "config", "--get", "remote.origin.url"),
-            "commit": command_output("git", "rev-parse", "HEAD"),
+            "repository": repository,
+            "commit": commit,
         },
         "build": {
             "image": args.build_image,
