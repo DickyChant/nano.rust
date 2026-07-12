@@ -1,6 +1,7 @@
 # nano.rust
 
 [![CI](https://github.com/DickyChant/nano.rust/actions/workflows/ci.yml/badge.svg)](https://github.com/DickyChant/nano.rust/actions/workflows/ci.yml)
+[![grid CLI](https://github.com/DickyChant/nano.rust/actions/workflows/grid-cli.yml/badge.svg)](https://github.com/DickyChant/nano.rust/actions/workflows/grid-cli.yml)
 [![docs](https://github.com/DickyChant/nano.rust/actions/workflows/docs.yml/badge.svg)](https://github.com/DickyChant/nano.rust/actions/workflows/docs.yml)
 [![links](https://github.com/DickyChant/nano.rust/actions/workflows/links.yml/badge.svg)](https://github.com/DickyChant/nano.rust/actions/workflows/links.yml)
 
