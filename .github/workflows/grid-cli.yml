@@ -1,0 +1,74 @@
+name: grid-cli
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: grid-cli-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  ARTIFACT_NAME: nano-rust-cli-el9-x86_64
+  BUILD_IMAGE: cmssw/el9:x86_64
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  CARGO_TERM_COLOR: always
+  RUST_FEATURES: nano-cli/http,nano-ui/http,nano-workflow/http
+
+jobs:
+  build:
+    name: Build Rust CLIs (CMS EL9)
+    runs-on: ubuntu-latest
+    container:
+      image: cmssw/el9:x86_64
+      options: --user 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build every Rust CLI
+        run: >-
+          cargo build --locked --release --workspace --bins
+          --features "${RUST_FEATURES}"
+
+      - name: Package grid artifact
+        run: |
+          python3 scripts/package_grid_cli.py \
+            --target-dir target/release \
+            --output-dir "dist/${ARTIFACT_NAME}" \
+            --build-image "${BUILD_IMAGE}" \
+            --features "${RUST_FEATURES}" \
+            --repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --commit "${GITHUB_SHA}"
+          python3 "dist/${ARTIFACT_NAME}/verify.py" "dist/${ARTIFACT_NAME}"
+          tar -C dist -czf "dist/${ARTIFACT_NAME}.tar.gz" "${ARTIFACT_NAME}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ github.sha }}
+          path: dist/${{ env.ARTIFACT_NAME }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  grid-smoke:
+    name: Smoke test artifact (CMS EL9 grid)
+    needs: build
+    runs-on: ubuntu-latest
+    container:
+      image: cmssw/el9:x86_64-grid
+      options: --user 0
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ github.sha }}
+
+      - name: Verify in grid worker image
+        run: |
+          tar -xzf "${ARTIFACT_NAME}.tar.gz"
+          python3 "${ARTIFACT_NAME}/verify.py" "${ARTIFACT_NAME}"
