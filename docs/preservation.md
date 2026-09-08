@@ -72,9 +72,17 @@ catches *agent* mistakes — that is what the next two layers are for.
 adversarial_reject.rs` — one positive + one rejected case per error class, each
 attributed to the right verifier: nonexistent/mistyped branch, era/version mismatch,
 dropped unit, wrong-type access, undefined object, score-before-inference, duplicate
-output → **validator** (`SpecError`); fill-before-weight, missing systematic arm →
-**rustc** (`compile_fail` doctests). Closing a found gap: duplicate output names were
-not previously rejected; now they are.
+output, colliding systematic-axis keys, unusable systematic name → **validator**
+(`SpecError`); fill-before-weight, missing systematic arm → **rustc** (`compile_fail`
+doctests). Closing found gaps: duplicate output names were not previously rejected;
+neither was a systematic axis in which two declarations claim the same variation key
+(a weight systematic and a shape correction both named `jes` silently *merged* into
+one axis entry in the interpreter, and were caught only by codegen — so an
+interpreted run quietly lost a declared systematic). Both are now validator
+rejections, and the axis itself has a single derivation
+(`nano_spec::systematics`) shared by the validator, the interpreter, and codegen,
+with `crates/nano-spec/tests/systematic_axis.rs` holding the three to one answer
+across the whole example corpus.
 
 **The two back-ends agree (differential fuzzing) — and it found real bugs.**
 `crates/nano-gen-demo/tests/differential_fuzz.rs` — a seeded, dependency-free generator

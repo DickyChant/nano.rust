@@ -11,9 +11,12 @@
 //! | 7. Fill-before-weight | `fill` accepts `Weighted<R, S>`; see `nano-analysis` doctests | `fill` with `Ev<Raw>` | rustc | `compile_fail` doctest |
 //! | 8. Missing systematic arm | complete generated `SystematicVisitor` impl; see `nano-analysis` doctests | visitor impl missing `muon_weight_down` | rustc | `compile_fail` doctest |
 //! | 9. Duplicate output name | distinct `[[outputs]]` names validate | duplicate ordinary output names | validator | `SpecError::InvalidExpression` |
+//! | 10. Colliding systematic axis keys | a weight systematic and a shape correction with distinct names validate | both named `jes`, so both claim `JesUp`/`JesDown` | validator | `SpecError::InvalidExpression` |
+//! | 11. Systematic name with no usable variation key | `jes_total` validates | `jes__total` has an empty camel-case part, so it can be parsed but never compiled | validator | `SpecError::InvalidExpression` |
 //!
 //! Branch existence, era catalogue membership, unit requirements, branch type,
-//! undefined object, score production, and duplicate output names are
+//! undefined object, score production, duplicate output names, and a
+//! well-formed systematic axis are
 //! `nano_spec::validate` obligations. Typestate ordering and closed systematic
 //! exhaustiveness are Rust type-system obligations and are checked by
 //! `nano-analysis` doctests.
@@ -177,6 +180,30 @@ fn adversarial_validator_reject_matrix() {
             negative_catalogue: CatalogueVersion::NanoV9,
             expected: ExpectedError::InvalidExpressionContains(
                 "duplicate output name `n_good_muon`",
+            ),
+        },
+        ValidatorCase {
+            class: "colliding systematic axis keys",
+            positive_name: "distinct systematic names",
+            positive_toml: DISTINCT_SYSTEMATIC_NAMES_SPEC,
+            positive_catalogue: CatalogueVersion::NanoV9,
+            negative_name: "weight and shape sharing one name",
+            negative_toml: COLLIDING_SYSTEMATIC_NAMES_SPEC,
+            negative_catalogue: CatalogueVersion::NanoV9,
+            expected: ExpectedError::InvalidExpressionContains(
+                "weight variation `jes` and shape correction `jes` both map to variation `JesUp`",
+            ),
+        },
+        ValidatorCase {
+            class: "systematic name has no usable variation key",
+            positive_name: "identifier systematic name",
+            positive_toml: IDENTIFIER_SYSTEMATIC_NAME_SPEC,
+            positive_catalogue: CatalogueVersion::NanoV9,
+            negative_name: "doubled-underscore systematic name",
+            negative_toml: UNUSABLE_SYSTEMATIC_NAME_SPEC,
+            negative_catalogue: CatalogueVersion::NanoV9,
+            expected: ExpectedError::InvalidExpressionContains(
+                "systematic name `jes__total` cannot be used as a variation identifier",
             ),
         },
     ];
@@ -439,4 +466,124 @@ expr = "count(good_muon)"
 [[outputs]]
 name = "n_good_muon"
 expr = "leading(good_muon).pt"
+"#;
+
+const DISTINCT_SYSTEMATIC_NAMES_SPEC: &str = r#"
+[analysis]
+name = "distinct_systematic_names"
+year = "Run2018"
+
+[weight]
+nominal = []
+
+[[systematic]]
+name = "muon_weight"
+kind = "weight"
+up = 2.0
+down = 0.5
+
+[[correction]]
+name = "jes"
+kind = "scale"
+collection = "good_muon"
+attr = "pt"
+up = 1.05
+down = 0.95
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[regions.signal]
+require = ["count(good_muon) >= 1"]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"
+"#;
+
+const COLLIDING_SYSTEMATIC_NAMES_SPEC: &str = r#"
+[analysis]
+name = "colliding_systematic_names"
+year = "Run2018"
+
+[weight]
+nominal = []
+
+[[systematic]]
+name = "jes"
+kind = "weight"
+up = 2.0
+down = 0.5
+
+[[correction]]
+name = "jes"
+kind = "scale"
+collection = "good_muon"
+attr = "pt"
+up = 1.05
+down = 0.95
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[regions.signal]
+require = ["count(good_muon) >= 1"]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"
+"#;
+
+const IDENTIFIER_SYSTEMATIC_NAME_SPEC: &str = r#"
+[analysis]
+name = "identifier_systematic_name"
+year = "Run2018"
+
+[weight]
+nominal = []
+
+[[systematic]]
+name = "jes_total"
+kind = "weight"
+up = 2.0
+down = 0.5
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[regions.signal]
+require = ["count(good_muon) >= 1"]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"
+"#;
+
+const UNUSABLE_SYSTEMATIC_NAME_SPEC: &str = r#"
+[analysis]
+name = "unusable_systematic_name"
+year = "Run2018"
+
+[weight]
+nominal = []
+
+[[systematic]]
+name = "jes__total"
+kind = "weight"
+up = 2.0
+down = 0.5
+
+[objects.good_muon]
+source = "Muon"
+cuts = []
+
+[regions.signal]
+require = ["count(good_muon) >= 1"]
+
+[[outputs]]
+name = "n_good_muon"
+expr = "count(good_muon)"
 "#;

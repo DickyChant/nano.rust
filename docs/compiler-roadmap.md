@@ -91,7 +91,7 @@ not hand-branched in codegen; ADL/TOML/YAML desugar onto the registry.
 7. **DONE** — ADL front-end: `from_adl_str` desugars to the SAME AnalysisSpec/Core IR/
    ResolvedPlan as TOML (proven equal + execution-equal); covers objects/regions/
    define/alias/outputs/histograms/weight-systematics/shape-corrections.
-8. **PARTIAL** — adversarial reject matrix (9 classes) **DONE**; differential fuzzing
+8. **PARTIAL** — adversarial reject matrix (11 classes) **DONE**; differential fuzzing
    (400 cases, found+fixed 3 real interpret-vs-codegen bugs) **DONE**; **two** non-Higgs
    analyses authored from prose (Z→μμ, multijet HT), each == an independent imperative
    reference **DONE** (the multijet one found 2 region-requirement IR gaps, since

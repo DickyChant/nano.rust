@@ -843,63 +843,41 @@ impl<'a> Generator<'a> {
     }
 
     fn generated_systematics(&self) -> Result<Vec<GeneratedSystematic>, CodegenError> {
-        let mut systematics = vec![GeneratedSystematic {
-            variant: "Nominal".to_string(),
-            method: "nominal".to_string(),
-            marker: "nano_analysis::Nominal".to_string(),
-            name: "nominal".to_string(),
-            source: GeneratedSystematicSource::Nominal,
-        }];
-
-        if let Some(systematic) = self.spec().weight_systematic() {
-            systematics.push(generated_systematic_variation(
-                &systematic.name,
-                "Up",
-                GeneratedSystematicSource::WeightUp,
-            )?);
-            systematics.push(generated_systematic_variation(
-                &systematic.name,
-                "Down",
-                GeneratedSystematicSource::WeightDown,
-            )?);
-        }
-
-        for correction in self.spec().scale_factor_systematics() {
-            systematics.push(generated_systematic_variation(
-                &correction.name,
-                "Up",
-                GeneratedSystematicSource::WeightUp,
-            )?);
-            systematics.push(generated_systematic_variation(
-                &correction.name,
-                "Down",
-                GeneratedSystematicSource::WeightDown,
-            )?);
-        }
-
-        for correction in self.spec().shape_corrections() {
-            systematics.push(generated_systematic_variation(
-                &correction.name,
-                "Up",
-                GeneratedSystematicSource::ShapeUp,
-            )?);
-            systematics.push(generated_systematic_variation(
-                &correction.name,
-                "Down",
-                GeneratedSystematicSource::ShapeDown,
-            )?);
-        }
-
-        let mut variants = BTreeSet::new();
-        for systematic in &systematics {
-            if !variants.insert(systematic.variant.as_str()) {
-                return Err(CodegenError::UnsupportedFeature(format!(
-                    "duplicate generated systematic variant `{}`",
-                    systematic.variant
-                )));
-            }
-        }
-        Ok(systematics)
+        // The axis itself is derived in `crate::systematics`, shared with the
+        // interpreter and the validator; codegen only adds the Rust marker path.
+        let axis = crate::systematics::systematic_axis(self.spec())
+            .map_err(|error| CodegenError::UnsupportedFeature(error.to_string()))?;
+        Ok(axis
+            .into_iter()
+            .map(|entry| GeneratedSystematic {
+                marker: match entry.source {
+                    crate::systematics::SystematicSource::Nominal => {
+                        "nano_analysis::Nominal".to_string()
+                    }
+                    _ => format!("systematic_markers::{}", entry.variant),
+                },
+                name: entry.method.clone(),
+                variant: entry.variant,
+                method: entry.method,
+                source: match entry.source {
+                    crate::systematics::SystematicSource::Nominal => {
+                        GeneratedSystematicSource::Nominal
+                    }
+                    crate::systematics::SystematicSource::WeightUp => {
+                        GeneratedSystematicSource::WeightUp
+                    }
+                    crate::systematics::SystematicSource::WeightDown => {
+                        GeneratedSystematicSource::WeightDown
+                    }
+                    crate::systematics::SystematicSource::ShapeUp => {
+                        GeneratedSystematicSource::ShapeUp
+                    }
+                    crate::systematics::SystematicSource::ShapeDown => {
+                        GeneratedSystematicSource::ShapeDown
+                    }
+                },
+            })
+            .collect())
     }
 
     fn validate_supported_spec(&self) -> Result<(), CodegenError> {
@@ -4490,9 +4468,14 @@ fn generated_systematic_variation(
     direction: &str,
     source: GeneratedSystematicSource,
 ) -> Result<GeneratedSystematic, CodegenError> {
-    let base = upper_camel_ident(name, "systematic name")?;
-    let variant = format!("{base}{direction}");
-    checked_ident(&variant, "systematic variant")?;
+    // Same derivation the interpreter and the validator use, so a variation is
+    // named identically no matter which back-end asks.
+    let variant = crate::systematics::variant_key(name, direction).ok_or_else(|| {
+        CodegenError::InvalidIdentifier {
+            context: "systematic name".to_string(),
+            value: name.to_string(),
+        }
+    })?;
     let method = format!(
         "{}_{}",
         checked_ident(name, "systematic visitor method")?,

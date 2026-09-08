@@ -17,9 +17,10 @@ use crate::kir::{
     Block, ForEachAxis, KirObject, KirProgram, KirShapeCorrection, KirShapeCorrectionPayload,
     Rvalue, Stmt, ValueId,
 };
+use crate::systematics::{SystematicAxisError, SystematicVariant};
 use crate::{
     ArithOp, CmpOp, Cut, DerivedObjectDef, DerivedSource, Expr, ModelDef, ModelProviderKind,
-    ObjectCandidateDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan, SystematicDef,
+    ObjectCandidateDef, ObjectPairDef, PairConstraint, PairSelection, ResolvedPlan,
 };
 
 /// One typed output cell produced by the interpreter.
@@ -483,93 +484,34 @@ fn provider_kind_name(kind: &ModelProviderKind) -> &str {
     }
 }
 
+/// The systematic axis keys of a plan, in axis order.
+///
+/// The derivation is shared with codegen and the validator
+/// (`crate::systematics`), so the interpreter cannot disagree with the compiled
+/// back-end about which variations exist.
 fn interpreted_systematic_variants(plan: &ResolvedPlan) -> Vec<String> {
-    interpreted_systematic_variants_from_parts(
-        &plan.spec.systematics,
-        &plan.spec.shape_corrections,
-        &plan.spec.scale_factor_corrections,
-    )
+    variant_keys(crate::systematics::systematic_axis(&plan.spec))
 }
 
-fn interpreted_systematic_variants_from_parts(
-    systematics: &[SystematicDef],
-    shape_corrections: &[impl NamedSystematicCorrection],
-    scale_factor_corrections: &[impl NamedSystematicCorrection],
+/// `validate` has already rejected any spec whose axis is malformed, so an error
+/// here cannot come from a validated plan; fall back to nominal-only rather than
+/// panicking on an unvalidated one.
+fn variant_keys(
+    axis: std::result::Result<Vec<SystematicVariant>, SystematicAxisError>,
 ) -> Vec<String> {
-    let mut variants = vec!["Nominal".to_string()];
-    for systematic in systematics {
-        if let SystematicDef::Weight(systematic) = systematic {
-            variants.push(interpreted_variant_name(&systematic.name, "Up"));
-            variants.push(interpreted_variant_name(&systematic.name, "Down"));
-        }
-    }
-    for correction in shape_corrections {
-        variants.push(interpreted_variant_name(correction.name(), "Up"));
-        variants.push(interpreted_variant_name(correction.name(), "Down"));
-    }
-    for correction in scale_factor_corrections
-        .iter()
-        .filter(|correction| correction.has_systematic())
-    {
-        variants.push(interpreted_variant_name(correction.name(), "Up"));
-        variants.push(interpreted_variant_name(correction.name(), "Down"));
-    }
-    variants
-}
-
-trait NamedSystematicCorrection {
-    fn name(&self) -> &str;
-    fn has_systematic(&self) -> bool {
-        true
-    }
-}
-
-impl NamedSystematicCorrection for crate::ShapeCorrectionDef {
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl NamedSystematicCorrection for KirShapeCorrection {
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl NamedSystematicCorrection for crate::ScaleFactorCorrectionDef {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn has_systematic(&self) -> bool {
-        self.systematic.is_some()
-    }
-}
-
-impl NamedSystematicCorrection for crate::kir::KirScaleFactorCorrection {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn has_systematic(&self) -> bool {
-        self.systematic.is_some()
-    }
+    axis.map(|axis| {
+        axis.into_iter()
+            .map(|variant| variant.variant)
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_else(|_| vec!["Nominal".to_string()])
 }
 
 fn interpreted_variant_name(name: &str, direction: &str) -> String {
-    format!("{}{direction}", interpreted_upper_camel(name))
-}
-
-fn interpreted_upper_camel(name: &str) -> String {
-    let mut ident = String::new();
-    for part in name.split('_') {
-        let mut chars = part.chars();
-        if let Some(first) = chars.next() {
-            ident.push(first.to_ascii_uppercase());
-            ident.extend(chars);
-        }
-    }
-    ident
+    // Shared with codegen so the two back-ends key variations identically. A
+    // malformed name is rejected by `validate`, so the empty fallback here can
+    // never match a variation of a validated plan.
+    crate::systematics::variant_key(name, direction).unwrap_or_default()
 }
 
 struct KirEvaluator<'a> {
@@ -840,11 +782,7 @@ impl<'a> KirEvaluator<'a> {
     }
 
     fn active_systematics(&self) -> Vec<String> {
-        interpreted_systematic_variants_from_parts(
-            &self.program.systematics,
-            &self.program.shape_corrections,
-            &self.program.scale_factor_corrections,
-        )
+        variant_keys(crate::systematics::systematic_axis_from_kir(self.program))
     }
 
     fn current_systematic(&self) -> Result<String> {

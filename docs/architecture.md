@@ -108,7 +108,12 @@ alone:
 
 1. **The front-end validator** (`nano-spec::validate`) checks *domain facts* rustc
    can't know: the branch exists for the era with the right type, units are
-   present, objects/regions are defined, a model output is produced before use.
+   present, objects/regions are defined, a model output is produced before use,
+   and the declared systematic axis is well formed (no two declarations claiming
+   the same variation key). That axis has a single derivation,
+   `nano-spec::systematics`, shared by the validator, the interpreter, and
+   codegen — recomputing it per back-end is how a declared systematic gets
+   silently merged or dropped.
 2. **rustc** checks the *structure of the generated Rust*: because the codegen
    target is the `nano-analysis` typestate, stage/region/weight-before-fill/score-
    before-use/exhaustive-systematic violations are compile errors, and a kernel
@@ -152,7 +157,7 @@ the execution.
 
 | Layer | Crate(s) |
 |---|---|
-| Front-end (verifier) | `nano-spec` (parse/validate/derive; `[[correction]]` scale_factor + jes, `[lumi_mask]`, triggers/flags), `nano-corrections` (native correctionlib-v2 evaluator, wired into the spec) |
+| Front-end (verifier) | `nano-spec` (parse/validate/derive; `[[correction]]` scale_factor + jes, `[lumi_mask]`, triggers/flags; `nano-spec::systematics` is the one shared systematic-axis derivation), `nano-corrections` (native correctionlib-v2 evaluator, wired into the spec) |
 | Per-event IR + kernel vocabulary | `nano-spec::core` (typed Core IR + primitive registry), `nano-spec::kir` (KIR, single executable semantics), `nano-analysis` (`Weighted<R,S>` typestate), `nano-inference` (model boundary) |
 | Per-event back-ends | `nano-spec::interpret` (executes KIR); codegen (emits from KIR) → `nano-producers`-shaped kernels; `nano-jit` (optional runtime compile + dlopen) |
 | Data plane | `nano-rootio` (owned ROOT I/O — reads NanoAOD v9/v12/v15, writes TTrees + `TH1F`), `nano-io` (streaming, `samples` table + normalization, `datacard` emitter), `nano-core` (event model) |

@@ -18,6 +18,7 @@ pub mod codegen;
 pub mod core;
 pub mod interpret;
 pub mod kir;
+pub mod systematics;
 
 /// Typed semantic analysis specification.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -903,6 +904,7 @@ fn validate_flat(
     let model_outputs =
         validate_models(spec, catalogue, &object_sources, &mut required, &mut errors);
     validate_unique_output_names(&spec.outputs, &mut errors);
+    validate_systematic_axis(spec, &mut errors);
 
     {
         let mut ctx = ValidationContext {
@@ -948,6 +950,21 @@ fn validate_flat(
     }
 
     Ok((required, model_outputs))
+}
+
+/// Reject a spec whose declared variations do not form a well-formed axis.
+///
+/// Which variations exist is a domain fact, so it belongs here rather than in
+/// one back-end: two declarations that map to the same axis key would otherwise
+/// be silently merged by the interpreter and only rejected by codegen, and a
+/// name that cannot be an identifier would run interpreted but never compile.
+fn validate_systematic_axis(spec: &AnalysisSpec, errors: &mut Vec<SpecError>) {
+    if let Err(error) = systematics::systematic_axis(spec) {
+        errors.push(SpecError::InvalidExpression {
+            context: "systematic axis".to_string(),
+            detail: error.to_string(),
+        });
+    }
 }
 
 fn validate_unique_output_names(outputs: &[OutputDef], errors: &mut Vec<SpecError>) {
