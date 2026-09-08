@@ -540,6 +540,27 @@ fn skim_schema() -> BranchSchema {
     .unwrap()
 }
 
+/// Read a fanned-out skim as `(nano_entry, n_good_muon, lead_muon_pt)` triples.
+fn read_variation_rows(path: &Path) -> Vec<(u64, u32, f32)> {
+    let schema = BranchSchema::new(vec![
+        BranchSpec::new("nano_entry", BranchType::U64),
+        BranchSpec::new("n_good_muon", BranchType::U32),
+        BranchSpec::new("lead_muon_pt", BranchType::F32),
+    ])
+    .unwrap();
+    read_events(path, schema)
+        .unwrap()
+        .iter()
+        .map(|event| {
+            (
+                event.scalar::<u64>("nano_entry").unwrap(),
+                event.scalar::<u32>("n_good_muon").unwrap(),
+                event.scalar::<f32>("lead_muon_pt").unwrap(),
+            )
+        })
+        .collect()
+}
+
 fn write_synthetic_input(path: &Path) {
     write_events(
         path,
@@ -624,4 +645,122 @@ impl Fixture {
     fn path(&self, name: &str) -> PathBuf {
         self.root.join(name)
     }
+}
+
+/// A shape systematic moves events across the region boundary, so each variation
+/// must get its own skim: `Muon_pt > 30 GeV` under a ±5% JES shift admits event 1
+/// only when varied up and drops event 0 when varied down. A single nominal run
+/// would report neither migration.
+#[test]
+fn run_interpret_fans_the_skim_out_over_shape_variations() {
+    let fixture = Fixture::new("run-interpret-shape-fanout");
+    let input = fixture.path("input.root");
+    let output = fixture.path("skim.root");
+    write_synthetic_input(&input);
+
+    let report = run([
+        "run",
+        "--interpret",
+        repo_path("crates/nano-spec/examples/muon_hist_shape_correction.toml")
+            .to_str()
+            .unwrap(),
+        "--inputs",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ])
+    .expect("interpreted run");
+
+    let Output::Run(report) = report else {
+        panic!("expected run report");
+    };
+
+    let variations = report.variations.expect("shape spec fans out");
+    assert_eq!(
+        variations
+            .iter()
+            .map(|variation| variation.systematic.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Nominal", "JesUp", "JesDown"],
+    );
+    // The nominal skim keeps the requested path; the others are suffixed.
+    assert_eq!(variations[0].output.as_deref(), Some(output.as_path()));
+    assert_eq!(
+        variations[1].output.as_deref(),
+        Some(fixture.path("skim__JesUp.root").as_path())
+    );
+
+    // Each variation selects its own events, and `nano_entry` says which.
+    let nominal = read_variation_rows(&output);
+    let up = read_variation_rows(&fixture.path("skim__JesUp.root"));
+    let down = read_variation_rows(&fixture.path("skim__JesDown.root"));
+
+    let entries = |rows: &[(u64, u32, f32)]| rows.iter().map(|row| row.0).collect::<Vec<_>>();
+    assert_eq!(entries(&nominal), vec![0, 2, 4]);
+    assert_eq!(entries(&up), vec![0, 1, 2, 4], "event 1 migrates in when varied up");
+    assert_eq!(entries(&down), vec![2, 4], "event 0 migrates out when varied down");
+
+    // The report's headline figures stay nominal, and every variation is listed.
+    assert_eq!(report.events_seen, 5);
+    assert_eq!(report.events_selected, 3);
+    assert_eq!(
+        variations
+            .iter()
+            .map(|variation| variation.events_selected)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 2],
+    );
+
+    // The join key is what makes the separate skims comparable: entry 2 is the
+    // same input event in all three, with its pt shifted by the variation.
+    let pt_at = |rows: &[(u64, u32, f32)], entry: u64| {
+        rows.iter().find(|row| row.0 == entry).unwrap().2
+    };
+    assert!(pt_at(&up, 2) > pt_at(&nominal, 2));
+    assert!(pt_at(&down, 2) < pt_at(&nominal, 2));
+}
+
+/// A spec with no declared variation is untouched by the fan-out: one file, the
+/// old schema, no `nano_entry` column, no `variations` in the report.
+#[test]
+fn run_interpret_leaves_a_nominal_only_spec_unchanged() {
+    let fixture = Fixture::new("run-interpret-nominal-only");
+    let input = fixture.path("input.root");
+    let output = fixture.path("skim.root");
+    write_synthetic_input(&input);
+
+    let report = run([
+        "run",
+        "--interpret",
+        repo_path("crates/nano-spec/examples/muon.toml")
+            .to_str()
+            .unwrap(),
+        "--inputs",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ])
+    .expect("interpreted run");
+
+    let Output::Run(report) = report else {
+        panic!("expected run report");
+    };
+    assert!(report.variations.is_none());
+    assert_eq!(report.events_selected, 3);
+    assert!(!fixture.path("skim__JesUp.root").exists());
+
+    // The skim still reads back under the original schema, with no join column.
+    assert_eq!(read_skim_rows(&output).len(), 3);
+    let branches = nano_rootio::RootFile::open(&output)
+        .unwrap()
+        .tree("Events")
+        .unwrap()
+        .branches()
+        .into_iter()
+        .map(|branch| branch.name)
+        .collect::<Vec<_>>();
+    assert!(
+        !branches.iter().any(|name| name == "nano_entry"),
+        "nominal-only skim gained a join column: {branches:?}"
+    );
 }

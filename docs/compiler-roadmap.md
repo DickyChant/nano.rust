@@ -77,7 +77,10 @@ not hand-branched in codegen; ADL/TOML/YAML desugar onto the registry.
 4. **DONE** — `Weighted<R,S>` + per-analysis generated closed `Systematic`
    enums and exhaustive `SystematicVisitor` (compile_fail proof); weight +
    shape systematic histogram fan-out **executes** (interpret==codegen) with
-   declaration-derived variant names. Remaining: table fan-out.
+   declaration-derived variant names. **Table fan-out** is now done too: because a
+   shape variation moves events across the region boundary, each variation gets its
+   own skim (`skim.root`, `skim__JesUp.root`, …) carrying a `nano_entry` join key,
+   so the per-variation tables can be lined back up and migration read off.
 5. **DONE (spec-declarable, payloads are content)** — corrections wired into the spec via
    the native correctionlib-v2 evaluator: `[[correction]]` kind="scale_factor" (SF →
    weight) and kind="jes" (binned correctionlib JES → kinematics, recomputes dependent

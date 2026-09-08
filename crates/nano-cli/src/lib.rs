@@ -10,7 +10,8 @@ use nano_review::{
 use nano_rootio::RootFile;
 use nano_spec::certificate::PlanCertificate;
 use nano_spec::codegen;
-use nano_spec::interpret::{interpret, InterpretError, OutputRow, Value};
+use nano_spec::interpret::{interpret_systematic, InterpretError, OutputRow, Value};
+use nano_spec::systematics::{systematic_axis, SystematicSource, SystematicVariant};
 use nano_spec::{AnalysisSpec, Catalogue, Expr, OutputDef, ParseError, SpecError};
 use nano_validate::{compare_root_files, CompareOptions, ComparisonReport};
 use nano_workflow::{
@@ -171,6 +172,20 @@ pub struct RunReport {
     pub output: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<PathBuf>,
+    /// Per-variation skims, present only when the spec declares a systematic
+    /// axis wider than nominal. `output`/`events_selected` above stay the
+    /// nominal figures, so a nominal-only run reports exactly as it always did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variations: Option<Vec<VariationReport>>,
+}
+
+/// One systematic variation's share of a fanned-out run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VariationReport {
+    pub systematic: String,
+    pub events_selected: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -412,8 +427,29 @@ pub fn render_text(output: &Output) -> String {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "(not written)".to_string())
-        ),
+        ) + &render_variations(report),
     }
+}
+
+/// The per-variation lines of a fanned-out run, or nothing for a nominal-only one.
+fn render_variations(report: &RunReport) -> String {
+    let Some(variations) = &report.variations else {
+        return String::new();
+    };
+    let mut rendered = format!("\nsystematics: {}", variations.len());
+    for variation in variations {
+        rendered.push_str(&format!(
+            "\n  {}: events_selected: {} output: {}",
+            variation.systematic,
+            variation.events_selected,
+            variation
+                .output
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(not written)".to_string()),
+        ));
+    }
+    rendered
 }
 
 pub fn output_success(output: &Output) -> bool {
@@ -607,8 +643,19 @@ pub fn run_workflow(options: WorkflowRunOptions) -> Result<RunReport> {
         events_selected: cutflow.events_selected,
         output: Some(output_path.clone()),
         manifest: Some(manifest_path_for_output(&output_path)),
+        variations: None,
     })
 }
+
+/// The join key written into every skim of a fanned-out run.
+///
+/// It is the ordinal of the input event, counted across `--inputs` in read
+/// order, so the per-variation skims can be lined back up: joining them on this
+/// column recovers which events migrated in or out of the region under each
+/// variation. It is stable for a given input list in a given order — it is a
+/// join key within one run, not a global event identifier. (`run:lumi:event`
+/// would be that, but the spec's derived `read_branches` need not include them.)
+const JOIN_INDEX_BRANCH: &str = "nano_entry";
 
 fn run_interpreted(options: WorkflowRunOptions) -> Result<RunReport> {
     let (_, plan) = load_validated_plan(&options.spec_path)?;
@@ -645,9 +692,46 @@ fn run_interpreted(options: WorkflowRunOptions) -> Result<RunReport> {
         .iter()
         .map(|output| output.name.clone())
         .collect::<Vec<_>>();
-    let mut rows = Vec::new();
+
+    // A shape systematic shifts kinematics, so each variation selects its own set
+    // of events. Running only the nominal variation would silently drop every
+    // declared shape systematic from the skim — the same class of loss the
+    // histogram fan-out already avoids. Fan the table out over the whole axis.
+    let axis = systematic_axis(&plan.spec).map_err(|error| CliError {
+        status: ErrorStatus::Error,
+        kind: ErrorKind::Interpret,
+        message: error.to_string(),
+        spec_path: Some(options.spec_path.clone()),
+        validation_errors: Vec::new(),
+    })?;
+
+    if axis.len() > 1 {
+        if let Some(clash) = plan
+            .spec
+            .outputs
+            .iter()
+            .find(|output| output.name == JOIN_INDEX_BRANCH)
+        {
+            return Err(CliError {
+                status: ErrorStatus::Error,
+                kind: ErrorKind::Interpret,
+                message: format!(
+                    "output `{}` collides with the `{JOIN_INDEX_BRANCH}` join key a fanned-out \
+                     skim writes; rename the output",
+                    clash.name
+                ),
+                spec_path: Some(options.spec_path.clone()),
+                validation_errors: Vec::new(),
+            });
+        }
+    }
+
+    let mut rows_per_variation = vec![Vec::new(); axis.len()];
+    // The join key: each variation records, for every row it keeps, which input
+    // event produced it. Variations select different events, so without this the
+    // separate skims could not be lined back up.
+    let mut entries_per_variation = vec![Vec::new(); axis.len()];
     let mut events_seen = 0_u64;
-    let mut events_selected = 0_u64;
 
     for input in &options.inputs {
         let events =
@@ -668,39 +752,79 @@ fn run_interpreted(options: WorkflowRunOptions) -> Result<RunReport> {
                 spec_path: Some(options.spec_path.clone()),
                 validation_errors: Vec::new(),
             })?;
+            let entry = events_seen;
             events_seen += 1;
-            if let Some(row) = interpret(&plan, &event)
-                .map_err(|error| interpret_cli_error(&options.spec_path, error))?
+            // Every variation sees each event exactly once, so the inputs are
+            // read once rather than once per variation.
+            for ((variation, rows), entries) in axis
+                .iter()
+                .zip(rows_per_variation.iter_mut())
+                .zip(entries_per_variation.iter_mut())
             {
-                validate_row_shape(&output_names, &row).map_err(|message| CliError {
+                if let Some(row) =
+                    interpret_systematic(&plan, &event, &variation.variant).map_err(|error| {
+                        interpret_cli_error(&options.spec_path, error)
+                    })?
+                {
+                    validate_row_shape(&output_names, &row).map_err(|message| CliError {
+                        status: ErrorStatus::Error,
+                        kind: ErrorKind::Interpret,
+                        message,
+                        spec_path: Some(options.spec_path.clone()),
+                        validation_errors: Vec::new(),
+                    })?;
+                    rows.push(row);
+                    entries.push(entry);
+                }
+            }
+        }
+    }
+
+    let fanned_out = axis.len() > 1;
+    let mut variations = Vec::new();
+    for ((variation, rows), entries) in axis
+        .iter()
+        .zip(rows_per_variation.iter())
+        .zip(entries_per_variation.iter())
+    {
+        let path = options
+            .output
+            .as_ref()
+            .map(|output| variation_output_path(output, variation));
+        if let Some(path) = &path {
+            let mut branches =
+                output_branches(&plan.spec.outputs, rows).map_err(|message| CliError {
                     status: ErrorStatus::Error,
                     kind: ErrorKind::Interpret,
                     message,
                     spec_path: Some(options.spec_path.clone()),
                     validation_errors: Vec::new(),
                 })?;
-                events_selected += 1;
-                rows.push(row);
+            if fanned_out {
+                branches.insert(0, OutputBranch::u64(JOIN_INDEX_BRANCH, entries.clone()));
             }
+            write_events(path, &branches).map_err(|error| CliError {
+                status: ErrorStatus::Error,
+                kind: ErrorKind::Workflow,
+                message: error.to_string(),
+                spec_path: Some(options.spec_path.clone()),
+                validation_errors: Vec::new(),
+            })?;
         }
+        variations.push(VariationReport {
+            systematic: variation.variant.clone(),
+            events_selected: rows.len() as u64,
+            output: path,
+        });
     }
 
-    if let Some(output_path) = &options.output {
-        let branches = output_branches(&plan.spec.outputs, &rows).map_err(|message| CliError {
-            status: ErrorStatus::Error,
-            kind: ErrorKind::Interpret,
-            message,
-            spec_path: Some(options.spec_path.clone()),
-            validation_errors: Vec::new(),
-        })?;
-        write_events(output_path, &branches).map_err(|error| CliError {
-            status: ErrorStatus::Error,
-            kind: ErrorKind::Workflow,
-            message: error.to_string(),
-            spec_path: Some(options.spec_path.clone()),
-            validation_errors: Vec::new(),
-        })?;
-    }
+    // The nominal entry always leads the axis, so it stays the report's headline
+    // figure and `skim.root` keeps its unsuffixed name: a nominal-only spec is
+    // byte-for-byte what it was before the fan-out existed.
+    let events_selected = variations
+        .first()
+        .map(|variation| variation.events_selected)
+        .unwrap_or(0);
 
     Ok(RunReport {
         status: Status::Ok,
@@ -712,7 +836,26 @@ fn run_interpreted(options: WorkflowRunOptions) -> Result<RunReport> {
         events_selected,
         output: options.output,
         manifest: None,
+        variations: (variations.len() > 1).then_some(variations),
     })
+}
+
+/// Where one variation's skim goes: the nominal keeps the requested path, each
+/// other variation gets a `__Variant` suffix on the file stem.
+fn variation_output_path(output: &Path, variation: &SystematicVariant) -> PathBuf {
+    if matches!(variation.source, SystematicSource::Nominal) {
+        return output.to_path_buf();
+    }
+    let stem = output
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut name = format!("{stem}__{}", variation.variant);
+    if let Some(extension) = output.extension() {
+        name.push('.');
+        name.push_str(&extension.to_string_lossy());
+    }
+    output.with_file_name(name)
 }
 
 fn inspect_command(source: &str, insecure: bool) -> Result<Output> {
